@@ -3,10 +3,12 @@ import test from 'node:test';
 
 import { createApp } from '../src/app.js';
 import type { AppStore } from '../src/app.js';
+import { createDevelopmentHeaderAuthenticator } from '../src/auth.js';
 
-const providerHeaders = { 'x-user-role': 'provedor' };
-const sindicoHeaders = { 'x-user-role': 'sindico' };
-const moradorHeaders = { 'x-user-role': 'morador' };
+const authenticator = createDevelopmentHeaderAuthenticator('test');
+const providerHeaders = { 'x-development-user-id': 'provider-1', 'x-development-user-role': 'provedor' };
+const sindicoHeaders = { 'x-development-user-id': 'manager-1', 'x-development-user-role': 'sindico' };
+const moradorHeaders = { 'x-development-user-id': 'resident-1', 'x-development-user-role': 'morador' };
 
 type StoredCondominio = Awaited<ReturnType<AppStore['condominio']['create']>>;
 type StoredMorador = Awaited<ReturnType<AppStore['morador']['create']>>;
@@ -156,7 +158,7 @@ async function createMorador(app: ReturnType<typeof createApp>, condominioId: st
 }
 
 test('provedor or sindico creates resident only for an active condominium', async () => {
-  const app = createApp({ db: createFakeStore() });
+  const app = createApp({ db: createFakeStore(), authenticator });
   const condominio = await createCondominio(app);
 
   const createResponse = await app.inject({
@@ -215,7 +217,7 @@ test('provedor or sindico creates resident only for an active condominium', asyn
 });
 
 test('listing residents by condominium does not leak other condominiums or deleted residents', async () => {
-  const app = createApp({ db: createFakeStore() });
+  const app = createApp({ db: createFakeStore(), authenticator });
   const firstCondominio = await createCondominio(app, 'Residencial A');
   const secondCondominio = await createCondominio(app, 'Residencial B');
   const firstResident = await createMorador(app, firstCondominio.id, 'Morador A');
@@ -250,7 +252,7 @@ test('listing residents by condominium does not leak other condominiums or delet
 });
 
 test('resident read, update and delete are scoped to the condominium', async () => {
-  const app = createApp({ db: createFakeStore() });
+  const app = createApp({ db: createFakeStore(), authenticator });
   const firstCondominio = await createCondominio(app, 'Residencial A');
   const secondCondominio = await createCondominio(app, 'Residencial B');
   const resident = await createMorador(app, firstCondominio.id, 'Carlos Nunes');
@@ -310,8 +312,8 @@ test('resident read, update and delete are scoped to the condominium', async () 
   await app.close();
 });
 
-test('resident endpoints validate payload and temporary role boundary', async () => {
-  const app = createApp({ db: createFakeStore() });
+test('resident endpoints validate payload and authorization boundary', async () => {
+  const app = createApp({ db: createFakeStore(), authenticator });
   const condominio = await createCondominio(app);
   const resident = await createMorador(app, condominio.id);
 

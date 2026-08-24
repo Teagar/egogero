@@ -1,6 +1,7 @@
 import Fastify from 'fastify';
-import type { FastifyReply, FastifyRequest } from 'fastify';
 
+import { authorize } from './auth.js';
+import type { Authenticator } from './auth.js';
 import { prisma as defaultPrisma } from './lib/prisma.js';
 
 type CondominioRecord = {
@@ -81,31 +82,6 @@ type MoradorBody = Partial<Record<'nome' | 'condominioId' | 'endereco', unknown>
 type EnderecoBody = Partial<Record<'rua' | 'numero' | 'bloco' | 'apartamento', unknown>>;
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-
-function requireRoles(request: FastifyRequest, reply: FastifyReply, allowedRoles: string[]) {
-  const roleHeader = request.headers['x-user-role'];
-  const role = Array.isArray(roleHeader) ? roleHeader[0] : roleHeader;
-
-  if (!role) {
-    reply.status(401).send({ error: 'Authentication required' });
-    return false;
-  }
-
-  if (!allowedRoles.includes(role)) {
-    reply.status(403).send({ error: 'Forbidden' });
-    return false;
-  }
-
-  return true;
-}
-
-function requireProvedor(request: FastifyRequest, reply: FastifyReply) {
-  return requireRoles(request, reply, ['provedor']);
-}
-
-function requireMoradorManager(request: FastifyRequest, reply: FastifyReply) {
-  return requireRoles(request, reply, ['provedor', 'sindico']);
-}
 
 function readRequiredString(body: Partial<Record<string, unknown>>, field: string) {
   const value = body[field];
@@ -296,16 +272,22 @@ async function ensureActiveCondominio(db: AppStore, condominioId: string) {
   return db.condominio.findFirst({ where: { id: condominioId, deletedAt: null } });
 }
 
-export function createApp({ db = defaultPrisma }: { db?: AppStore } = {}) {
+const unauthenticated: Authenticator = {
+  async authenticate() {
+    return null;
+  }
+};
+
+export function createApp(
+  { db = defaultPrisma, authenticator = unauthenticated }: { db?: AppStore; authenticator?: Authenticator } = {}
+) {
   const app = Fastify({ logger: false });
+  const condominioManagement = { preHandler: authorize(authenticator, 'condominios:manage') };
+  const moradorManagement = { preHandler: authorize(authenticator, 'moradores:manage') };
 
   app.get('/health', async () => ({ status: 'ok' }));
 
-  app.post('/condominios', async (request, reply) => {
-    if (!requireProvedor(request, reply)) {
-      return;
-    }
-
+  app.post('/condominios', condominioManagement, async (request, reply) => {
     const data = parseCreateBody(request.body);
 
     if (!data) {
@@ -316,11 +298,7 @@ export function createApp({ db = defaultPrisma }: { db?: AppStore } = {}) {
     return reply.status(201).send(toCondominioResponse(condominio));
   });
 
-  app.get('/condominios', async (request, reply) => {
-    if (!requireProvedor(request, reply)) {
-      return;
-    }
-
+  app.get('/condominios', condominioManagement, async () => {
     const condominios = await db.condominio.findMany({
       where: { deletedAt: null },
       orderBy: { createdAt: 'desc' }
@@ -329,11 +307,7 @@ export function createApp({ db = defaultPrisma }: { db?: AppStore } = {}) {
     return condominios.map(toCondominioResponse);
   });
 
-  app.get('/condominios/:id', async (request, reply) => {
-    if (!requireProvedor(request, reply)) {
-      return;
-    }
-
+  app.get('/condominios/:id', condominioManagement, async (request, reply) => {
     const id = parseId(request.params);
 
     if (!id) {
@@ -349,11 +323,7 @@ export function createApp({ db = defaultPrisma }: { db?: AppStore } = {}) {
     return toCondominioResponse(condominio);
   });
 
-  app.patch('/condominios/:id', async (request, reply) => {
-    if (!requireProvedor(request, reply)) {
-      return;
-    }
-
+  app.patch('/condominios/:id', condominioManagement, async (request, reply) => {
     const id = parseId(request.params);
 
     if (!id) {
@@ -381,11 +351,7 @@ export function createApp({ db = defaultPrisma }: { db?: AppStore } = {}) {
     return toCondominioResponse(condominio);
   });
 
-  app.delete('/condominios/:id', async (request, reply) => {
-    if (!requireProvedor(request, reply)) {
-      return;
-    }
-
+  app.delete('/condominios/:id', condominioManagement, async (request, reply) => {
     const id = parseId(request.params);
 
     if (!id) {
@@ -404,11 +370,7 @@ export function createApp({ db = defaultPrisma }: { db?: AppStore } = {}) {
     return reply.status(204).send();
   });
 
-  app.post('/moradores', async (request, reply) => {
-    if (!requireMoradorManager(request, reply)) {
-      return;
-    }
-
+  app.post('/moradores', moradorManagement, async (request, reply) => {
     const data = parseMoradorCreateBody(request.body);
 
     if (!data) {
@@ -425,11 +387,7 @@ export function createApp({ db = defaultPrisma }: { db?: AppStore } = {}) {
     return reply.status(201).send(toMoradorResponse(morador));
   });
 
-  app.get('/condominios/:condominioId/moradores', async (request, reply) => {
-    if (!requireMoradorManager(request, reply)) {
-      return;
-    }
-
+  app.get('/condominios/:condominioId/moradores', moradorManagement, async (request, reply) => {
     const condominioId = parseUuidParam(request.params, 'condominioId');
 
     if (!condominioId) {
@@ -450,11 +408,7 @@ export function createApp({ db = defaultPrisma }: { db?: AppStore } = {}) {
     return moradores.map(toMoradorResponse);
   });
 
-  app.get('/condominios/:condominioId/moradores/:id', async (request, reply) => {
-    if (!requireMoradorManager(request, reply)) {
-      return;
-    }
-
+  app.get('/condominios/:condominioId/moradores/:id', moradorManagement, async (request, reply) => {
     const condominioId = parseUuidParam(request.params, 'condominioId');
     const id = parseId(request.params);
 
@@ -481,11 +435,7 @@ export function createApp({ db = defaultPrisma }: { db?: AppStore } = {}) {
     return toMoradorResponse(morador);
   });
 
-  app.patch('/condominios/:condominioId/moradores/:id', async (request, reply) => {
-    if (!requireMoradorManager(request, reply)) {
-      return;
-    }
-
+  app.patch('/condominios/:condominioId/moradores/:id', moradorManagement, async (request, reply) => {
     const condominioId = parseUuidParam(request.params, 'condominioId');
     const id = parseId(request.params);
 
@@ -524,11 +474,7 @@ export function createApp({ db = defaultPrisma }: { db?: AppStore } = {}) {
     return toMoradorResponse(morador);
   });
 
-  app.delete('/condominios/:condominioId/moradores/:id', async (request, reply) => {
-    if (!requireMoradorManager(request, reply)) {
-      return;
-    }
-
+  app.delete('/condominios/:condominioId/moradores/:id', moradorManagement, async (request, reply) => {
     const condominioId = parseUuidParam(request.params, 'condominioId');
     const id = parseId(request.params);
 
