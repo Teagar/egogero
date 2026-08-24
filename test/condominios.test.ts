@@ -3,9 +3,11 @@ import test from 'node:test';
 
 import { createApp } from '../src/app.js';
 import type { AppStore } from '../src/app.js';
+import { createDevelopmentHeaderAuthenticator } from '../src/auth.js';
 
-const providerHeaders = { 'x-user-role': 'provedor' };
-const moradorHeaders = { 'x-user-role': 'morador' };
+const authenticator = createDevelopmentHeaderAuthenticator('test');
+const providerHeaders = { 'x-development-user-id': 'provider-1', 'x-development-user-role': 'provedor' };
+const moradorHeaders = { 'x-development-user-id': 'resident-1', 'x-development-user-role': 'morador' };
 
 type StoredCondominio = Awaited<ReturnType<AppStore['condominio']['create']>>;
 
@@ -84,7 +86,7 @@ function createFakeStore() {
 }
 
 test('provedor creates, edits and soft-deletes a condominium', async () => {
-  const app = createApp({ db: createFakeStore() });
+  const app = createApp({ db: createFakeStore(), authenticator });
 
   const createResponse = await app.inject({
     method: 'POST',
@@ -150,7 +152,7 @@ test('provedor creates, edits and soft-deletes a condominium', async () => {
 });
 
 test('morador receives 403 on condominium endpoints', async () => {
-  const app = createApp({ db: createFakeStore() });
+  const app = createApp({ db: createFakeStore(), authenticator });
   const id = '00000000-0000-4000-8000-000000000001';
   const requests = [
     { method: 'POST', url: '/condominios', payload: { nome: 'A', responsavel: 'B', tipo: 'C' } },
@@ -169,7 +171,7 @@ test('morador receives 403 on condominium endpoints', async () => {
 });
 
 test('condominium creation validates required string fields', async () => {
-  const app = createApp({ db: createFakeStore() });
+  const app = createApp({ db: createFakeStore(), authenticator });
   const response = await app.inject({
     method: 'POST',
     url: '/condominios',
