@@ -221,16 +221,17 @@ enum DeliveryStatus {
 }
 
 model HumanAccount {
-  id                 String             @id @default(uuid()) @db.Uuid
-  createdAt          DateTime           @default(now()) @db.Timestamptz(3)
-  updatedAt          DateTime           @updatedAt @db.Timestamptz(3)
-  displayName        String
-  status             HumanAccountStatus @default(invited)
-  sessionVersion     Int                @default(0)
-  disabledAt         DateTime?          @db.Timestamptz(3)
-  externalIdentities ExternalIdentity[]
-  memberships        HumanMembership[]
-  browserSessions    BrowserSession[]
+  id                      String                        @id @default(uuid()) @db.Uuid
+  createdAt               DateTime                      @default(now()) @db.Timestamptz(3)
+  updatedAt               DateTime                      @updatedAt @db.Timestamptz(3)
+  displayName             String
+  status                  HumanAccountStatus            @default(invited)
+  sessionVersion          Int                           @default(0)
+  disabledAt              DateTime?                     @db.Timestamptz(3)
+  externalIdentities      ExternalIdentity[]
+  memberships             HumanMembership[]
+  browserSessions         BrowserSession[]
+  provisioningInvitations HumanProvisioningInvitation[]
 }
 
 model ExternalIdentity {
@@ -251,18 +252,19 @@ model ExternalIdentity {
 }
 
 model HumanMembership {
-  id              String                @id @default(uuid()) @db.Uuid
-  createdAt       DateTime              @default(now()) @db.Timestamptz(3)
-  disabledAt      DateTime?             @db.Timestamptz(3)
-  accountId       String                @db.Uuid
-  condominioId    String?
-  residentId      String?
-  role            HumanRole
-  status          HumanMembershipStatus @default(invited)
-  account         HumanAccount          @relation(fields: [accountId], references: [id], onDelete: Restrict)
-  condominio      Condominio?           @relation(fields: [condominioId], references: [id], onDelete: Restrict)
-  resident        Morador?              @relation(fields: [residentId, condominioId], references: [id, condominioId], onDelete: Restrict)
-  browserSessions BrowserSession[]
+  id                     String                       @id @default(uuid()) @db.Uuid
+  createdAt              DateTime                     @default(now()) @db.Timestamptz(3)
+  disabledAt             DateTime?                    @db.Timestamptz(3)
+  accountId              String                       @db.Uuid
+  condominioId           String?
+  residentId             String?
+  role                   HumanRole
+  status                 HumanMembershipStatus        @default(invited)
+  account                HumanAccount                 @relation(fields: [accountId], references: [id], onDelete: Restrict)
+  condominio             Condominio?                  @relation(fields: [condominioId], references: [id], onDelete: Restrict)
+  resident               Morador?                     @relation(fields: [residentId, condominioId], references: [id, condominioId], onDelete: Restrict)
+  browserSessions        BrowserSession[]
+  provisioningInvitation HumanProvisioningInvitation?
 
   @@unique([id, accountId])
   @@index([accountId, status])
@@ -271,42 +273,46 @@ model HumanMembership {
 }
 
 model OidcLoginTransaction {
-  id                     String                @id @default(uuid()) @db.Uuid
-  createdAt              DateTime              @default(now()) @db.Timestamptz(3)
-  expiresAt              DateTime              @db.Timestamptz(3)
-  consumedAt             DateTime?             @db.Timestamptz(3)
-  stateDigest            Bytes                 @unique
-  nonceDigest            Bytes
-  pkceVerifierCiphertext Bytes
-  pkceVerifierNonce      Bytes
-  pkceVerifierAuthTag    Bytes
-  pkceKeyVersion         Int
-  issuer                 String
-  clientId               String
-  redirectUri            String
-  returnTo               String
-  recoveryIntent         Boolean               @default(false)
-  reauthenticationIntent Boolean               @default(false)
-  reauthenticationFamilyId String?             @db.Uuid
-  validatedHandoff       OidcValidatedHandoff?
+  id                       String                @id @default(uuid()) @db.Uuid
+  createdAt                DateTime              @default(now()) @db.Timestamptz(3)
+  expiresAt                DateTime              @db.Timestamptz(3)
+  consumedAt               DateTime?             @db.Timestamptz(3)
+  stateDigest              Bytes                 @unique
+  nonceDigest              Bytes
+  pkceVerifierCiphertext   Bytes
+  pkceVerifierNonce        Bytes
+  pkceVerifierAuthTag      Bytes
+  pkceKeyVersion           Int
+  issuer                   String
+  clientId                 String
+  redirectUri              String
+  returnTo                 String
+  recoveryIntent           Boolean               @default(false)
+  invitationTokenDigest    Bytes?
+  reauthenticationIntent   Boolean               @default(false)
+  reauthenticationFamilyId String?               @db.Uuid
+  validatedHandoff         OidcValidatedHandoff?
 
   @@index([expiresAt, consumedAt])
 }
 
 model OidcValidatedHandoff {
-  id                 String               @id @default(uuid()) @db.Uuid
-  createdAt          DateTime             @default(now()) @db.Timestamptz(3)
-  expiresAt          DateTime             @db.Timestamptz(3)
-  consumedAt         DateTime?            @db.Timestamptz(3)
-  handleDigest       Bytes                @unique
-  loginTransactionId String               @unique @db.Uuid
-  accountId          String               @db.Uuid
-  externalIdentityId String               @db.Uuid
-  authenticatedAt    DateTime             @db.Timestamptz(3)
-  reauthenticationIntent Boolean           @default(false)
-  reauthenticationFamilyId String?          @db.Uuid
-  loginTransaction   OidcLoginTransaction @relation(fields: [loginTransactionId], references: [id], onDelete: Restrict)
-  externalIdentity   ExternalIdentity     @relation(fields: [externalIdentityId, accountId], references: [id, accountId], onDelete: Restrict)
+  id                       String               @id @default(uuid()) @db.Uuid
+  createdAt                DateTime             @default(now()) @db.Timestamptz(3)
+  expiresAt                DateTime             @db.Timestamptz(3)
+  consumedAt               DateTime?            @db.Timestamptz(3)
+  handleDigest             Bytes                @unique
+  loginTransactionId       String               @unique @db.Uuid
+  accountId                String               @db.Uuid
+  externalIdentityId       String               @db.Uuid
+  authenticatedAt          DateTime             @db.Timestamptz(3)
+  authenticationMethods    String[]             @default([])
+  assuranceContext         String?
+  recoveryIntent           Boolean              @default(false)
+  reauthenticationIntent   Boolean              @default(false)
+  reauthenticationFamilyId String?              @db.Uuid
+  loginTransaction         OidcLoginTransaction @relation(fields: [loginTransactionId], references: [id], onDelete: Restrict)
+  externalIdentity         ExternalIdentity     @relation(fields: [externalIdentityId, accountId], references: [id, accountId], onDelete: Restrict)
 
   @@index([expiresAt, consumedAt])
   @@index([accountId, createdAt])
@@ -320,6 +326,8 @@ model BrowserSession {
   idleExpiresAt         DateTime        @db.Timestamptz(3)
   absoluteExpiresAt     DateTime        @db.Timestamptz(3)
   authenticatedAt       DateTime        @db.Timestamptz(3)
+  authenticationMethods String[]        @default([])
+  assuranceContext      String?
   revokedAt             DateTime?       @db.Timestamptz(3)
   revokeReason          String?
   tokenDigest           Bytes           @unique
@@ -340,6 +348,37 @@ model BrowserSession {
   @@index([idleExpiresAt, absoluteExpiresAt])
   @@index([activeMembershipId])
   @@index([familyId])
+}
+
+model HumanProvisioningInvitation {
+  id                 String          @id @default(uuid()) @db.Uuid
+  createdAt          DateTime        @default(now()) @db.Timestamptz(3)
+  expiresAt          DateTime        @db.Timestamptz(3)
+  consumedAt         DateTime?       @db.Timestamptz(3)
+  disabledAt         DateTime?       @db.Timestamptz(3)
+  tokenDigest        Bytes           @unique
+  expectedEmail      String
+  accountId          String          @db.Uuid
+  membershipId       String          @unique @db.Uuid
+  createdByAccountId String          @db.Uuid
+  account            HumanAccount    @relation(fields: [accountId], references: [id], onDelete: Restrict)
+  membership         HumanMembership @relation(fields: [membershipId, accountId], references: [id, accountId], onDelete: Restrict)
+
+  @@unique([membershipId, accountId])
+  @@index([accountId, expiresAt])
+}
+
+model RecoveryWebhookEvent {
+  id          String   @id @default(uuid()) @db.Uuid
+  createdAt   DateTime @default(now()) @db.Timestamptz(3)
+  eventId     String   @unique
+  eventDigest Bytes    @unique
+  issuer      String
+  subject     String
+  accountId   String?  @db.Uuid
+  processedAt DateTime @db.Timestamptz(3)
+
+  @@index([createdAt])
 }
 
 model AuthenticationAuditEvent {

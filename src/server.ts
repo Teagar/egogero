@@ -16,6 +16,7 @@ import {
   createCredentialRouter,
   createPrismaBrowserSessionStore
 } from './sessions.js';
+import { createHumanAdministrationService } from './human-administration.js';
 
 export async function startServer(environment: NodeJS.ProcessEnv = process.env) {
   const env = getEnv(environment);
@@ -36,8 +37,14 @@ export async function startServer(environment: NodeJS.ProcessEnv = process.env) 
   const oidcService = env.oidc
     ? await createOidcService(env.oidc, createPrismaOidcLoginStore(prisma))
     : undefined;
+  const humanAdministrationService = env.humanAdministration
+    ? createHumanAdministrationService(prisma, env.humanAdministration)
+    : undefined;
   const browserSessionStore = env.sessions
-    ? createPrismaBrowserSessionStore(prisma, env.sessions)
+    ? createPrismaBrowserSessionStore(prisma, {
+        ...env.sessions,
+        mfaPolicy: env.humanAdministration?.mfaPolicy
+      })
     : undefined;
   const browserSessionService = browserSessionStore
     ? createBrowserSessionService(browserSessionStore)
@@ -58,7 +65,8 @@ export async function startServer(environment: NodeJS.ProcessEnv = process.env) 
     trustProxy: env.trustProxy,
     oidcService,
     browserSessionService,
-    browserSessionStore
+    browserSessionStore,
+    humanAdministrationService
   });
 
   await app.listen({ host: env.host, port: env.port });

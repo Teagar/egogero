@@ -12,6 +12,8 @@ import type { FastifyRequest } from 'fastify';
 
 import { AuthenticationError } from './auth.js';
 import type { Authenticator, HumanSessionIdentity, Role } from './auth.js';
+import { evidenceSatisfiesRole } from './human-administration.js';
+import type { RoleMfaPolicy } from './human-administration.js';
 
 export type { HumanSessionIdentity } from './auth.js';
 
@@ -31,6 +33,7 @@ export type SessionRuntimeConfig = {
   currentCsrfKeyVersion: number;
   csrfKeys: ReadonlyMap<number, Buffer>;
   publicApplicationOrigin: string;
+  mfaPolicy?: RoleMfaPolicy;
 };
 
 export type BrowserSessionSnapshot = {
@@ -49,6 +52,8 @@ export type BrowserSessionSnapshot = {
   expiresAt: Date;
   idleExpiresAt: Date;
   authenticatedAt: Date;
+  authenticationMethods?: string[];
+  assuranceContext?: string | null;
 };
 
 declare module 'fastify' {
@@ -133,6 +138,8 @@ type SessionRow = MembershipRow & {
   idleExpiresAt: Date;
   absoluteExpiresAt: Date;
   authenticatedAt: Date;
+  authenticationMethods: string[];
+  assuranceContext: string | null;
   revokedAt: Date | null;
   csrfDigest: Buffer;
   csrfCiphertext: Buffer;
@@ -371,7 +378,12 @@ function liveMembershipCondition(alias: string) {
   `);
 }
 
-async function chooseMembership(transaction: Prisma.TransactionClient, accountId: string) {
+async function chooseMembership(
+  transaction: Prisma.TransactionClient,
+  accountId: string,
+  policy?: RoleMfaPolicy,
+  evidence?: { amr: string[]; acr: string | null }
+) {
   const rows = await transaction.$queryRaw<MembershipRow[]>(Prisma.sql`
     SELECT membership.id, membership."accountId", membership.role,
            membership."condominioId", membership."residentId"
@@ -388,10 +400,11 @@ async function chooseMembership(transaction: Prisma.TransactionClient, accountId
     WHERE membership."accountId" = ${accountId}::uuid
       AND ${liveMembershipCondition('membership')}
     ORDER BY usage."lastUsedAt" DESC NULLS LAST, membership."createdAt" ASC, membership.id ASC
-    LIMIT 1
     FOR SHARE OF membership
   `);
-  return rows[0] ?? null;
+  return policy && evidence
+    ? rows.find((membership) => evidenceSatisfiesRole(policy, membership.role, evidence)) ?? null
+    : rows[0] ?? null;
 }
 
 async function loadTargetMembership(
@@ -434,6 +447,8 @@ async function insertSession(
     accountSessionVersion: number;
     membershipId: string;
     authenticatedAt: Date;
+    authenticationMethods: string[];
+    assuranceContext: string | null;
     absoluteExpiresAt?: Date;
     tokenDigest: Buffer;
     csrf: Buffer;
@@ -449,7 +464,7 @@ async function insertSession(
       id, "familyId", "createdAt", "lastSeenAt", "idleExpiresAt", "absoluteExpiresAt",
       "authenticatedAt", "tokenDigest", "csrfDigest", "csrfCiphertext", "csrfNonce",
       "csrfAuthTag", "csrfKeyVersion", "accountId", "accountSessionVersion",
-      "activeMembershipId", "ipPrefix", "userAgentHash"
+      "activeMembershipId", "ipPrefix", "userAgentHash", "authenticationMethods", "assuranceContext"
     )
     SELECT ${input.id}::uuid, ${input.familyId}::uuid, now, now,
            LEAST(now + interval '30 minutes', COALESCE(${input.absoluteExpiresAt ?? null}::timestamptz, now + interval '12 hours')),
@@ -457,7 +472,7 @@ async function insertSession(
             LEAST(${input.authenticatedAt}, now), ${input.tokenDigest}, ${digest(input.csrf)},
            ${encrypted.ciphertext}, ${encrypted.nonce}, ${encrypted.authTag}, ${encrypted.keyVersion},
            ${input.accountId}::uuid, ${input.accountSessionVersion}, ${input.membershipId}::uuid,
-           ${input.ipPrefix}, ${input.userAgentHash}
+            ${input.ipPrefix}, ${input.userAgentHash}, ${input.authenticationMethods}, ${input.assuranceContext}
     FROM db_clock
     RETURNING "createdAt", "absoluteExpiresAt"
   `);
@@ -499,7 +514,8 @@ async function loadSession(transaction: Prisma.TransactionClient, tokenDigest: B
            session."absoluteExpiresAt", session."authenticatedAt", session."revokedAt",
            session."csrfDigest", session."csrfCiphertext", session."csrfNonce",
            session."csrfAuthTag", session."csrfKeyVersion", session."ipPrefix",
-           session."userAgentHash", clock_timestamp() AS "databaseNow"
+            session."userAgentHash", session."authenticationMethods", session."assuranceContext",
+            clock_timestamp() AS "databaseNow"
     FROM "BrowserSession" session
     JOIN "HumanAccount" account ON account.id = session."accountId"
     JOIN "HumanMembership" membership ON membership.id = session."activeMembershipId"
@@ -578,6 +594,9 @@ export function createPrismaBrowserSessionStore(client: PrismaClient, config: Se
           accountId: string;
           externalIdentityId: string;
           authenticatedAt: Date;
+          authenticationMethods: string[];
+          assuranceContext: string | null;
+          recoveryIntent: boolean;
           reauthenticationIntent: boolean;
           reauthenticationFamilyId: string | null;
         }>>(Prisma.sql`
@@ -586,7 +605,8 @@ export function createPrismaBrowserSessionStore(client: PrismaClient, config: Se
           WHERE "handleDigest" = ${digest(input.handoffToken)}
             AND "consumedAt" IS NULL
             AND "expiresAt" > clock_timestamp()
-          RETURNING "accountId", "externalIdentityId", "authenticatedAt", "reauthenticationIntent",
+          RETURNING "accountId", "externalIdentityId", "authenticatedAt", "authenticationMethods",
+                    "assuranceContext", "recoveryIntent", "reauthenticationIntent",
                     "reauthenticationFamilyId"
         `);
         const handoff = handoffs[0];
@@ -645,6 +665,13 @@ export function createPrismaBrowserSessionStore(client: PrismaClient, config: Se
             await auditDenied(transaction, input, 'session_reauthentication_denied', 'session_integrity_failed', oldSession);
             return null;
           }
+          if (config.mfaPolicy && !evidenceSatisfiesRole(config.mfaPolicy, membership.role, {
+            amr: handoff.authenticationMethods, acr: handoff.assuranceContext
+          })) {
+            csrf.fill(0);
+            await auditDenied(transaction, input, 'mfa_policy_denied', 'insufficient_authentication_assurance', oldSession);
+            return null;
+          }
           const revoked = await transaction.$executeRaw`
             UPDATE "BrowserSession" SET "revokedAt" = clock_timestamp(), "revokeReason" = 'reauthenticated'
             WHERE id = ${oldSession.sessionId}::uuid AND "revokedAt" IS NULL
@@ -659,6 +686,7 @@ export function createPrismaBrowserSessionStore(client: PrismaClient, config: Se
             id: sessionId, familyId: oldSession.familyId, accountId: account.id,
             accountSessionVersion: oldSession.accountSessionVersion, membershipId: membership.id,
             authenticatedAt: handoff.authenticatedAt, absoluteExpiresAt: oldSession.absoluteExpiresAt,
+            authenticationMethods: handoff.authenticationMethods, assuranceContext: handoff.assuranceContext,
             csrfKeyVersion: Math.max(config.currentCsrfKeyVersion, oldSession.csrfKeyVersion),
             csrf, ipPrefix: input.ipPrefix ?? oldSession.ipPrefix,
             userAgentHash: input.userAgent === undefined ? oldSession.userAgentHash : userAgentDigest(input.userAgent)
@@ -676,12 +704,30 @@ export function createPrismaBrowserSessionStore(client: PrismaClient, config: Se
           csrf.fill(0);
           return result;
         }
-        const membership = await chooseMembership(transaction, account.id);
+        const membership = await chooseMembership(transaction, account.id, config.mfaPolicy, {
+          amr: handoff.authenticationMethods,
+          acr: handoff.assuranceContext
+        });
         if (!membership) {
+          const liveMembership = config.mfaPolicy ? await chooseMembership(transaction, account.id) : null;
           await insertAudit(transaction, {
-            eventType: 'session_issue_denied', outcome: 'denied', reasonCode: 'no_active_membership',
+            eventType: liveMembership ? 'mfa_policy_denied' : 'session_issue_denied', outcome: 'denied',
+            reasonCode: liveMembership ? 'insufficient_authentication_assurance' : 'no_active_membership',
             requestCorrelationId: input.requestCorrelationId, accountId: account.id,
-            externalIdentityId: handoff.externalIdentityId, ipPrefix: input.ipPrefix,
+            externalIdentityId: handoff.externalIdentityId, membershipId: liveMembership?.id,
+            condominioId: liveMembership?.condominioId, ipPrefix: input.ipPrefix,
+            userAgentHash: userAgentDigest(input.userAgent)
+          });
+          return null;
+        }
+        if (config.mfaPolicy && !evidenceSatisfiesRole(config.mfaPolicy, membership.role, {
+          amr: handoff.authenticationMethods, acr: handoff.assuranceContext
+        })) {
+          await insertAudit(transaction, {
+            eventType: 'mfa_policy_denied', outcome: 'denied', reasonCode: 'insufficient_authentication_assurance',
+            requestCorrelationId: input.requestCorrelationId, accountId: account.id,
+            externalIdentityId: handoff.externalIdentityId, membershipId: membership.id,
+            condominioId: membership.condominioId, ipPrefix: input.ipPrefix,
             userAgentHash: userAgentDigest(input.userAgent)
           });
           return null;
@@ -697,7 +743,17 @@ export function createPrismaBrowserSessionStore(client: PrismaClient, config: Se
           return null;
         }
 
-        if (oldSession) {
+        if (handoff.recoveryIntent) {
+          await transaction.$executeRaw`
+            UPDATE "HumanAccount" SET "sessionVersion" = "sessionVersion" + 1, "updatedAt" = clock_timestamp()
+            WHERE id = ${account.id}::uuid
+          `;
+          await transaction.$executeRaw`
+            UPDATE "BrowserSession" SET "revokedAt" = clock_timestamp(), "revokeReason" = 'credential_recovery'
+            WHERE "accountId" = ${account.id}::uuid AND "revokedAt" IS NULL
+          `;
+          account.sessionVersion += 1;
+        } else if (oldSession) {
           const revoked = await transaction.$executeRaw`
             UPDATE "BrowserSession"
             SET "revokedAt" = clock_timestamp(), "revokeReason" = 'login_replaced'
@@ -726,6 +782,8 @@ export function createPrismaBrowserSessionStore(client: PrismaClient, config: Se
           accountSessionVersion: account.sessionVersion,
           membershipId: membership.id,
           authenticatedAt: handoff.authenticatedAt,
+          authenticationMethods: handoff.authenticationMethods,
+          assuranceContext: handoff.assuranceContext,
           csrf,
           ipPrefix: input.ipPrefix ?? null,
           userAgentHash: userAgentDigest(input.userAgent)
@@ -736,7 +794,7 @@ export function createPrismaBrowserSessionStore(client: PrismaClient, config: Se
           accountId: account.id, externalIdentityId: handoff.externalIdentityId, sessionId,
           membershipId: membership.id, condominioId: membership.condominioId,
           ipPrefix: input.ipPrefix, userAgentHash: userAgentDigest(input.userAgent),
-          metadata: { authenticationMethod: 'oidc' }
+          metadata: { authenticationMethod: 'oidc', recoveryIntent: handoff.recoveryIntent }
         });
 
         const result = {
@@ -762,6 +820,12 @@ export function createPrismaBrowserSessionStore(client: PrismaClient, config: Se
         const reason = sessionDenialReason(session);
         if (reason) {
           await auditDenied(transaction, request, 'session_authentication_denied', reason, session);
+          return null;
+        }
+        if (config.mfaPolicy && !evidenceSatisfiesRole(config.mfaPolicy, session.role, {
+          amr: session.authenticationMethods, acr: session.assuranceContext
+        })) {
+          await auditDenied(transaction, request, 'mfa_policy_denied', 'insufficient_authentication_assurance', session);
           return null;
         }
         if (extendIdle) await touchSession(transaction, session);
@@ -790,6 +854,12 @@ export function createPrismaBrowserSessionStore(client: PrismaClient, config: Se
         const reason = sessionDenialReason(session);
         if (reason) {
           await auditDenied(transaction, input, 'session_authentication_denied', reason, session);
+          return null;
+        }
+        if (config.mfaPolicy && !evidenceSatisfiesRole(config.mfaPolicy, session.role, {
+          amr: session.authenticationMethods, acr: session.assuranceContext
+        })) {
+          await auditDenied(transaction, input, 'mfa_policy_denied', 'insufficient_authentication_assurance', session);
           return null;
         }
         const csrf = decryptCsrf(config, session);
@@ -835,7 +905,9 @@ export function createPrismaBrowserSessionStore(client: PrismaClient, config: Se
           csrfDigest: Buffer.from(session.csrfDigest),
           expiresAt: session.absoluteExpiresAt,
           idleExpiresAt,
-          authenticatedAt: session.authenticatedAt
+          authenticatedAt: session.authenticatedAt,
+          authenticationMethods: session.authenticationMethods,
+          assuranceContext: session.assuranceContext
         };
         csrf.fill(0);
         return snapshot;
@@ -877,6 +949,12 @@ export function createPrismaBrowserSessionStore(client: PrismaClient, config: Se
           await auditDenied(transaction, input, 'session_rotation_denied', 'target_membership_inactive', session);
           return { status: 'denied' };
         }
+        if (config.mfaPolicy && !evidenceSatisfiesRole(config.mfaPolicy, membership.role, {
+          amr: session.authenticationMethods, acr: session.assuranceContext
+        })) {
+          await auditDenied(transaction, input, 'mfa_policy_denied', 'insufficient_authentication_assurance', session);
+          return { status: 'denied' };
+        }
         if (!await creationAllowed(transaction, session.accountId)) {
           await auditDenied(transaction, input, 'session_rotation_denied', 'session_creation_rate_limited', session);
           return { status: 'denied' };
@@ -907,6 +985,8 @@ export function createPrismaBrowserSessionStore(client: PrismaClient, config: Se
           accountSessionVersion: session.accountSessionVersion,
           membershipId: membership.id,
           authenticatedAt: session.authenticatedAt,
+          authenticationMethods: session.authenticationMethods,
+          assuranceContext: session.assuranceContext,
           absoluteExpiresAt: session.absoluteExpiresAt,
           csrfKeyVersion: Math.max(config.currentCsrfKeyVersion, session.csrfKeyVersion),
           csrf,

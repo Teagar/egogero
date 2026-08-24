@@ -19,6 +19,8 @@ import * as oidc from 'openid-client';
 
 import { hasBrowserSessionCookie, parseBrowserSessionCookie } from './sessions.js';
 import type { BrowserSessionService, BrowserSessionStore } from './sessions.js';
+import { digestSecret, normalizeProvisioningEmail } from './human-administration.js';
+import type { HumanAdministrationService } from './human-administration.js';
 
 const LOGIN_TRANSACTION_TTL_MS = 10 * 60 * 1000;
 const OIDC_CLOCK_TOLERANCE_SECONDS = 60;
@@ -46,7 +48,7 @@ export type OidcRuntimeConfig = {
 };
 
 type AuditInput = {
-  eventType: 'oidc_login_started' | 'oidc_callback_succeeded' | 'oidc_callback_failed' | 'oidc_configuration_failed';
+  eventType: string;
   outcome: 'success' | 'failure' | 'denied';
   requestCorrelationId: string;
   reasonCode?: string;
@@ -69,12 +71,13 @@ type LoginTransactionInput = {
   redirectUri: string;
   returnTo: string;
   recoveryIntent: boolean;
+  invitationTokenDigest?: Buffer;
   reauthenticationIntent?: boolean;
   reauthenticationFamilyId?: string;
   audit: AuditInput;
 };
 
-type ConsumedLoginTransaction = Omit<LoginTransactionInput, 'expiresAt' | 'audit' | 'recoveryIntent'> & {
+type ConsumedLoginTransaction = Omit<LoginTransactionInput, 'expiresAt' | 'audit'> & {
   createdAt: Date;
   returnTo: string;
 };
@@ -85,6 +88,9 @@ export type ValidatedOidcIdentity = {
   issuer: string;
   subject: string;
   authenticatedAt: Date;
+  authenticationMethods?: string[];
+  assuranceContext?: string | null;
+  recoveryIntent?: boolean;
 };
 
 export interface OidcLoginStore {
@@ -97,6 +103,10 @@ export interface OidcLoginStore {
     email: string | null;
     emailVerified: boolean;
     authenticatedAt: Date;
+    authenticationMethods?: string[];
+    assuranceContext?: string | null;
+    invitationTokenDigest?: Buffer;
+    recoveryIntent?: boolean;
     reauthenticationIntent?: boolean;
     reauthenticationFamilyId?: string;
     handoffId: string;
@@ -115,6 +125,8 @@ export interface OidcService {
     requestCorrelationId: string;
     reauthentication?: boolean;
     reauthenticationFamilyId?: string;
+    invitationToken?: string;
+    recovery?: boolean;
   }): Promise<URL>;
   completeCallback(input: {
     callbackUrl: URL;
@@ -367,13 +379,13 @@ export function createPrismaOidcLoginStore(client: PrismaClient): OidcLoginStore
             id, "expiresAt", "stateDigest", "nonceDigest", "pkceVerifierCiphertext",
             "pkceVerifierNonce", "pkceVerifierAuthTag", "pkceKeyVersion", issuer,
              "clientId", "redirectUri", "returnTo", "recoveryIntent", "reauthenticationIntent",
-             "reauthenticationFamilyId"
+             "reauthenticationFamilyId", "invitationTokenDigest"
           ) VALUES (
             ${input.id}::uuid, ${input.expiresAt}, ${input.stateDigest}, ${input.nonceDigest},
             ${input.pkceVerifierCiphertext}, ${input.pkceVerifierNonce}, ${input.pkceVerifierAuthTag},
             ${input.pkceKeyVersion}, ${input.issuer}, ${input.clientId}, ${input.redirectUri},
              ${input.returnTo}, ${input.recoveryIntent}, ${input.reauthenticationIntent === true},
-             ${input.reauthenticationFamilyId ?? null}::uuid
+              ${input.reauthenticationFamilyId ?? null}::uuid, ${input.invitationTokenDigest ?? null}
           )
         `;
         await insertAudit(transaction, input.audit);
@@ -390,13 +402,72 @@ export function createPrismaOidcLoginStore(client: PrismaClient): OidcLoginStore
         RETURNING id, "createdAt", "stateDigest", "nonceDigest", "pkceVerifierCiphertext",
                   "pkceVerifierNonce", "pkceVerifierAuthTag", "pkceKeyVersion",
                    issuer, "clientId", "redirectUri", "returnTo", "reauthenticationIntent",
-                   "reauthenticationFamilyId"
+                    "reauthenticationFamilyId", "recoveryIntent", "invitationTokenDigest"
       `);
       return rows[0] ?? null;
     },
 
     async completeIdentity(input) {
       return client.$transaction(async (transaction) => {
+        const normalizedEmail = typeof input.email === 'string' ? normalizeProvisioningEmail(input.email) : null;
+        if (input.invitationTokenDigest) {
+          if (!input.emailVerified || !normalizedEmail) {
+            await insertAudit(transaction, { ...input.audit, eventType: 'account_invitation_accept_failed',
+              outcome: 'denied', reasonCode: 'invitation_validation_failed' });
+            return null;
+          }
+          const invitations = await transaction.$queryRaw<Array<{ id: string; accountId: string; membershipId: string }>>(Prisma.sql`
+            SELECT invitation.id, invitation."accountId", invitation."membershipId"
+            FROM "HumanProvisioningInvitation" invitation
+            JOIN "HumanAccount" account ON account.id = invitation."accountId"
+            JOIN "HumanMembership" membership ON membership.id = invitation."membershipId"
+              AND membership."accountId" = account.id
+            WHERE invitation."tokenDigest" = ${input.invitationTokenDigest}
+              AND invitation."consumedAt" IS NULL AND invitation."disabledAt" IS NULL
+              AND invitation."expiresAt" > clock_timestamp()
+              AND invitation."expectedEmail" = ${normalizedEmail}
+              AND account.status = 'invited' AND membership.status = 'invited'
+            FOR UPDATE OF invitation, account, membership
+          `);
+          const invitation = invitations[0];
+          if (!invitation) {
+            await insertAudit(transaction, { ...input.audit, eventType: 'account_invitation_accept_failed',
+              outcome: 'denied', reasonCode: 'invitation_validation_failed' });
+            return null;
+          }
+          const identityId = randomUUID();
+          const inserted = await transaction.$executeRaw`
+            INSERT INTO "ExternalIdentity" (id, "accountId", issuer, subject, email, "emailVerified", "lastLoginAt")
+            VALUES (${identityId}::uuid, ${invitation.accountId}::uuid, ${input.issuer}, ${input.subject},
+              ${normalizedEmail}, true, clock_timestamp()) ON CONFLICT (issuer, subject) DO NOTHING
+          `;
+          if (inserted !== 1) {
+            await insertAudit(transaction, { ...input.audit, eventType: 'account_invitation_accept_failed',
+              outcome: 'denied', reasonCode: 'identity_already_bound' });
+            return null;
+          }
+          await transaction.$executeRaw`
+            UPDATE "HumanProvisioningInvitation" SET "consumedAt" = clock_timestamp()
+            WHERE id = ${invitation.id}::uuid AND "consumedAt" IS NULL
+          `;
+          await transaction.$executeRaw`UPDATE "HumanAccount" SET status = 'active', "updatedAt" = clock_timestamp() WHERE id = ${invitation.accountId}::uuid`;
+          await transaction.$executeRaw`UPDATE "HumanMembership" SET status = 'active' WHERE id = ${invitation.membershipId}::uuid`;
+          await transaction.$executeRaw`
+            INSERT INTO "OidcValidatedHandoff" (
+              id, "expiresAt", "handleDigest", "loginTransactionId", "accountId", "externalIdentityId",
+              "authenticatedAt", "authenticationMethods", "assuranceContext", "recoveryIntent"
+            ) VALUES (${input.handoffId}::uuid, ${input.handoffExpiresAt}, ${input.handoffDigest},
+              ${input.loginTransactionId}::uuid, ${invitation.accountId}::uuid, ${identityId}::uuid,
+              ${input.authenticatedAt}, ${input.authenticationMethods ?? []}, ${input.assuranceContext ?? null}, false)
+          `;
+          await insertAudit(transaction, { ...input.audit, eventType: 'account_invitation_accepted', outcome: 'success',
+            accountId: invitation.accountId, externalIdentityId: identityId });
+          return { accountId: invitation.accountId, externalIdentityId: identityId, issuer: input.issuer,
+            subject: input.subject, authenticatedAt: input.authenticatedAt,
+            authenticationMethods: input.authenticationMethods ?? [], assuranceContext: input.assuranceContext ?? null,
+            recoveryIntent: false };
+        }
+
         const identities = await transaction.$queryRaw<Array<{
           id: string;
           accountId: string;
@@ -429,11 +500,13 @@ export function createPrismaOidcLoginStore(client: PrismaClient): OidcLoginStore
         await transaction.$executeRaw`
           INSERT INTO "OidcValidatedHandoff" (
             id, "expiresAt", "handleDigest", "loginTransactionId", "accountId",
-             "externalIdentityId", "authenticatedAt", "reauthenticationIntent", "reauthenticationFamilyId"
+              "externalIdentityId", "authenticatedAt", "authenticationMethods", "assuranceContext", "recoveryIntent",
+              "reauthenticationIntent", "reauthenticationFamilyId"
           ) VALUES (
             ${input.handoffId}::uuid, ${input.handoffExpiresAt}, ${input.handoffDigest},
             ${input.loginTransactionId}::uuid, ${identity.accountId}::uuid,
-             ${identity.id}::uuid, ${input.authenticatedAt}, ${input.reauthenticationIntent === true},
+              ${identity.id}::uuid, ${input.authenticatedAt}, ${input.authenticationMethods ?? []},
+              ${input.assuranceContext ?? null}, ${input.recoveryIntent === true}, ${input.reauthenticationIntent === true},
              ${input.reauthenticationFamilyId ?? null}::uuid
           )
         `;
@@ -447,7 +520,10 @@ export function createPrismaOidcLoginStore(client: PrismaClient): OidcLoginStore
           externalIdentityId: identity.id,
           issuer: input.issuer,
           subject: input.subject,
-          authenticatedAt: input.authenticatedAt
+          authenticatedAt: input.authenticatedAt,
+          authenticationMethods: input.authenticationMethods ?? [],
+          assuranceContext: input.assuranceContext ?? null,
+          recoveryIntent: input.recoveryIntent === true
         };
       });
     },
@@ -465,7 +541,8 @@ export function createPrismaOidcLoginStore(client: PrismaClient): OidcLoginStore
           AND account.id = handoff."accountId"
           AND account.status = 'active'
         RETURNING handoff."accountId", handoff."externalIdentityId",
-                  identity.issuer, identity.subject, handoff."authenticatedAt"
+                  identity.issuer, identity.subject, handoff."authenticatedAt",
+                  handoff."authenticationMethods", handoff."assuranceContext", handoff."recoveryIntent"
       `);
       return rows[0] ?? null;
     },
@@ -736,10 +813,15 @@ export async function createOidcService(
   return {
     failurePath: config.failurePath,
 
-    async startLogin({ returnTo, requestCorrelationId, reauthentication = false, reauthenticationFamilyId }) {
+    async startLogin({ returnTo, requestCorrelationId, reauthentication = false, reauthenticationFamilyId,
+      invitationToken, recovery = false }) {
       if (reauthentication !== (typeof reauthenticationFamilyId === 'string'
         && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(reauthenticationFamilyId))) {
         throw new Error('OIDC reauthentication requires a trusted session family');
+      }
+      if (recovery && (reauthentication || invitationToken !== undefined)) throw new Error('Invalid authentication intent');
+      if (invitationToken !== undefined && !/^[A-Za-z0-9_-]{43}$/.test(invitationToken)) {
+        throw new Error('Invalid invitation');
       }
       const normalizedReturnTo = normalizeSafeRelativePath(returnTo, '/', config.returnToPrefixes);
       const id = randomUUID();
@@ -762,14 +844,16 @@ export async function createOidcService(
         clientId: config.clientId,
         redirectUri: config.redirectUri,
         returnTo: normalizedReturnTo,
-        recoveryIntent: false,
+        recoveryIntent: recovery,
+        invitationTokenDigest: invitationToken ? digestSecret(invitationToken) : undefined,
         reauthenticationIntent: reauthentication,
         reauthenticationFamilyId,
         audit: {
           eventType: 'oidc_login_started',
           outcome: 'success',
           requestCorrelationId,
-          metadata: { recoveryIntent: false, reauthenticationIntent: reauthentication }
+          metadata: { recoveryIntent: recovery, reauthenticationIntent: reauthentication,
+            invitationIntent: invitationToken !== undefined }
         }
       });
 
@@ -851,6 +935,11 @@ export async function createOidcService(
           || authenticationTime * 1000 < transaction.createdAt.getTime() - OIDC_CLOCK_TOLERANCE_SECONDS * 1000) {
           throw new OidcCallbackError();
         }
+        const authenticationMethods = Array.isArray(claims.amr) && claims.amr.length <= 16
+          && claims.amr.every((method) => typeof method === 'string' && method.length > 0 && method.length <= 100)
+          ? [...new Set(claims.amr)] as string[] : [];
+        const assuranceContext = typeof claims.acr === 'string' && claims.acr.length > 0 && claims.acr.length <= 255
+          ? claims.acr : null;
 
         const handoffToken = randomBytes(32).toString('base64url');
         const identity = await store.completeIdentity({
@@ -860,6 +949,10 @@ export async function createOidcService(
           email: typeof claims.email === 'string' ? claims.email : null,
           emailVerified: claims.email_verified === true,
           authenticatedAt: new Date(authenticationTime * 1000),
+          authenticationMethods,
+          assuranceContext,
+          invitationTokenDigest: transaction.invitationTokenDigest,
+          recoveryIntent: transaction.recoveryIntent,
           reauthenticationIntent: transaction.reauthenticationIntent,
           reauthenticationFamilyId: transaction.reauthenticationFamilyId,
           handoffId: randomUUID(),
@@ -890,7 +983,8 @@ export function registerOidcRoutes(
   app: FastifyInstance,
   service?: OidcService,
   browserSessionService?: BrowserSessionService,
-  browserSessionStore?: BrowserSessionStore
+  browserSessionStore?: BrowserSessionStore,
+  humanAdministration?: HumanAdministrationService
 ) {
   if (!service) return;
 
@@ -926,6 +1020,40 @@ export function registerOidcRoutes(
     } catch {
       return reply.redirect(service.failurePath, 303);
     }
+  });
+
+  app.post('/auth/invitations/accept', unambiguous, async (request, reply) => {
+    reply.header('Cache-Control', 'no-store').header('Referrer-Policy', 'no-referrer');
+    const origin = typeof request.headers.origin === 'string' ? request.headers.origin : null;
+    const contentType = typeof request.headers['content-type'] === 'string' ? request.headers['content-type'] : '';
+    const body = request.body && typeof request.body === 'object' && !Array.isArray(request.body)
+      ? request.body as Record<string, unknown> : {};
+    if (!browserSessionStore || origin !== browserSessionStore.publicApplicationOrigin
+      || !/^application\/json(?:\s*;\s*charset=[A-Za-z0-9._-]+)?$/i.test(contentType)
+      || Object.keys(body).some((key) => !['token', 'returnTo'].includes(key))
+      || typeof body.token !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(body.token)
+      || (body.returnTo !== undefined && typeof body.returnTo !== 'string')) {
+      return reply.status(400).send({ error: 'invalid_request' });
+    }
+    try {
+      const authorizationUrl = await service.startLogin({ invitationToken: body.token,
+        returnTo: body.returnTo as string | undefined, requestCorrelationId: request.id });
+      return reply.redirect(authorizationUrl.toString(), 303);
+    } catch { return reply.status(400).send({ error: 'invalid_request' }); }
+  });
+
+  app.get('/auth/recovery', unambiguous, async (request, reply) => {
+    reply.header('Cache-Control', 'no-store').header('Referrer-Policy', 'no-referrer');
+    if (!humanAdministration) return reply.status(503).send({ error: 'authentication_unavailable' });
+    if (request.query && typeof request.query === 'object' && Object.keys(request.query).length > 0) {
+      return reply.status(400).send({ error: 'invalid_request' });
+    }
+    try {
+      const authorizationUrl = await service.startLogin({ requestCorrelationId: request.id, recovery: true });
+      const recovery = new URL(humanAdministration.recoveryUrl);
+      recovery.search = authorizationUrl.search;
+      return reply.redirect(recovery.toString(), 302);
+    } catch { return reply.redirect(service.failurePath, 303); }
   });
 
   app.get('/auth/callback', unambiguous, async (request, reply) => {

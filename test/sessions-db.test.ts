@@ -370,7 +370,14 @@ test(
       await prisma.condominio.update({ where: { id: nextCondominiumId }, data: { deletedAt: new Date() } });
       assert.equal(await store.authenticate(nextLogin.sessionToken, 'deleted-condominium'), null);
       await prisma.condominio.update({ where: { id: nextCondominiumId }, data: { deletedAt: null } });
-      assert.deepEqual(await store.authenticate(nextLogin.sessionToken, 'restored-condominium'), nextLogin.identity);
+      assert.equal(await store.authenticate(nextLogin.sessionToken, 'restored-condominium'), null);
+      assert.equal((await prisma.browserSession.findUniqueOrThrow({
+        where: { id: nextLogin.identity.sessionId }
+      })).revokeReason, 'condominium_disabled');
+      // Restore this fixture only so the remaining independent denial controls exercise the same session row.
+      await prisma.browserSession.update({
+        where: { id: nextLogin.identity.sessionId }, data: { revokedAt: null, revokeReason: null }
+      });
 
       await prisma.humanMembership.update({
         where: { id: nextMembershipId },
