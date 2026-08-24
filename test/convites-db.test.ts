@@ -7,6 +7,7 @@ import { PrismaClient } from '@prisma/client';
 import { createApp } from '../src/app.js';
 import { createDevelopmentHeaderAuthenticator } from '../src/auth.js';
 import {
+  DailyInvitationLimitError,
   consumeInvitationToken,
   createInvitation,
   createInvitations,
@@ -222,6 +223,79 @@ test('PostgreSQL invitation creation is secure, atomic, scoped, and one-use', { 
     await prisma.convidado.update({ where: { id: guestIds[1] }, data: { deletedAt: new Date() } });
     assert.equal(await consumeInvitationToken(store, batch.convites[0]!.token), false);
     await app.close();
+  } finally {
+    await prisma.$disconnect();
+  }
+});
+
+test('PostgreSQL daily limits use resident precedence, UTC days, and serialized batch issuance', { skip: !runDatabaseTests }, async () => {
+  const prisma = new PrismaClient();
+  const store = createPrismaInvitationStore(prisma, secret);
+  const condominioId = uuid(10);
+  const moradorId = uuid(110);
+  const guestIds = Array.from({ length: 16 }, (_, index) => uuid(300 + index));
+  const expiresAt = new Date(Date.now() + 60 * 60 * 1000);
+  const invitation = (convidadoId: string) => ({ condominioId, moradorId, convidadoId, tipo: 'visitante' as const, expiresAt });
+
+  try {
+    await prisma.convite.deleteMany();
+    await prisma.convidado.deleteMany();
+    await prisma.morador.deleteMany();
+    await prisma.condominio.deleteMany();
+    await prisma.securityKey.deleteMany();
+    await prisma.condominio.create({ data: { id: condominioId, nome: 'Principal', responsavel: 'Owner', tipo: 'residencial', dailyInvitationLimit: 10 } });
+    await prisma.morador.create({ data: { id: moradorId, nome: 'Resident', condominioId } });
+    await prisma.convidado.createMany({ data: guestIds.map((id) => ({ id, nome: id, condominioId, moradorId })) });
+
+    for (const guestId of guestIds.slice(0, 10)) {
+      assert.ok(await createInvitation(store, invitation(guestId)));
+    }
+    await assert.rejects(createInvitation(store, invitation(guestIds[10]!)), DailyInvitationLimitError);
+    assert.equal(await prisma.convite.count(), 10, 'the eleventh invitation is not persisted');
+
+    await prisma.convite.deleteMany();
+    for (const guestId of guestIds.slice(0, 9)) {
+      assert.ok(await createInvitation(store, invitation(guestId)));
+    }
+    await assert.rejects(
+      createInvitations(store, [invitation(guestIds[9]!), invitation(guestIds[10]!)]),
+      DailyInvitationLimitError
+    );
+    assert.equal(await prisma.convite.count(), 9, 'a batch over the remaining allowance rolls back entirely');
+
+    await prisma.convite.deleteMany();
+    const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    await prisma.convite.create({ data: { ...invitation(guestIds[0]!), createdAt: yesterday, tokenDigest: createHmac('sha256', secret).update('999999').digest('hex') } });
+    for (const guestId of guestIds.slice(1, 11)) {
+      assert.ok(await createInvitation(store, invitation(guestId)));
+    }
+    assert.equal(await prisma.convite.count(), 11, 'an invitation before the UTC day boundary does not consume today allowance');
+
+    await prisma.convite.deleteMany();
+    await prisma.morador.update({ where: { id: moradorId }, data: { dailyInvitationLimit: 1 } });
+    const simultaneous = await Promise.allSettled([
+      createInvitation(store, invitation(guestIds[0]!)),
+      createInvitation(store, invitation(guestIds[1]!))
+    ]);
+    assert.equal(simultaneous.filter((result) => result.status === 'fulfilled').length, 1);
+    assert.equal(simultaneous.filter((result) => result.status === 'rejected').length, 1);
+    assert.equal(await prisma.convite.count(), 1, 'concurrent issuance cannot exceed the resident limit');
+
+    await prisma.convite.deleteMany();
+    const used = await createInvitation(store, invitation(guestIds[0]!));
+    assert.ok(used);
+    assert.equal(await consumeInvitationToken(store, used.token), true);
+    await assert.rejects(createInvitation(store, invitation(guestIds[1]!)), DailyInvitationLimitError);
+    await prisma.convite.update({ where: { id: used.convite.id }, data: { deletedAt: new Date() } });
+    assert.ok(await createInvitation(store, invitation(guestIds[1]!)), 'soft-deleted invitations no longer count');
+
+    await prisma.convite.deleteMany();
+    await prisma.morador.update({ where: { id: moradorId }, data: { dailyInvitationLimit: null } });
+    await prisma.condominio.update({ where: { id: condominioId }, data: { dailyInvitationLimit: null } });
+    for (const guestId of guestIds.slice(0, 12)) {
+      assert.ok(await createInvitation(store, invitation(guestId)));
+    }
+    assert.equal(await prisma.convite.count(), 12, 'null at both levels represents an unlimited default');
   } finally {
     await prisma.$disconnect();
   }

@@ -56,6 +56,12 @@ export class TokenGenerationExhaustedError extends Error {
   }
 }
 
+export class DailyInvitationLimitError extends Error {
+  constructor() {
+    super('Daily invitation limit reached');
+  }
+}
+
 export function generateSixDigitToken() {
   return randomInt(TOKEN_LIMIT).toString().padStart(6, '0');
 }
@@ -179,8 +185,14 @@ export function createPrismaInvitationStore(client: PrismaClient, tokenSecret: s
     const guestIds = allocations.map((allocation) => allocation.convidadoId);
     const first = allocations[0]!;
     const earliestExpiration = new Date(Math.min(...allocations.map((allocation) => allocation.expiresAt.getTime())));
-    const activeGuests = await transaction.$queryRaw<Array<{ id: string }>>(Prisma.sql`
-      SELECT convidado.id
+    const activeGuests = await transaction.$queryRaw<Array<{
+      id: string;
+      residentLimit: number | null;
+      condominiumLimit: number | null;
+    }>>(Prisma.sql`
+      SELECT convidado.id,
+             morador."dailyInvitationLimit" AS "residentLimit",
+             condominio."dailyInvitationLimit" AS "condominiumLimit"
       FROM "Convidado" AS convidado
       JOIN "Morador" AS morador
         ON morador.id = convidado."moradorId"
@@ -199,6 +211,23 @@ export function createPrismaInvitationStore(client: PrismaClient, tokenSecret: s
 
     if (activeGuests.length !== allocations.length) {
       return null;
+    }
+
+    // The resident and condominium locks above serialize all issuance for this resident.
+    // A UTC calendar day counts every non-deleted issuance, including used invitations.
+    const limit = activeGuests[0]!.residentLimit ?? activeGuests[0]!.condominiumLimit;
+    if (limit !== null) {
+      const [{ count }] = await transaction.$queryRaw<Array<{ count: bigint }>>`
+        SELECT COUNT(*)::bigint AS count
+        FROM "Convite"
+        WHERE "condominioId" = ${first.condominioId}
+          AND "moradorId" = ${first.moradorId}
+          AND "deletedAt" IS NULL
+          AND "createdAt" >= date_trunc('day', clock_timestamp() AT TIME ZONE 'UTC')
+      `;
+      if (count + BigInt(allocations.length) > BigInt(limit)) {
+        throw new DailyInvitationLimitError();
+      }
     }
 
     const convites: InvitationRecord[] = [];
@@ -431,6 +460,9 @@ export function registerConviteRoutes(
       if (error instanceof TokenGenerationExhaustedError) {
         return reply.status(503).send({ error: 'Invitation token unavailable' });
       }
+      if (error instanceof DailyInvitationLimitError) {
+        return reply.status(429).send({ error: 'Daily invitation limit reached' });
+      }
       throw error;
     }
   });
@@ -492,6 +524,9 @@ export function registerConviteRoutes(
     } catch (error) {
       if (error instanceof TokenGenerationExhaustedError) {
         return reply.status(503).send({ error: 'Invitation token unavailable' });
+      }
+      if (error instanceof DailyInvitationLimitError) {
+        return reply.status(429).send({ error: 'Daily invitation limit reached' });
       }
       throw error;
     }
