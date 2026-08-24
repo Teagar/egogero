@@ -3,6 +3,8 @@ import Fastify from 'fastify';
 import { authorize, isUuid, unauthenticatedAuthenticator } from './auth.js';
 import type { Authenticator } from './auth.js';
 import { registerConvidadoRoutes } from './convidados.js';
+import { registerConviteRoutes, unavailableInvitationIssuer } from './convites.js';
+import type { InvitationIssuer } from './convites.js';
 import { prisma as defaultPrisma } from './lib/prisma.js';
 
 type CondominioRecord = {
@@ -358,8 +360,9 @@ const defaultStore: AppStore = {
 export function createApp(
   {
     db = defaultStore,
-    authenticator = unauthenticatedAuthenticator
-  }: { db?: AppStore; authenticator?: Authenticator } = {}
+    authenticator = unauthenticatedAuthenticator,
+    invitationIssuer = unavailableInvitationIssuer
+  }: { db?: AppStore; authenticator?: Authenticator; invitationIssuer?: InvitationIssuer } = {}
 ) {
   const app = Fastify({ logger: false });
   const condominioManagement = { preHandler: authorize(authenticator, 'condominios:manage') };
@@ -581,6 +584,7 @@ export function createApp(
   });
 
   registerConvidadoRoutes(app, db, authenticator);
+  registerConviteRoutes(app, db, authenticator, invitationIssuer);
 
   return app;
 }

@@ -5,6 +5,7 @@ import { createApp } from '../src/app.js';
 import type { AppStore } from '../src/app.js';
 import { ROLES, createDevelopmentHeaderAuthenticator } from '../src/auth.js';
 import type { Role } from '../src/auth.js';
+import type { InvitationIssuer } from '../src/convites.js';
 
 const CONDOMINIO_ID = '00000000-0000-4000-8000-000000000001';
 const OTHER_CONDOMINIO_ID = '00000000-0000-4000-8000-000000000002';
@@ -12,6 +13,13 @@ const MORADOR_ID = '00000000-0000-4000-8000-000000000101';
 const CONVIDADO_ID = '00000000-0000-4000-8000-000000000201';
 const createdAt = new Date('2026-01-01T00:00:00.000Z');
 const authenticator = createDevelopmentHeaderAuthenticator(true);
+const invitationIssuer: InvitationIssuer = {
+  async issueForRegisteredGuests(batch) {
+    return batch.convidadoIds.map((convidadoId, index) => ({
+      conviteId: `convite-${index}`, convidadoId, token: `token-${index}`, expiraEm: createdAt
+    }));
+  }
+};
 
 const condominio = {
   id: CONDOMINIO_ID,
@@ -243,6 +251,16 @@ const endpoints: Endpoint[] = [
     },
     roles: ['provedor', 'sindico', 'morador'],
     successStatus: 204
+  },
+  {
+    name: 'create batch invitations',
+    request: {
+      method: 'POST',
+      url: `/condominios/${CONDOMINIO_ID}/moradores/${MORADOR_ID}/convites/multiplos`,
+      payload: { convidadoIds: [CONVIDADO_ID] }
+    },
+    roles: ['provedor', 'sindico', 'morador'],
+    successStatus: 201
   }
 ];
 
@@ -257,7 +275,7 @@ function developmentHeaders(role: Role) {
 test('RBAC matrix covers every official role and business endpoint', async () => {
   for (const endpoint of endpoints) {
     for (const role of ROLES) {
-      const app = createApp({ db: createAuthorizationStore(), authenticator });
+      const app = createApp({ db: createAuthorizationStore(), authenticator, invitationIssuer });
       const response = await app.inject({ ...endpoint.request, headers: developmentHeaders(role) });
       const expectedStatus = endpoint.roles.includes(role) ? endpoint.successStatus : 403;
 
@@ -269,7 +287,7 @@ test('RBAC matrix covers every official role and business endpoint', async () =>
 
 test('business endpoints reject missing identity and the legacy role header', async () => {
   for (const endpoint of endpoints) {
-    const app = createApp({ db: createAuthorizationStore(), authenticator });
+    const app = createApp({ db: createAuthorizationStore(), authenticator, invitationIssuer });
     const missingIdentity = await app.inject(endpoint.request);
     const forgedLegacyRole = await app.inject({
       ...endpoint.request,
@@ -311,7 +329,13 @@ test('tenant matrix prevents a sindico from reaching another condominium before 
         .replaceAll(MORADOR_ID, otherMorador.id)
         .replaceAll(CONVIDADO_ID, otherConvidado.id),
       payload: endpoint.request.payload
-        ? { ...endpoint.request.payload, condominioId: OTHER_CONDOMINIO_ID }
+        ? {
+            ...endpoint.request.payload,
+            condominioId: OTHER_CONDOMINIO_ID,
+            convidadoIds: Array.isArray(endpoint.request.payload.convidadoIds)
+              ? endpoint.request.payload.convidadoIds.map((id) => id === CONVIDADO_ID ? otherConvidado.id : id)
+              : undefined
+          }
         : undefined
     }
   }));
@@ -381,7 +405,7 @@ test('tenant matrix prevents a sindico from reaching another condominium before 
           }
         }
       };
-      const app = createApp({ db, authenticator });
+      const app = createApp({ db, authenticator, invitationIssuer });
       const response = await app.inject({ ...endpoint.request, headers: developmentHeaders(role) });
 
       if (role === 'provedor') {
@@ -411,7 +435,7 @@ test('resident guest ownership is enforced before any store access', async () =>
   };
 
   for (const endpoint of endpoints.slice(10)) {
-    const app = createApp({ db, authenticator });
+    const app = createApp({ db, authenticator, invitationIssuer });
     const request = {
       ...endpoint.request,
       url: endpoint.request.url.replaceAll(MORADOR_ID, otherMorador.id)
@@ -436,14 +460,15 @@ test('route inventory keeps every business route in the RBAC matrix', async () =
       '│   └── /:id|:condominioId (GET, HEAD, PATCH, DELETE)',
       '│       └── /moradores (GET, HEAD)',
       '│           └── /:id|:moradorId (GET, HEAD, PATCH, DELETE)',
-      '│               └── /convidados (POST, GET, HEAD)',
-      '│                   ├── /recentes (GET, HEAD)',
-      '│                   └── /:id (GET, HEAD, PATCH, DELETE)',
+      '│               ├── /convidados (POST, GET, HEAD)',
+      '│               │   ├── /recentes (GET, HEAD)',
+      '│               │   └── /:id (GET, HEAD, PATCH, DELETE)',
+      '│               └── /convites/multiplos (POST)',
       '└── /moradores (POST)',
       ''
     ].join('\n')
   );
-  assert.equal(endpoints.length, 16);
+  assert.equal(endpoints.length, 17);
 
   await app.close();
 });
