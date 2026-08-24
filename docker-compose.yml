@@ -7,6 +7,8 @@ services:
       POSTGRES_PASSWORD: office
     ports:
       - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U office -d office"]
       interval: 5s
@@ -25,3 +27,6 @@ services:
     depends_on:
       db:
         condition: service_healthy
+
+volumes:
+  postgres_data:
