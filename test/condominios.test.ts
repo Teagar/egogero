@@ -2,12 +2,12 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { createApp } from '../src/app.js';
-import type { CondominioStore } from '../src/app.js';
+import type { AppStore } from '../src/app.js';
 
 const providerHeaders = { 'x-user-role': 'provedor' };
 const moradorHeaders = { 'x-user-role': 'morador' };
 
-type StoredCondominio = Awaited<ReturnType<CondominioStore['condominio']['create']>>;
+type StoredCondominio = Awaited<ReturnType<AppStore['condominio']['create']>>;
 
 function clone(condominio: StoredCondominio) {
   return {
@@ -21,7 +21,7 @@ function createFakeStore() {
   const rows = new Map<string, StoredCondominio>();
   let nextId = 1;
 
-  const db: CondominioStore = {
+  const db: AppStore = {
     condominio: {
       async create({ data }) {
         const row = {
@@ -62,6 +62,20 @@ function createFakeStore() {
 
         rows.set(row.id, { ...row, ...data });
         return { count: 1 };
+      }
+    },
+    morador: {
+      async create() {
+        throw new Error('Unexpected resident create');
+      },
+      async findMany() {
+        throw new Error('Unexpected resident findMany');
+      },
+      async findFirst() {
+        throw new Error('Unexpected resident findFirst');
+      },
+      async updateMany() {
+        throw new Error('Unexpected resident updateMany');
       }
     }
   };

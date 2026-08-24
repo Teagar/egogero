@@ -22,20 +22,67 @@ type CondominioUpdateData = Partial<CondominioCreateData> & {
   deletedAt?: Date;
 };
 
-export type CondominioStore = {
+type MoradorRecord = {
+  id: string;
+  createdAt: Date;
+  deletedAt: Date | null;
+  nome: string;
+  condominioId: string;
+  enderecoRua: string | null;
+  enderecoNumero: string | null;
+  enderecoBloco: string | null;
+  enderecoApartamento: string | null;
+};
+
+type MoradorEnderecoData = {
+  enderecoRua: string | null;
+  enderecoNumero: string | null;
+  enderecoBloco: string | null;
+  enderecoApartamento: string | null;
+};
+
+type MoradorCreateData = MoradorEnderecoData & {
+  nome: string;
+  condominioId: string;
+};
+
+type MoradorUpdateData = Partial<Pick<MoradorCreateData, 'nome'>> &
+  Partial<MoradorEnderecoData> & {
+    deletedAt?: Date;
+  };
+
+export type AppStore = {
   condominio: {
     create(args: { data: CondominioCreateData }): Promise<CondominioRecord>;
     findMany(args: { where: { deletedAt: null }; orderBy: { createdAt: 'desc' } }): Promise<CondominioRecord[]>;
     findFirst(args: { where: { id: string; deletedAt: null } }): Promise<CondominioRecord | null>;
     updateMany(args: { where: { id: string; deletedAt: null }; data: CondominioUpdateData }): Promise<{ count: number }>;
   };
+  morador: {
+    create(args: { data: MoradorCreateData }): Promise<MoradorRecord>;
+    findMany(args: {
+      where: { condominioId: string; deletedAt: null };
+      orderBy: { createdAt: 'desc' };
+    }): Promise<MoradorRecord[]>;
+    findFirst(args: {
+      where: { id: string; condominioId?: string; deletedAt: null };
+    }): Promise<MoradorRecord | null>;
+    updateMany(args: {
+      where: { id: string; condominioId: string; deletedAt: null };
+      data: MoradorUpdateData;
+    }): Promise<{ count: number }>;
+  };
 };
 
+export type CondominioStore = AppStore;
+
 type CondominioBody = Partial<Record<keyof CondominioCreateData, unknown>>;
+type MoradorBody = Partial<Record<'nome' | 'condominioId' | 'endereco', unknown>>;
+type EnderecoBody = Partial<Record<'rua' | 'numero' | 'bloco' | 'apartamento', unknown>>;
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
-function requireProvedor(request: FastifyRequest, reply: FastifyReply) {
+function requireRoles(request: FastifyRequest, reply: FastifyReply, allowedRoles: string[]) {
   const roleHeader = request.headers['x-user-role'];
   const role = Array.isArray(roleHeader) ? roleHeader[0] : roleHeader;
 
@@ -44,7 +91,7 @@ function requireProvedor(request: FastifyRequest, reply: FastifyReply) {
     return false;
   }
 
-  if (role !== 'provedor') {
+  if (!allowedRoles.includes(role)) {
     reply.status(403).send({ error: 'Forbidden' });
     return false;
   }
@@ -52,7 +99,15 @@ function requireProvedor(request: FastifyRequest, reply: FastifyReply) {
   return true;
 }
 
-function readRequiredString(body: CondominioBody, field: keyof CondominioCreateData) {
+function requireProvedor(request: FastifyRequest, reply: FastifyReply) {
+  return requireRoles(request, reply, ['provedor']);
+}
+
+function requireMoradorManager(request: FastifyRequest, reply: FastifyReply) {
+  return requireRoles(request, reply, ['provedor', 'contratante']);
+}
+
+function readRequiredString(body: Partial<Record<string, unknown>>, field: string) {
   const value = body[field];
 
   if (typeof value !== 'string') {
@@ -104,12 +159,113 @@ function parseUpdateBody(body: unknown) {
 }
 
 function parseId(params: unknown) {
+  return parseUuidParam(params, 'id');
+}
+
+function parseUuidParam(params: unknown, field: string) {
   if (!params || typeof params !== 'object' || Array.isArray(params)) {
     return null;
   }
 
-  const { id } = params as { id?: unknown };
-  return typeof id === 'string' && UUID_PATTERN.test(id) ? id : null;
+  const value = (params as Record<string, unknown>)[field];
+  return typeof value === 'string' && UUID_PATTERN.test(value) ? value : null;
+}
+
+function parseEndereco(value: unknown): MoradorEnderecoData | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return null;
+  }
+
+  const payload = value as EnderecoBody;
+  const rua = readEnderecoString(payload, 'rua');
+  const numero = readEnderecoString(payload, 'numero');
+  const bloco = readEnderecoString(payload, 'bloco');
+  const apartamento = readEnderecoString(payload, 'apartamento');
+  const hasRuaNumero = Boolean(rua && numero && !bloco && !apartamento);
+  const hasBlocoApartamento = Boolean(bloco && apartamento && !rua && !numero);
+
+  if (hasRuaNumero) {
+    return {
+      enderecoRua: rua,
+      enderecoNumero: numero,
+      enderecoBloco: null,
+      enderecoApartamento: null
+    };
+  }
+
+  if (hasBlocoApartamento) {
+    return {
+      enderecoRua: null,
+      enderecoNumero: null,
+      enderecoBloco: bloco,
+      enderecoApartamento: apartamento
+    };
+  }
+
+  return null;
+}
+
+function readEnderecoString(body: EnderecoBody, field: keyof EnderecoBody) {
+  if (!Object.hasOwn(body, field)) {
+    return null;
+  }
+
+  const value = body[field];
+
+  if (typeof value !== 'string') {
+    return null;
+  }
+
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+function parseMoradorCreateBody(body: unknown) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    return null;
+  }
+
+  const payload = body as MoradorBody;
+  const nome = readRequiredString(payload, 'nome');
+  const condominioId = typeof payload.condominioId === 'string' && UUID_PATTERN.test(payload.condominioId) ? payload.condominioId : null;
+  const endereco = parseEndereco(payload.endereco);
+
+  if (!nome || !condominioId || !endereco) {
+    return null;
+  }
+
+  return { nome, condominioId, ...endereco };
+}
+
+function parseMoradorUpdateBody(body: unknown) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    return null;
+  }
+
+  const payload = body as MoradorBody;
+  const data: MoradorUpdateData = {};
+
+  if (Object.hasOwn(payload, 'nome')) {
+    const nome = readRequiredString(payload, 'nome');
+
+    if (!nome) {
+      return null;
+    }
+
+    data.nome = nome;
+  }
+
+  if (Object.hasOwn(payload, 'endereco')) {
+    const endereco = parseEndereco(payload.endereco);
+
+    if (!endereco) {
+      return null;
+    }
+
+    Object.assign(data, endereco);
+  }
+
+  return Object.keys(data).length > 0 ? data : null;
 }
 
 function toCondominioResponse(condominio: CondominioRecord) {
@@ -122,7 +278,25 @@ function toCondominioResponse(condominio: CondominioRecord) {
   };
 }
 
-export function createApp({ db = defaultPrisma }: { db?: CondominioStore } = {}) {
+function toMoradorResponse(morador: MoradorRecord) {
+  const endereco = morador.enderecoRua
+    ? { rua: morador.enderecoRua, numero: morador.enderecoNumero }
+    : { bloco: morador.enderecoBloco, apartamento: morador.enderecoApartamento };
+
+  return {
+    id: morador.id,
+    createdAt: morador.createdAt.toISOString(),
+    condominioId: morador.condominioId,
+    nome: morador.nome,
+    endereco
+  };
+}
+
+async function ensureActiveCondominio(db: AppStore, condominioId: string) {
+  return db.condominio.findFirst({ where: { id: condominioId, deletedAt: null } });
+}
+
+export function createApp({ db = defaultPrisma }: { db?: AppStore } = {}) {
   const app = Fastify({ logger: false });
 
   app.get('/health', async () => ({ status: 'ok' }));
@@ -225,6 +399,160 @@ export function createApp({ db = defaultPrisma }: { db?: CondominioStore } = {})
 
     if (result.count === 0) {
       return reply.status(404).send({ error: 'Condominium not found' });
+    }
+
+    return reply.status(204).send();
+  });
+
+  app.post('/moradores', async (request, reply) => {
+    if (!requireMoradorManager(request, reply)) {
+      return;
+    }
+
+    const data = parseMoradorCreateBody(request.body);
+
+    if (!data) {
+      return reply.status(400).send({ error: 'Invalid resident payload' });
+    }
+
+    const condominio = await ensureActiveCondominio(db, data.condominioId);
+
+    if (!condominio) {
+      return reply.status(404).send({ error: 'Condominium not found' });
+    }
+
+    const morador = await db.morador.create({ data });
+    return reply.status(201).send(toMoradorResponse(morador));
+  });
+
+  app.get('/condominios/:condominioId/moradores', async (request, reply) => {
+    if (!requireMoradorManager(request, reply)) {
+      return;
+    }
+
+    const condominioId = parseUuidParam(request.params, 'condominioId');
+
+    if (!condominioId) {
+      return reply.status(400).send({ error: 'Invalid condominium id' });
+    }
+
+    const condominio = await ensureActiveCondominio(db, condominioId);
+
+    if (!condominio) {
+      return reply.status(404).send({ error: 'Condominium not found' });
+    }
+
+    const moradores = await db.morador.findMany({
+      where: { condominioId, deletedAt: null },
+      orderBy: { createdAt: 'desc' }
+    });
+
+    return moradores.map(toMoradorResponse);
+  });
+
+  app.get('/condominios/:condominioId/moradores/:id', async (request, reply) => {
+    if (!requireMoradorManager(request, reply)) {
+      return;
+    }
+
+    const condominioId = parseUuidParam(request.params, 'condominioId');
+    const id = parseId(request.params);
+
+    if (!condominioId) {
+      return reply.status(400).send({ error: 'Invalid condominium id' });
+    }
+
+    if (!id) {
+      return reply.status(400).send({ error: 'Invalid resident id' });
+    }
+
+    const condominio = await ensureActiveCondominio(db, condominioId);
+
+    if (!condominio) {
+      return reply.status(404).send({ error: 'Condominium not found' });
+    }
+
+    const morador = await db.morador.findFirst({ where: { id, condominioId, deletedAt: null } });
+
+    if (!morador) {
+      return reply.status(404).send({ error: 'Resident not found' });
+    }
+
+    return toMoradorResponse(morador);
+  });
+
+  app.patch('/condominios/:condominioId/moradores/:id', async (request, reply) => {
+    if (!requireMoradorManager(request, reply)) {
+      return;
+    }
+
+    const condominioId = parseUuidParam(request.params, 'condominioId');
+    const id = parseId(request.params);
+
+    if (!condominioId) {
+      return reply.status(400).send({ error: 'Invalid condominium id' });
+    }
+
+    if (!id) {
+      return reply.status(400).send({ error: 'Invalid resident id' });
+    }
+
+    const condominio = await ensureActiveCondominio(db, condominioId);
+
+    if (!condominio) {
+      return reply.status(404).send({ error: 'Condominium not found' });
+    }
+
+    const data = parseMoradorUpdateBody(request.body);
+
+    if (!data) {
+      return reply.status(400).send({ error: 'Invalid resident payload' });
+    }
+
+    const result = await db.morador.updateMany({ where: { id, condominioId, deletedAt: null }, data });
+
+    if (result.count === 0) {
+      return reply.status(404).send({ error: 'Resident not found' });
+    }
+
+    const morador = await db.morador.findFirst({ where: { id, condominioId, deletedAt: null } });
+
+    if (!morador) {
+      return reply.status(404).send({ error: 'Resident not found' });
+    }
+
+    return toMoradorResponse(morador);
+  });
+
+  app.delete('/condominios/:condominioId/moradores/:id', async (request, reply) => {
+    if (!requireMoradorManager(request, reply)) {
+      return;
+    }
+
+    const condominioId = parseUuidParam(request.params, 'condominioId');
+    const id = parseId(request.params);
+
+    if (!condominioId) {
+      return reply.status(400).send({ error: 'Invalid condominium id' });
+    }
+
+    if (!id) {
+      return reply.status(400).send({ error: 'Invalid resident id' });
+    }
+
+    const condominio = await ensureActiveCondominio(db, condominioId);
+
+    if (!condominio) {
+      return reply.status(404).send({ error: 'Condominium not found' });
+    }
+
+    const result = await db.morador.updateMany({
+      where: { id, condominioId, deletedAt: null },
+      data: { deletedAt: new Date() }
+    });
+
+    if (result.count === 0) {
+      return reply.status(404).send({ error: 'Resident not found' });
     }
 
     return reply.status(204).send();
