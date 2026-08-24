@@ -228,6 +228,137 @@ test('PostgreSQL invitation creation is secure, atomic, scoped, and one-use', { 
   }
 });
 
+test('PostgreSQL gatehouse validation is tenant-scoped, one-use, and fail-closed', { skip: !runDatabaseTests }, async () => {
+  const prisma = new PrismaClient();
+  const store = createPrismaInvitationStore(prisma, secret);
+  const condominioId = uuid(20);
+  const otherCondominioId = uuid(21);
+  const moradorId = uuid(120);
+  const otherMoradorId = uuid(121);
+  const guestIds = Array.from({ length: 8 }, (_, index) => uuid(420 + index));
+  const future = new Date(Date.now() + 60 * 60 * 1000);
+  const create = (guestId: string, token: string, tenant = condominioId, resident = moradorId) => createInvitation(
+    store,
+    { condominioId: tenant, moradorId: resident, convidadoId: guestId, tipo: 'visitante', expiresAt: future },
+    { generateToken: () => token }
+  );
+  const headers = (tenant: string) => ({
+    'x-development-user-id': `gatehouse-${tenant}`,
+    'x-development-user-role': 'portaria',
+    'x-development-condominio-id': tenant
+  });
+
+  try {
+    await prisma.convite.deleteMany();
+    await prisma.convidado.deleteMany();
+    await prisma.morador.deleteMany();
+    await prisma.condominio.deleteMany();
+    await prisma.securityKey.deleteMany();
+    await prisma.condominio.createMany({
+      data: [
+        { id: condominioId, nome: 'Principal', responsavel: 'Owner', tipo: 'residencial' },
+        { id: otherCondominioId, nome: 'Other', responsavel: 'Other', tipo: 'residencial' }
+      ]
+    });
+    await prisma.morador.createMany({
+      data: [
+        { id: moradorId, nome: 'Resident', condominioId },
+        { id: otherMoradorId, nome: 'Other resident', condominioId: otherCondominioId }
+      ]
+    });
+    await prisma.convidado.createMany({
+      data: [
+        ...guestIds.slice(0, 7).map((id, index) => ({ id, nome: `Guest ${index}`, condominioId, moradorId })),
+        { id: guestIds[7]!, nome: 'Other guest', condominioId: otherCondominioId, moradorId: otherMoradorId }
+      ]
+    });
+
+    const valid = await create(guestIds[0]!, '101010');
+    const expired = await create(guestIds[1]!, '202020');
+    const revoked = await create(guestIds[2]!, '303030');
+    const wrongTenant = await create(guestIds[7]!, '404040', otherCondominioId, otherMoradorId);
+    const deletedGuest = await create(guestIds[3]!, '505050');
+    const deletedResident = await create(guestIds[4]!, '606060');
+    const concurrent = await create(guestIds[5]!, '707070');
+    const deletedCondominium = await create(guestIds[6]!, '808080');
+    assert.ok(valid && expired && revoked && wrongTenant && deletedGuest && deletedResident && concurrent && deletedCondominium);
+
+    await prisma.convite.update({
+      where: { id: expired.convite.id },
+      data: {
+        createdAt: new Date(Date.now() - 2 * 60 * 60 * 1000),
+        expiresAt: new Date(Date.now() - 60 * 60 * 1000)
+      }
+    });
+    assert.equal(await store.revokeActive({ id: revoked.convite.id, condominioId, moradorId }, new Date()), 'revoked');
+    await prisma.convidado.update({ where: { id: deletedGuest.convite.convidadoId! }, data: { deletedAt: new Date() } });
+
+    const app = createApp({ authenticator: createDevelopmentHeaderAuthenticator(true), invitationTokenSecret: secret });
+    const validate = (token: string, tenant = condominioId) => app.inject({
+      method: 'POST',
+      url: '/portaria/convites/validar',
+      headers: headers(tenant),
+      payload: { token }
+    });
+    const denied = { allowed: false, reason: 'invalid_or_unavailable' };
+
+    const allowed = await validate(valid.token);
+    assert.equal(allowed.statusCode, 200);
+    assert.equal(allowed.headers['cache-control'], 'no-store');
+    assert.deepEqual(allowed.json(), {
+      allowed: true,
+      guest: { name: 'Guest 0' },
+      invitation: { type: 'visitante' }
+    });
+    assert.equal(allowed.body.includes(valid.token), false);
+    assert.deepEqual((await validate(valid.token)).json(), denied, 'replay is denied');
+    const persistedValid = await prisma.convite.findUniqueOrThrow({ where: { id: valid.convite.id } });
+    assert.ok(persistedValid.usedAt);
+    assert.equal(persistedValid.tokenDigest, null);
+    assert.ok((await prisma.convidado.findUniqueOrThrow({ where: { id: guestIds[0]! } })).ultimoUsoEm);
+
+    assert.deepEqual((await validate(expired.token)).json(), denied);
+    assert.deepEqual((await validate(revoked.token)).json(), denied);
+    assert.deepEqual((await validate(wrongTenant.token)).json(), denied);
+    assert.equal((await prisma.convite.findUniqueOrThrow({ where: { id: wrongTenant.convite.id } })).usedAt, null);
+    assert.deepEqual((await validate(deletedGuest.token)).json(), denied);
+
+    await prisma.morador.update({ where: { id: moradorId }, data: { deletedAt: new Date() } });
+    assert.deepEqual((await validate(deletedResident.token)).json(), denied);
+    await prisma.morador.update({ where: { id: moradorId }, data: { deletedAt: null } });
+    await prisma.condominio.update({ where: { id: condominioId }, data: { deletedAt: new Date() } });
+    assert.deepEqual((await validate(deletedCondominium.token)).json(), denied);
+    await prisma.condominio.update({ where: { id: condominioId }, data: { deletedAt: null } });
+
+    for (const payload of [{ token: '12345' }, { token: 'abcdef' }, { token: '123456', extra: true }]) {
+      assert.deepEqual((await app.inject({ method: 'POST', url: '/portaria/convites/validar', headers: headers(condominioId), payload })).json(), denied);
+    }
+
+    const simultaneous = await Promise.all([validate(concurrent.token), validate(concurrent.token)]);
+    assert.equal(simultaneous.filter((response) => response.json().allowed === true).length, 1);
+    assert.equal(simultaneous.filter((response) => response.json().allowed === false).length, 1);
+
+    const mismatchedSecretApp = createApp({
+      authenticator: createDevelopmentHeaderAuthenticator(true),
+      invitationTokenSecret: 'different-database-e2e-secret-32-bytes-minimum'
+    });
+    const mismatch = await mismatchedSecretApp.inject({
+      method: 'POST',
+      url: '/portaria/convites/validar',
+      headers: headers(otherCondominioId),
+      payload: { token: wrongTenant.token }
+    });
+    assert.equal(mismatch.statusCode, 503);
+    assert.deepEqual(mismatch.json(), { allowed: false, reason: 'service_unavailable' });
+    assert.equal((await prisma.convite.findUniqueOrThrow({ where: { id: wrongTenant.convite.id } })).usedAt, null);
+
+    await mismatchedSecretApp.close();
+    await app.close();
+  } finally {
+    await prisma.$disconnect();
+  }
+});
+
 test('PostgreSQL daily limits use resident precedence, UTC days, and serialized batch issuance', { skip: !runDatabaseTests }, async () => {
   const prisma = new PrismaClient();
   const store = createPrismaInvitationStore(prisma, secret);

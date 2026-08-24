@@ -135,6 +135,21 @@ function createAuthorizationStore(): AppDependencies {
       async consumeActive() {
         return true;
       },
+      async validateActive(_args, now) {
+        return {
+          allowed: true,
+          guest: { name: convidado.nome },
+          invitation: { type: convite.tipo },
+          event: {
+            invitationId: convite.id,
+            condominiumId: CONDOMINIO_ID,
+            residentId: MORADOR_ID,
+            guestId: CONVIDADO_ID,
+            invitationType: convite.tipo,
+            usedAt: now
+          }
+        };
+      },
       async revokeActive() {
         return 'revoked' as const;
       }
@@ -315,6 +330,12 @@ const endpoints: Endpoint[] = [
     },
     roles: ['provedor', 'sindico'],
     successStatus: 200
+  },
+  {
+    name: 'validate invitation at gatehouse',
+    request: { method: 'POST', url: '/portaria/convites/validar', payload: { token: '123456' } },
+    roles: ['portaria'],
+    successStatus: 200
   }
 ];
 
@@ -374,7 +395,7 @@ test('business endpoints reject missing identity and the legacy role header', as
 });
 
 test('tenant matrix prevents a sindico from reaching another condominium before store access', async () => {
-  const otherResidentEndpoints = endpoints.slice(5).map((endpoint) => ({
+  const otherResidentEndpoints = endpoints.slice(5).filter((endpoint) => endpoint.name !== 'validate invitation at gatehouse').map((endpoint) => ({
     ...endpoint,
     request: {
       ...endpoint.request,
@@ -471,6 +492,10 @@ test('tenant matrix prevents a sindico from reaching another condominium before 
             storeCalls += 1;
             return store.convite!.consumeActive(token, now);
           },
+          validateActive: async (args, now) => {
+            storeCalls += 1;
+            return store.convite!.validateActive(args, now);
+          },
           revokeActive: async (args, now) => {
             storeCalls += 1;
             return store.convite!.revokeActive(args, now);
@@ -480,7 +505,7 @@ test('tenant matrix prevents a sindico from reaching another condominium before 
       const app = createApp({ db, authenticator });
       const response = await app.inject({ ...endpoint.request, headers: developmentHeaders(role) });
 
-      if (role === 'provedor') {
+      if (role === 'provedor' && endpoint.roles.includes(role)) {
         assert.equal(response.statusCode, endpoint.successStatus, `${role}: ${endpoint.name}`);
         assert.ok(storeCalls > 0, `${role}: ${endpoint.name} should reach its tenant data`);
         if (!['create invitation', 'update condominium invitation limit'].includes(endpoint.name)) {
@@ -506,7 +531,7 @@ test('resident guest ownership is enforced before any store access', async () =>
     condominio: { create: inaccessible, findMany: inaccessible, findFirst: inaccessible, updateMany: inaccessible },
     morador: { create: inaccessible, findMany: inaccessible, findFirst: inaccessible, updateMany: inaccessible },
     convidado: { create: inaccessible, findMany: inaccessible, findFirst: inaccessible, updateMany: inaccessible },
-    convite: { createActive: inaccessible, createBatchActive: inaccessible, consumeActive: inaccessible, revokeActive: inaccessible }
+    convite: { createActive: inaccessible, createBatchActive: inaccessible, consumeActive: inaccessible, validateActive: inaccessible, revokeActive: inaccessible }
   };
 
   for (const endpoint of endpoints.slice(10)) {
@@ -543,11 +568,12 @@ test('route inventory keeps every business route in the RBAC matrix', async () =
       '│               │       └── /convites (POST)',
       '│               ├── /convites/multiplos (POST)',
       '│               └── /convites/:conviteId (DELETE)',
-      '└── /moradores (POST)',
+      '├── /moradores (POST)',
+      '└── /portaria/convites/validar (POST)',
       ''
     ].join('\n')
   );
-  assert.equal(endpoints.length, 21);
+  assert.equal(endpoints.length, 22);
 
   await app.close();
 });

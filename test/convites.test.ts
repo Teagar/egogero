@@ -88,6 +88,24 @@ function uniqueMemoryStore(initialTokens: string[] = []): InvitationStore & {
     async consumeActive(token: string) {
       return activeTokens.delete(token);
     },
+    async validateActive({ token, condominiumId }: { token: string; condominiumId: string }) {
+      if (condominiumId !== CONDOMINIO_ID || !activeTokens.delete(token)) {
+        return { allowed: false as const, reason: 'invalid_or_unavailable' as const };
+      }
+      return {
+        allowed: true as const,
+        guest: { name: 'Guest' },
+        invitation: { type: 'visitante' as const },
+        event: {
+          invitationId: uuid(300),
+          condominiumId,
+          residentId: MORADOR_ID,
+          guestId: CONVIDADO_ID,
+          invitationType: 'visitante' as const,
+          usedAt: NOW
+        }
+      };
+    },
     async revokeActive() {
       return 'revoked' as const;
     }
@@ -231,6 +249,7 @@ test('revocation route is scoped, idempotent for revoked invitations, and fails 
     async createActive() { throw new Error('Unexpected create'); },
     async createBatchActive() { throw new Error('Unexpected create'); },
     async consumeActive() { throw new Error('Unexpected consume'); },
+    async validateActive() { throw new Error('Unexpected validate'); },
     async revokeActive(args) {
       calls.push(args);
       return outcomes.shift() ?? 'unavailable';
@@ -278,6 +297,84 @@ test('single creation exposes plaintext once with no-store and enforces scope be
   assert.equal(wrongOwner.statusCode, 403);
   assert.equal(wrongTenant.statusCode, 403);
   assert.equal(store.batchCalls, calls);
+  await app.close();
+});
+
+test('gatehouse validation is portaria-only, tenant-scoped, non-oracular, and minimal', async () => {
+  const token = '123456';
+  const store = uniqueMemoryStore([token]);
+  const app = Fastify({ logger: false });
+  registerConviteRoutes(app, batchStore(), store, authenticator);
+  const portariaHeaders = {
+    'x-development-user-id': 'gatehouse-device-1',
+    'x-development-user-role': 'portaria',
+    'x-development-condominio-id': CONDOMINIO_ID
+  };
+
+  const allowed = await app.inject({
+    method: 'POST',
+    url: '/portaria/convites/validar',
+    headers: portariaHeaders,
+    payload: { token }
+  });
+  assert.equal(allowed.statusCode, 200);
+  assert.equal(allowed.headers['cache-control'], 'no-store');
+  assert.equal(allowed.headers.pragma, 'no-cache');
+  assert.deepEqual(allowed.json(), {
+    allowed: true,
+    guest: { name: 'Guest' },
+    invitation: { type: 'visitante' }
+  });
+  assert.equal(allowed.body.includes(token), false);
+
+  for (const payload of [{ token }, { token: '12345' }, { token: 'abcdef' }, { token, extra: true }, {}]) {
+    const denied = await app.inject({ method: 'POST', url: '/portaria/convites/validar', headers: portariaHeaders, payload });
+    assert.equal(denied.statusCode, 200);
+    assert.deepEqual(denied.json(), { allowed: false, reason: 'invalid_or_unavailable' });
+  }
+
+  const wrongTenant = await app.inject({
+    method: 'POST',
+    url: '/portaria/convites/validar',
+    headers: { ...portariaHeaders, 'x-development-condominio-id': OTHER_CONDOMINIO_ID },
+    payload: { token: '654321' }
+  });
+  assert.deepEqual(wrongTenant.json(), { allowed: false, reason: 'invalid_or_unavailable' });
+
+  for (const role of ['provedor', 'sindico', 'morador'] as const) {
+    const response = await app.inject({
+      method: 'POST',
+      url: '/portaria/convites/validar',
+      headers: {
+        'x-development-user-id': role === 'morador' ? MORADOR_ID : `${role}-1`,
+        'x-development-user-role': role,
+        'x-development-condominio-id': role === 'provedor' ? '*' : CONDOMINIO_ID
+      },
+      payload: { token: '654321' }
+    });
+    assert.equal(response.statusCode, 403);
+  }
+  await app.close();
+});
+
+test('gatehouse validation never logs or returns the bearer token', async () => {
+  const token = '246810';
+  const logs: string[] = [];
+  const app = Fastify({ logger: { stream: { write(message: string) { logs.push(message); } } } });
+  registerConviteRoutes(app, batchStore(), uniqueMemoryStore([token]), authenticator);
+  const response = await app.inject({
+    method: 'POST',
+    url: '/portaria/convites/validar',
+    headers: {
+      'x-development-user-id': 'gatehouse-device-1',
+      'x-development-user-role': 'portaria',
+      'x-development-condominio-id': CONDOMINIO_ID
+    },
+    payload: { token }
+  });
+
+  assert.equal(response.body.includes(token), false);
+  assert.equal(logs.join('').includes(token), false);
   await app.close();
 });
 
