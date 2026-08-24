@@ -9,6 +9,7 @@ import {
   generateSessionToken
 } from '../src/sessions.js';
 import type { SessionRuntimeConfig } from '../src/sessions.js';
+import { createPrismaAuthRateLimiter } from '../src/auth-rate-limits.js';
 
 const runDatabaseTests = process.env.RUN_DATABASE_TESTS === 'true' && Boolean(process.env.DATABASE_URL);
 
@@ -28,7 +29,10 @@ test(
       csrfKeys: new Map([[1, csrfKey], [2, nextCsrfKey]]),
       publicApplicationOrigin: 'https://app.example.test'
     };
-    const store = createPrismaBrowserSessionStore(prisma, config);
+    const permissiveRateLimiter = {
+      async check() { return { allowed: true, retryAfterSeconds: 0, repeatedExcess: false }; }
+    };
+    const store = createPrismaBrowserSessionStore(prisma, config, { rateLimiter: permissiveRateLimiter });
     const accountId = randomUUID();
     const externalIdentityId = randomUUID();
     const otherAccountId = randomUUID();
@@ -86,8 +90,8 @@ test(
       return handoffToken;
     }
 
-    async function issue(handoffToken: string, oldSessionToken?: string) {
-      return store.issueFromHandoff({
+    async function issue(handoffToken: string, oldSessionToken?: string, targetStore = store) {
+      return targetStore.issueFromHandoff({
         handoffToken,
         oldSessionToken,
         requestCorrelationId: randomUUID(),
@@ -224,7 +228,7 @@ test(
         currentCsrfKeyVersion: 2,
         csrfKeys: new Map([[1, csrfKey], [2, nextCsrfKey]]),
         publicApplicationOrigin: 'https://app.example.test'
-      });
+      }, { rateLimiter: permissiveRateLimiter });
       assert.equal((await rotatedKeyStore.inspect({
         sessionToken: first.sessionToken,
         requestCorrelationId: 'csrf-key-rotation'
@@ -468,7 +472,7 @@ test(
         currentCsrfKeyVersion: 2,
         csrfKeys: new Map([[2, randomBytes(32)]]),
         publicApplicationOrigin: 'https://app.example.test'
-      });
+      }, { rateLimiter: permissiveRateLimiter });
       assert.deepEqual(await missingKeyStore.rotate({
         sessionToken: nextLogin.sessionToken,
         requestCorrelationId: 'csrf-key-missing'
@@ -506,13 +510,15 @@ test(
       assert.equal(accountAfterAll.sessionVersion, accountBeforeAll.sessionVersion + 1);
       assert.equal(await store.authenticate(beforeAll.sessionToken, 'after-revoke-all'), null);
 
-      const recentCount = await prisma.browserSession.count({
-        where: { accountId, createdAt: { gt: new Date(Date.now() - 15 * 60_000) } }
+      await prisma.browserSession.deleteMany({ where: { accountId } });
+      await prisma.authenticationRateLimit.deleteMany({ where: { subject: accountId } });
+      const limitedStore = createPrismaBrowserSessionStore(prisma, config, {
+        rateLimiter: createPrismaAuthRateLimiter(prisma)
       });
-      for (let index = recentCount; index < 10; index += 1) {
-        assert.ok(await issue(await createHandoff()));
+      for (let index = 0; index < 10; index += 1) {
+        assert.ok(await issue(await createHandoff(), undefined, limitedStore));
       }
-      assert.equal(await issue(await createHandoff()), null);
+      assert.equal(await issue(await createHandoff(), undefined, limitedStore), null);
       assert.equal(await prisma.browserSession.count({
         where: { accountId, createdAt: { gt: new Date(Date.now() - 15 * 60_000) } }
       }), 10);
@@ -562,3 +568,68 @@ test(
     }
   }
 );
+
+test('recovery handoff revokes every old session, increments account version, and issues a fresh family', { skip: !runDatabaseTests }, async () => {
+  const prisma = new PrismaClient();
+  const accountId = randomUUID();
+  const identityId = randomUUID();
+  const membershipId = randomUUID();
+  const transactionIds: string[] = [];
+  const store = createPrismaBrowserSessionStore(prisma, {
+    currentCsrfKeyVersion: 1,
+    csrfKeys: new Map([[1, randomBytes(32)]]),
+    publicApplicationOrigin: 'https://app.example.test'
+  });
+
+  async function handoff(recoveryIntent: boolean) {
+    const loginTransactionId = randomUUID();
+    const token = generateSessionToken();
+    transactionIds.push(loginTransactionId);
+    await prisma.oidcLoginTransaction.create({
+      data: {
+        id: loginTransactionId, expiresAt: new Date(Date.now() + 600_000), stateDigest: randomBytes(32),
+        nonceDigest: randomBytes(32), pkceVerifierCiphertext: randomBytes(43), pkceVerifierNonce: randomBytes(12),
+        pkceVerifierAuthTag: randomBytes(16), pkceKeyVersion: 1, issuer: 'https://identity.example.test',
+        clientId: 'recovery-test', redirectUri: 'https://app.example.test/auth/callback', returnTo: '/', recoveryIntent
+      }
+    });
+    await prisma.oidcValidatedHandoff.create({
+      data: {
+        id: randomUUID(), expiresAt: new Date(Date.now() + 300_000), handleDigest: digest(token), loginTransactionId,
+        accountId, externalIdentityId: identityId, authenticatedAt: new Date(), recoveryIntent
+      }
+    });
+    return token;
+  }
+
+  try {
+    await prisma.humanAccount.create({ data: { id: accountId, displayName: 'Recovery', status: 'active' } });
+    await prisma.externalIdentity.create({
+      data: { id: identityId, accountId, issuer: 'https://identity.example.test', subject: `recovery-${accountId}` }
+    });
+    await prisma.humanMembership.create({
+      data: { id: membershipId, accountId, role: 'provedor', status: 'active' }
+    });
+    const first = await store.issueFromHandoff({ handoffToken: await handoff(false), requestCorrelationId: 'initial' });
+    assert.ok(first);
+    const recovered = await store.issueFromHandoff({
+      handoffToken: await handoff(true), oldSessionToken: first.sessionToken, requestCorrelationId: 'recovery'
+    });
+    assert.ok(recovered);
+    assert.notEqual(recovered.identity.sessionId, first.identity.sessionId);
+    assert.equal(await store.authenticate(first.sessionToken, 'old-after-recovery'), null);
+    assert.equal((await prisma.humanAccount.findUniqueOrThrow({ where: { id: accountId } })).sessionVersion, 1);
+    assert.equal(await prisma.authenticationAuditEvent.count({
+      where: { accountId, eventType: 'credential_recovery_observed', outcome: 'success' }
+    }), 1);
+  } finally {
+    await prisma.authenticationRateLimit.deleteMany({ where: { subject: accountId } });
+    await prisma.browserSession.deleteMany({ where: { accountId } });
+    await prisma.oidcValidatedHandoff.deleteMany({ where: { loginTransactionId: { in: transactionIds } } });
+    await prisma.oidcLoginTransaction.deleteMany({ where: { id: { in: transactionIds } } });
+    await prisma.humanMembership.deleteMany({ where: { accountId } });
+    await prisma.externalIdentity.deleteMany({ where: { accountId } });
+    await prisma.humanAccount.deleteMany({ where: { id: accountId } });
+    await prisma.$disconnect();
+  }
+});

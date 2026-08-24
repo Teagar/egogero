@@ -17,6 +17,7 @@ import {
   createPrismaBrowserSessionStore
 } from './sessions.js';
 import { createHumanAdministrationService } from './human-administration.js';
+import { createPrismaAuthRateLimiter } from './auth-rate-limits.js';
 
 export async function startServer(environment: NodeJS.ProcessEnv = process.env) {
   const env = getEnv(environment);
@@ -34,8 +35,9 @@ export async function startServer(environment: NodeJS.ProcessEnv = process.env) 
   const notificationSender = environment.NODE_ENV === 'development'
     ? createDevelopmentNotificationSender()
     : createUnavailableNotificationSender();
+  const authRateLimiter = createPrismaAuthRateLimiter(prisma);
   const oidcService = env.oidc
-    ? await createOidcService(env.oidc, createPrismaOidcLoginStore(prisma))
+    ? await createOidcService(env.oidc, createPrismaOidcLoginStore(prisma), fetch, { rateLimiter: authRateLimiter })
     : undefined;
   const humanAdministrationService = env.humanAdministration
     ? createHumanAdministrationService(prisma, env.humanAdministration)
@@ -44,13 +46,13 @@ export async function startServer(environment: NodeJS.ProcessEnv = process.env) 
     ? createPrismaBrowserSessionStore(prisma, {
         ...env.sessions,
         mfaPolicy: env.humanAdministration?.mfaPolicy
-      })
+      }, { rateLimiter: authRateLimiter })
     : undefined;
   const browserSessionService = browserSessionStore
     ? createBrowserSessionService(browserSessionStore)
     : undefined;
   const authenticator = browserSessionStore
-    ? createCredentialRouter(browserSessionStore, deviceAuthenticator, developmentAuthenticator)
+    ? createCredentialRouter(browserSessionStore, deviceAuthenticator, developmentAuthenticator, authRateLimiter)
     : developmentAuthenticator
       ? createCompositeAuthenticator(deviceAuthenticator, developmentAuthenticator)
       : deviceAuthenticator;
@@ -66,7 +68,8 @@ export async function startServer(environment: NodeJS.ProcessEnv = process.env) 
     oidcService,
     browserSessionService,
     browserSessionStore,
-    humanAdministrationService
+    humanAdministrationService,
+    authRateLimiter
   });
 
   await app.listen({ host: env.host, port: env.port });

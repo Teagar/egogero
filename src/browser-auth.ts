@@ -9,6 +9,8 @@ import {
   parseBrowserSessionCookie
 } from './sessions.js';
 import type { BrowserSessionService, BrowserSessionStore } from './sessions.js';
+import type { AuthRateLimiter } from './auth-rate-limits.js';
+import { requestIpPrefix } from './client-ip.js';
 
 function noStore(reply: { header(name: string, value: string): unknown }) {
   reply.header('Cache-Control', 'no-store');
@@ -34,10 +36,11 @@ export function registerBrowserAuthRoutes(
   app: FastifyInstance,
   store?: BrowserSessionStore,
   service?: BrowserSessionService,
-  oidcService?: OidcService
+  oidcService?: OidcService,
+  rateLimiter?: AuthRateLimiter
 ) {
   if (!store || !service) return;
-  const authenticator = createBrowserSessionAuthenticator(store);
+  const authenticator = createBrowserSessionAuthenticator(store, rateLimiter);
 
   async function rejectAmbiguousCredentials(request: FastifyRequest, reply: FastifyReply) {
     if (hasBrowserSessionCookie(request.headers.cookie)
@@ -62,7 +65,7 @@ export function registerBrowserAuthRoutes(
       reply.header('Set-Cookie', CLEARED_SESSION_COOKIE);
       return reply.status(401).send({ error: 'authentication_required' });
     }
-    const snapshot = await store.inspect({ sessionToken: token, requestCorrelationId: request.id });
+    const snapshot = await store.inspect({ sessionToken: token, requestCorrelationId: request.id, ipPrefix: requestIpPrefix(request) });
     if (!snapshot) {
       reply.header('Set-Cookie', CLEARED_SESSION_COOKIE);
       return reply.status(401).send({ error: 'authentication_required' });
@@ -97,6 +100,7 @@ export function registerBrowserAuthRoutes(
       sessionToken: token,
       targetMembershipId: body.membershipId,
       requestCorrelationId: request.id,
+      ipPrefix: requestIpPrefix(request),
       userAgent: typeof request.headers['user-agent'] === 'string' ? request.headers['user-agent'] : null
     });
     if (result.status === 'stale') {
@@ -132,6 +136,7 @@ export function registerBrowserAuthRoutes(
     await service.revoke({
       sessionToken: parseBrowserSessionCookie(request.headers.cookie)!,
       requestCorrelationId: request.id,
+      ipPrefix: requestIpPrefix(request),
       userAgent: typeof request.headers['user-agent'] === 'string' ? request.headers['user-agent'] : null
     });
     reply.header('Set-Cookie', service.clearSessionCookie());
@@ -150,6 +155,7 @@ export function registerBrowserAuthRoutes(
     const result = await service.revokeAll({
       sessionToken: parseBrowserSessionCookie(request.headers.cookie)!,
       requestCorrelationId: request.id,
+      ipPrefix: requestIpPrefix(request),
       userAgent: typeof request.headers['user-agent'] === 'string' ? request.headers['user-agent'] : null
     });
     if (result === 'reauthentication-required') {
@@ -179,6 +185,10 @@ export function registerBrowserAuthRoutes(
     if (Object.keys(body).some((key) => key !== 'returnTo')
       || (body.returnTo !== undefined && typeof body.returnTo !== 'string')) {
       return reply.status(400).send({ error: 'invalid_request' });
+    }
+    const limited = await rateLimiter?.check('reauthentication_account', request.browserSessionSnapshot!.account.id);
+    if (limited && !limited.allowed) {
+      return reply.header('Retry-After', limited.retryAfterSeconds).status(429).send({ error: 'authentication_temporarily_unavailable' });
     }
     const authorizationUrl = await oidcService.startLogin({
       returnTo: body.returnTo as string | undefined,

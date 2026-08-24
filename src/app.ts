@@ -28,6 +28,7 @@ import { registerHumanAdministrationRoutes } from './human-administration.js';
 import type { HumanAdministrationService } from './human-administration.js';
 import { prisma as defaultPrisma } from './lib/prisma.js';
 import { isDatabaseTimeZoneRejection, isValidTimeZone } from './timezones.js';
+import type { AuthRateLimiter } from './auth-rate-limits.js';
 
 type CondominioRecord = {
   id: string;
@@ -436,7 +437,8 @@ export function createApp(
     oidcService,
     browserSessionService,
     browserSessionStore,
-    humanAdministrationService
+    humanAdministrationService,
+    authRateLimiter
   }: {
     db?: AppDependencies;
     invitationStore?: InvitationStore;
@@ -456,6 +458,7 @@ export function createApp(
     browserSessionService?: BrowserSessionService;
     browserSessionStore?: BrowserSessionStore;
     humanAdministrationService?: HumanAdministrationService;
+    authRateLimiter?: AuthRateLimiter;
   } = {}
 ) {
   const db: AppDependencies = suppliedDb ?? {
@@ -783,8 +786,10 @@ export function createApp(
     secureValidationTransport
   );
   registerNotificationRoutes(app, db.notificacao, authenticator);
-  registerOidcRoutes(app, oidcService, browserSessionService, browserSessionStore, humanAdministrationService);
-  registerBrowserAuthRoutes(app, browserSessionStore, browserSessionService, oidcService);
+  registerOidcRoutes(
+    app, oidcService, browserSessionService, browserSessionStore, humanAdministrationService, authRateLimiter
+  );
+  registerBrowserAuthRoutes(app, browserSessionStore, browserSessionService, oidcService, authRateLimiter);
   registerHumanAdministrationRoutes(app, authenticator, humanAdministrationService);
 
   return app;

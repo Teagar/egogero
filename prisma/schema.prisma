@@ -406,6 +406,19 @@ model AuthenticationAuditEvent {
   @@index([createdAt])
 }
 
+model AuthenticationRateLimit {
+  action          String
+  subject         String
+  windowStartedAt DateTime  @default(now()) @db.Timestamptz(3)
+  count           Int       @default(0)
+  deniedCount     Int       @default(0)
+  blockedUntil    DateTime? @db.Timestamptz(3)
+  updatedAt       DateTime  @default(now()) @db.Timestamptz(3)
+
+  @@id([action, subject])
+  @@index([updatedAt])
+}
+
 enum HumanAccountStatus {
   invited
   active

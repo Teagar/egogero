@@ -13,6 +13,8 @@ import {
 import type { OidcLoginStore, OidcRuntimeConfig } from '../src/oidc.js';
 import { createBrowserSessionService, generateSessionToken, SESSION_COOKIE_NAME } from '../src/sessions.js';
 import type { BrowserSessionStore } from '../src/sessions.js';
+import { createAuthTestCollectors } from '../src/auth-observability.js';
+import { AuthRateLimitError } from '../src/oidc.js';
 
 type StoredTransaction = Parameters<OidcLoginStore['createTransaction']>[0] & { createdAt: Date; consumed: boolean };
 
@@ -241,7 +243,11 @@ test('OIDC login stores only digests and AEAD material, validates a callback onc
   const config = configuration();
   const database = memoryStore();
   const provider = await mockProvider(config);
-  const service = await createOidcService(config, database.store, provider.fetchImplementation);
+  const telemetry = createAuthTestCollectors();
+  const service = await createOidcService(config, database.store, provider.fetchImplementation, {
+    metrics: telemetry.metricSink,
+    alerts: telemetry.alertSink
+  });
 
   const authorization = await service.startLogin({
     returnTo: '/dashboard?tab=entry',
@@ -280,6 +286,8 @@ test('OIDC login stores only digests and AEAD material, validates a callback onc
   assert.doesNotMatch(handoffCookie, /eg_session/);
   assert.equal(successful.headers['referrer-policy'], 'no-referrer');
   assert.equal(provider.tokenCalls, 1);
+  assert.ok(telemetry.metrics.some((metric) => metric.name === 'auth_oidc_callback_total'
+    && metric.labels.outcome === 'success'));
   assert.equal(database.handoff?.subject, 'provider-subject');
 
   const replay = await app.inject({
@@ -293,7 +301,37 @@ test('OIDC login stores only digests and AEAD material, validates a callback onc
     '__Host-eg_oidc_handoff=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0'
   );
   assert.equal(provider.tokenCalls, 1);
+  assert.ok(telemetry.metrics.some((metric) => metric.name === 'auth_oidc_callback_total'
+    && metric.labels.outcome === 'failure' && metric.labels.reason === 'state'));
   await app.close();
+});
+
+test('OIDC callback consumes state but performs no provider exchange after distributed denial', async () => {
+  const config = configuration();
+  const database = memoryStore();
+  const provider = await mockProvider(config);
+  const service = await createOidcService(config, database.store, provider.fetchImplementation, {
+    rateLimiter: {
+      async check(_action, _subject, consume = true) {
+        return consume
+          ? { allowed: true, retryAfterSeconds: 0, repeatedExcess: false }
+          : { allowed: false, retryAfterSeconds: 30, repeatedExcess: true };
+      }
+    }
+  });
+  const authorization = await service.startLogin({ requestCorrelationId: 'limited-login' });
+  provider.prepare(authorization);
+  await assert.rejects(
+    service.completeCallback({
+      callbackUrl: callbackUrl(config, authorization),
+      requestCorrelationId: 'limited-callback',
+      ipPrefix: '192.0.2.0/24'
+    }),
+    AuthRateLimitError
+  );
+  assert.equal(provider.tokenCalls, 0);
+  const state = authorization.searchParams.get('state')!;
+  assert.equal(database.transactions.get(createHash('sha256').update(state).digest('hex'))!.consumed, true);
 });
 
 test('OIDC reauthentication persists trusted intent and requests fresh provider authentication', async () => {

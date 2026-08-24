@@ -21,6 +21,10 @@ import { hasBrowserSessionCookie, parseBrowserSessionCookie } from './sessions.j
 import type { BrowserSessionService, BrowserSessionStore } from './sessions.js';
 import { digestSecret, exactOidcIssuer, normalizeProvisioningEmail } from './human-administration.js';
 import type { HumanAdministrationService } from './human-administration.js';
+import type { AuthRateLimiter } from './auth-rate-limits.js';
+import { noopAuthAlerts, noopAuthMetrics, safeAuthAlerts, safeAuthMetrics } from './auth-observability.js';
+import type { AuthAlertSink, AuthMetrics } from './auth-observability.js';
+import { requestIpPrefix } from './client-ip.js';
 
 const LOGIN_TRANSACTION_TTL_MS = 10 * 60 * 1000;
 const OIDC_CLOCK_TOLERANCE_SECONDS = 60;
@@ -80,6 +84,7 @@ type LoginTransactionInput = {
 type ConsumedLoginTransaction = Omit<LoginTransactionInput, 'expiresAt' | 'audit'> & {
   createdAt: Date;
   returnTo: string;
+  recoveryIntent: boolean;
 };
 
 export type ValidatedOidcIdentity = {
@@ -131,6 +136,7 @@ export interface OidcService {
   completeCallback(input: {
     callbackUrl: URL;
     requestCorrelationId: string;
+    ipPrefix?: string;
   }): Promise<{ returnTo: string; identity: ValidatedOidcIdentity; handoffToken: string }>;
 }
 
@@ -138,6 +144,13 @@ export class OidcCallbackError extends Error {
   constructor() {
     super('OIDC callback failed');
     this.name = 'OidcCallbackError';
+  }
+}
+
+export class AuthRateLimitError extends Error {
+  constructor(readonly retryAfterSeconds: number) {
+    super('Authentication rate limit exceeded');
+    this.name = 'AuthRateLimitError';
   }
 }
 
@@ -725,8 +738,11 @@ async function exchangeAuthorizationCode(
 export async function createOidcService(
   config: OidcRuntimeConfig,
   store: OidcLoginStore,
-  fetchImplementation: typeof fetch = fetch
+  fetchImplementation: typeof fetch = fetch,
+  dependencies: { rateLimiter?: AuthRateLimiter; metrics?: AuthMetrics; alerts?: AuthAlertSink } = {}
 ): Promise<OidcService> {
+  const metrics = safeAuthMetrics(dependencies.metrics ?? noopAuthMetrics);
+  const alerts = safeAuthAlerts(dependencies.alerts ?? noopAuthAlerts);
   const exactFetch = createExactOidcFetch(config, fetchImplementation);
   let clientConfiguration: oidc.Configuration;
   let keySet: ReturnType<typeof createRemoteJWKSet>;
@@ -784,6 +800,7 @@ export async function createOidcService(
     await keySet.reload();
     validateJwksDocument(config, keySet.jwks());
   } catch {
+    alerts.emit('crypto_key_failure', { operation: 'oidc_initialization' });
     try {
       await store.appendAudit({
         eventType: 'oidc_configuration_failed',
@@ -797,7 +814,7 @@ export async function createOidcService(
     throw new Error('OIDC initialization failed');
   }
 
-  async function appendFailureAudit(reasonCode: string, requestCorrelationId: string) {
+  async function appendFailureAudit(reasonCode: string, requestCorrelationId: string, ipPrefix = 'unknown') {
     try {
       await store.appendAudit({
         eventType: 'oidc_callback_failed',
@@ -808,6 +825,19 @@ export async function createOidcService(
     } catch {
       console.error('OIDC audit persistence unavailable');
     }
+    metrics.increment('auth_oidc_callback_total', { outcome: 'failure', reason: reasonClass(reasonCode) });
+    if (reasonCode === 'invalid_state') alerts.emit('oidc_replay_or_state_miss', { reason: 'state_miss' });
+    if (reasonCode === 'issuer_mixup') alerts.emit('oidc_issuer_mixup', { reason: 'issuer_mismatch' });
+    const decision = await dependencies.rateLimiter?.check('callback_failure_ip', ipPrefix);
+    if (decision && !decision.allowed) throw new AuthRateLimitError(decision.retryAfterSeconds);
+  }
+
+  function reasonClass(reason: string) {
+    if (reason.includes('state')) return 'state';
+    if (reason.includes('issuer')) return 'issuer';
+    if (reason.includes('decrypt') || reason.includes('integrity')) return 'crypto';
+    if (reason.includes('provision')) return 'account';
+    return 'validation';
   }
 
   return {
@@ -867,22 +897,25 @@ export async function createOidcService(
         state,
         nonce,
         max_age: '0',
-        ...(reauthentication ? { prompt: 'login' } : {})
+        ...((reauthentication || recovery) ? { prompt: 'login' } : {})
       });
     },
 
-    async completeCallback({ callbackUrl, requestCorrelationId }) {
+    async completeCallback({ callbackUrl, requestCorrelationId, ipPrefix = 'unknown' }) {
       const states = callbackUrl.searchParams.getAll('state');
       if (states.length !== 1 || !states[0] || states[0].length > 512) {
-        await appendFailureAudit('invalid_state', requestCorrelationId);
+        await appendFailureAudit('invalid_state', requestCorrelationId, ipPrefix);
         throw new OidcCallbackError();
       }
 
       const transaction = await store.consumeTransaction(digest(states[0]));
       if (!transaction) {
-        await appendFailureAudit('invalid_state', requestCorrelationId);
+        await appendFailureAudit('invalid_state', requestCorrelationId, ipPrefix);
         throw new OidcCallbackError();
       }
+
+      const existingLimit = await dependencies.rateLimiter?.check('callback_failure_ip', ipPrefix, false);
+      if (existingLimit && !existingLimit.allowed) throw new AuthRateLimitError(existingLimit.retryAfterSeconds);
 
       const codes = callbackUrl.searchParams.getAll('code');
       const issuers = callbackUrl.searchParams.getAll('iss');
@@ -901,7 +934,8 @@ export async function createOidcService(
         || transaction.clientId !== config.clientId
         || transaction.redirectUri !== config.redirectUri
       ) {
-        await appendFailureAudit('invalid_callback', requestCorrelationId);
+        const issuerMismatch = issuers.length === 1 && issuers[0] !== config.issuer;
+        await appendFailureAudit(issuerMismatch ? 'issuer_mixup' : 'invalid_callback', requestCorrelationId, ipPrefix);
         throw new OidcCallbackError();
       }
 
@@ -909,7 +943,10 @@ export async function createOidcService(
       try {
         verifier = decryptPkceVerifier(config, transaction);
       } catch {
-        await appendFailureAudit('pkce_decryption_failed', requestCorrelationId);
+        alerts.emit(config.pkceKeys.has(transaction.pkceKeyVersion)
+          ? 'crypto_integrity_failure'
+          : 'crypto_key_failure', { operation: 'oidc_pkce' });
+        await appendFailureAudit('pkce_decryption_failed', requestCorrelationId, ipPrefix);
         throw new OidcCallbackError();
       }
 
@@ -965,10 +1002,15 @@ export async function createOidcService(
           }
         });
         if (!identity) throw new AuditedOidcCallbackError();
+        metrics.increment('auth_oidc_callback_total', { outcome: 'success', reason: 'none' });
         return { returnTo: transaction.returnTo, identity, handoffToken };
       } catch (error) {
-        if (error instanceof AuditedOidcCallbackError) throw new OidcCallbackError();
-        await appendFailureAudit('oidc_validation_failed', requestCorrelationId);
+        if (error instanceof AuditedOidcCallbackError) {
+          await appendFailureAudit('access_not_provisioned', requestCorrelationId, ipPrefix);
+          throw new OidcCallbackError();
+        }
+        if (error instanceof AuthRateLimitError) throw error;
+        await appendFailureAudit('oidc_validation_failed', requestCorrelationId, ipPrefix);
         throw new OidcCallbackError();
       }
     }
@@ -984,7 +1026,8 @@ export function registerOidcRoutes(
   service?: OidcService,
   browserSessionService?: BrowserSessionService,
   browserSessionStore?: BrowserSessionStore,
-  humanAdministration?: HumanAdministrationService
+  humanAdministration?: HumanAdministrationService,
+  rateLimiter?: AuthRateLimiter
 ) {
   if (!service) return;
 
@@ -1009,6 +1052,10 @@ export function registerOidcRoutes(
       .header('Referrer-Policy', 'no-referrer')
       .header('Set-Cookie', CLEARED_HANDOFF_COOKIE);
     try {
+      const limited = await rateLimiter?.check('login_ip', requestIpPrefix(request));
+      if (limited && !limited.allowed) {
+        return reply.header('Retry-After', limited.retryAfterSeconds).status(429).send({ error: 'authentication_temporarily_unavailable' });
+      }
       const query = request.query && typeof request.query === 'object'
         ? request.query as Record<string, unknown>
         : {};
@@ -1043,12 +1090,17 @@ export function registerOidcRoutes(
   });
 
   app.get('/auth/recovery', unambiguous, async (request, reply) => {
-    reply.header('Cache-Control', 'no-store').header('Referrer-Policy', 'no-referrer');
+    reply.header('Cache-Control', 'no-store').header('Pragma', 'no-cache').header('Referrer-Policy', 'no-referrer');
     if (!humanAdministration) return reply.status(503).send({ error: 'authentication_unavailable' });
     if (request.query && typeof request.query === 'object' && Object.keys(request.query).length > 0) {
       return reply.status(400).send({ error: 'invalid_request' });
     }
     try {
+      const limited = await rateLimiter?.check('recovery_ip', requestIpPrefix(request));
+      if (limited && !limited.allowed) {
+        return reply.header('Retry-After', limited.retryAfterSeconds).status(429)
+          .send({ error: 'authentication_temporarily_unavailable' });
+      }
       const authorizationUrl = await service.startLogin({ requestCorrelationId: request.id, recovery: true });
       const recovery = new URL(humanAdministration.recoveryUrl);
       recovery.search = authorizationUrl.search;
@@ -1060,12 +1112,14 @@ export function registerOidcRoutes(
     reply.header('Cache-Control', 'no-store').header('Pragma', 'no-cache').header('Referrer-Policy', 'no-referrer');
     try {
       const callbackUrl = new URL(request.url, 'https://egogero.invalid');
-      const result = await service.completeCallback({ callbackUrl, requestCorrelationId: request.id });
+      const ipPrefix = requestIpPrefix(request);
+      const result = await service.completeCallback({ callbackUrl, requestCorrelationId: request.id, ipPrefix });
       if (browserSessionService) {
         const issued = await browserSessionService.issueFromHandoff({
           handoffToken: result.handoffToken,
           oldSessionToken: parseBrowserSessionCookie(request.headers.cookie) ?? undefined,
           requestCorrelationId: request.id,
+          ipPrefix,
           userAgent: typeof request.headers['user-agent'] === 'string' ? request.headers['user-agent'] : null
         });
         if (!issued) throw new OidcCallbackError();
@@ -1080,8 +1134,11 @@ export function registerOidcRoutes(
         );
       }
       return reply.redirect(result.returnTo, 303);
-    } catch {
+    } catch (error) {
       reply.header('Set-Cookie', CLEARED_HANDOFF_COOKIE);
+      if (error instanceof AuthRateLimitError) {
+        return reply.header('Retry-After', error.retryAfterSeconds).status(429).send({ error: 'authentication_temporarily_unavailable' });
+      }
       return reply.redirect(service.failurePath, 303);
     }
   });

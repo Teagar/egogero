@@ -40,8 +40,8 @@ export type AuthenticatedIdentity =
 
 export class AuthenticationError extends Error {
   constructor(
-    readonly statusCode: 400 | 401 | 403,
-    readonly code: 'ambiguous_credentials' | 'authentication_required' | 'csrf_required',
+    readonly statusCode: 400 | 401 | 403 | 429,
+    readonly code: 'ambiguous_credentials' | 'authentication_required' | 'authentication_temporarily_unavailable' | 'csrf_required',
     readonly headers: Readonly<Record<string, string>> = {}
   ) {
     super(code);

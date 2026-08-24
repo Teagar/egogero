@@ -14,6 +14,11 @@ import { AuthenticationError } from './auth.js';
 import type { Authenticator, HumanSessionIdentity, Role } from './auth.js';
 import { evidenceSatisfiesRole } from './human-administration.js';
 import type { RoleMfaPolicy } from './human-administration.js';
+import { createPrismaAuthRateLimiter } from './auth-rate-limits.js';
+import type { AuthRateLimiter } from './auth-rate-limits.js';
+import { noopAuthAlerts, noopAuthMetrics, safeAuthAlerts, safeAuthMetrics } from './auth-observability.js';
+import type { AuthAlertSink, AuthMetrics } from './auth-observability.js';
+import { requestIpPrefix } from './client-ip.js';
 
 export type { HumanSessionIdentity } from './auth.js';
 
@@ -448,17 +453,6 @@ async function lockLiveMembershipScope(transaction: Prisma.TransactionClient, me
   }
   return true;
 }
-
-async function creationAllowed(transaction: Prisma.TransactionClient, accountId: string) {
-  const rows = await transaction.$queryRaw<Array<{ allowed: boolean }>>(Prisma.sql`
-    SELECT COUNT(*) < ${SESSION_CREATION_LIMIT} AS allowed
-    FROM "BrowserSession"
-    WHERE "accountId" = ${accountId}::uuid
-      AND "createdAt" > clock_timestamp() - interval '15 minutes'
-  `);
-  return rows[0]?.allowed === true;
-}
-
 async function insertSession(
   transaction: Prisma.TransactionClient,
   config: SessionRuntimeConfig,
@@ -569,7 +563,19 @@ async function touchSession(transaction: Prisma.TransactionClient, session: Sess
   return touched[0]?.idleExpiresAt ?? session.idleExpiresAt;
 }
 
-export function createPrismaBrowserSessionStore(client: PrismaClient, config: SessionRuntimeConfig): BrowserSessionStore {
+export function createPrismaBrowserSessionStore(
+  client: PrismaClient,
+  config: SessionRuntimeConfig,
+  dependencies: { rateLimiter?: AuthRateLimiter; metrics?: AuthMetrics; alerts?: AuthAlertSink } = {}
+): BrowserSessionStore {
+  const metrics = safeAuthMetrics(dependencies.metrics ?? noopAuthMetrics);
+  const alerts = safeAuthAlerts(dependencies.alerts ?? noopAuthAlerts);
+  const rateLimiter = dependencies.rateLimiter ?? createPrismaAuthRateLimiter(client, metrics, alerts);
+  function recordLookup(operation: 'authenticate' | 'inspect', startedAt: number, databaseStartedAt: number, outcome: 'hit' | 'miss' | 'failure') {
+    metrics.observe('auth_session_database_seconds', (performance.now() - databaseStartedAt) / 1000, { operation, outcome });
+    metrics.observe('auth_session_lookup_seconds', (performance.now() - startedAt) / 1000, { operation, outcome });
+    metrics.increment('auth_session_lookup_total', { operation, outcome });
+  }
   async function auditDenied(
     transaction: Prisma.TransactionClient,
     request: SessionRequestContext,
@@ -717,6 +723,9 @@ export function createPrismaBrowserSessionStore(client: PrismaClient, config: Se
           const csrf = decryptCsrf(config, oldSession);
           if (!membership || !membershipScopeLive || !csrf) {
             csrf?.fill(0);
+            if (!csrf) alerts.emit(config.csrfKeys.has(oldSession.csrfKeyVersion)
+              ? 'crypto_integrity_failure'
+              : 'crypto_key_failure', { operation: 'session_csrf' });
             await auditDenied(transaction, input, 'session_reauthentication_denied', 'session_integrity_failed', oldSession);
             return null;
           }
@@ -725,6 +734,12 @@ export function createPrismaBrowserSessionStore(client: PrismaClient, config: Se
           })) {
             csrf.fill(0);
             await auditDenied(transaction, input, 'mfa_policy_denied', 'insufficient_authentication_assurance', oldSession);
+            return null;
+          }
+          const creationLimit = await rateLimiter.check('session_creation_account', account.id);
+          if (!creationLimit.allowed) {
+            csrf.fill(0);
+            await auditDenied(transaction, input, 'session_reauthentication_denied', 'session_creation_rate_limited', oldSession);
             return null;
           }
           const revoked = await transaction.$executeRaw`
@@ -772,7 +787,27 @@ export function createPrismaBrowserSessionStore(client: PrismaClient, config: Se
           });
           return null;
         }
-        if (!await creationAllowed(transaction, account.id)) {
+        let accountSessionVersion = account.sessionVersion;
+        if (handoff.recoveryIntent) {
+          const versions = await transaction.$queryRaw<Array<{ sessionVersion: number }>>(Prisma.sql`
+            UPDATE "HumanAccount" SET "sessionVersion" = "sessionVersion" + 1, "updatedAt" = clock_timestamp()
+            WHERE id = ${account.id}::uuid RETURNING "sessionVersion"
+          `);
+          accountSessionVersion = versions[0]!.sessionVersion;
+          const revoked = await transaction.$executeRaw`
+            UPDATE "BrowserSession" SET "revokedAt" = clock_timestamp(), "revokeReason" = 'credential_recovery'
+            WHERE "accountId" = ${account.id}::uuid AND "revokedAt" IS NULL
+          `;
+          await insertAudit(transaction, {
+            eventType: 'credential_recovery_observed', outcome: 'success', requestCorrelationId: input.requestCorrelationId,
+            accountId: account.id, externalIdentityId: handoff.externalIdentityId,
+            ipPrefix: input.ipPrefix, userAgentHash: userAgentDigest(input.userAgent),
+            metadata: { revokedSessions: revoked }
+          });
+          metrics.increment('auth_database_writes_total', { operation: 'recovery', outcome: 'success' });
+        }
+        const creationLimit = await rateLimiter.check('session_creation_account', account.id);
+        if (!creationLimit.allowed) {
           await insertAudit(transaction, {
             eventType: 'session_issue_denied', outcome: 'denied', reasonCode: 'session_creation_rate_limited',
             requestCorrelationId: input.requestCorrelationId, accountId: account.id,
@@ -783,17 +818,7 @@ export function createPrismaBrowserSessionStore(client: PrismaClient, config: Se
           return null;
         }
 
-        if (handoff.recoveryIntent) {
-          await transaction.$executeRaw`
-            UPDATE "HumanAccount" SET "sessionVersion" = "sessionVersion" + 1, "updatedAt" = clock_timestamp()
-            WHERE id = ${account.id}::uuid
-          `;
-          await transaction.$executeRaw`
-            UPDATE "BrowserSession" SET "revokedAt" = clock_timestamp(), "revokeReason" = 'credential_recovery'
-            WHERE "accountId" = ${account.id}::uuid AND "revokedAt" IS NULL
-          `;
-          account.sessionVersion += 1;
-        } else if (oldSession) {
+        if (!handoff.recoveryIntent && oldSession) {
           const revoked = await transaction.$executeRaw`
             UPDATE "BrowserSession"
             SET "revokedAt" = clock_timestamp(), "revokeReason" = 'login_replaced'
@@ -819,7 +844,7 @@ export function createPrismaBrowserSessionStore(client: PrismaClient, config: Se
           id: sessionId,
           familyId: randomUUID(),
           accountId: account.id,
-          accountSessionVersion: account.sessionVersion,
+          accountSessionVersion,
           membershipId: membership.id,
           authenticatedAt: handoff.authenticatedAt,
           authenticationMethods: handoff.authenticationMethods,
@@ -836,6 +861,7 @@ export function createPrismaBrowserSessionStore(client: PrismaClient, config: Se
           ipPrefix: input.ipPrefix, userAgentHash: userAgentDigest(input.userAgent),
           metadata: { authenticationMethod: 'oidc', recoveryIntent: handoff.recoveryIntent }
         });
+        metrics.increment('auth_database_writes_total', { operation: 'session_issue', outcome: 'success' });
 
         const result = {
           sessionToken,
@@ -850,27 +876,39 @@ export function createPrismaBrowserSessionStore(client: PrismaClient, config: Se
 
     async authenticate(sessionToken, requestCorrelationId, extendIdle = true) {
       const request = { requestCorrelationId };
-      if (!validSessionToken(sessionToken)) return null;
-      return client.$transaction(async (transaction) => {
-        const session = await loadSession(transaction, digest(sessionToken), false);
-        if (!session) {
-          await auditDenied(transaction, request, 'session_authentication_denied', 'invalid_session');
-          return null;
-        }
-        const reason = sessionDenialReason(session);
-        if (reason) {
-          await auditDenied(transaction, request, 'session_authentication_denied', reason, session);
-          return null;
-        }
-        if (config.mfaPolicy && !evidenceSatisfiesRole(config.mfaPolicy, session.role, {
-          amr: session.authenticationMethods, acr: session.assuranceContext
-        })) {
-          await auditDenied(transaction, request, 'mfa_policy_denied', 'insufficient_authentication_assurance', session);
-          return null;
-        }
-        if (extendIdle) await touchSession(transaction, session);
-        return identityFor(session.sessionId, session);
-      });
+      const startedAt = performance.now();
+      if (!validSessionToken(sessionToken)) {
+        metrics.increment('auth_session_lookup_total', { operation: 'authenticate', outcome: 'miss' });
+        return null;
+      }
+      const databaseStartedAt = performance.now();
+      try {
+        const result = await client.$transaction(async (transaction) => {
+          const session = await loadSession(transaction, digest(sessionToken), false);
+          if (!session) {
+            await auditDenied(transaction, request, 'session_authentication_denied', 'invalid_session');
+            return null;
+          }
+          const reason = sessionDenialReason(session);
+          if (reason) {
+            await auditDenied(transaction, request, 'session_authentication_denied', reason, session);
+            return null;
+          }
+          if (config.mfaPolicy && !evidenceSatisfiesRole(config.mfaPolicy, session.role, {
+            amr: session.authenticationMethods, acr: session.assuranceContext
+          })) {
+            await auditDenied(transaction, request, 'mfa_policy_denied', 'insufficient_authentication_assurance', session);
+            return null;
+          }
+          if (extendIdle) await touchSession(transaction, session);
+          return identityFor(session.sessionId, session);
+        });
+        recordLookup('authenticate', startedAt, databaseStartedAt, result ? 'hit' : 'miss');
+        return result;
+      } catch (error) {
+        recordLookup('authenticate', startedAt, databaseStartedAt, 'failure');
+        throw error;
+      }
     },
 
     async isRevoked(sessionToken) {
@@ -884,8 +922,14 @@ export function createPrismaBrowserSessionStore(client: PrismaClient, config: Se
     },
 
     async inspect(input) {
-      if (!validSessionToken(input.sessionToken)) return null;
-      return client.$transaction(async (transaction) => {
+      const startedAt = performance.now();
+      if (!validSessionToken(input.sessionToken)) {
+        metrics.increment('auth_session_lookup_total', { operation: 'inspect', outcome: 'miss' });
+        return null;
+      }
+      const databaseStartedAt = performance.now();
+      try {
+        const result = await client.$transaction(async (transaction) => {
         const session = await loadSession(transaction, digest(input.sessionToken), true);
         if (!session) {
           await auditDenied(transaction, input, 'session_authentication_denied', 'invalid_session');
@@ -904,6 +948,9 @@ export function createPrismaBrowserSessionStore(client: PrismaClient, config: Se
         }
         const csrf = decryptCsrf(config, session);
         if (!csrf) {
+          alerts.emit(config.csrfKeys.has(session.csrfKeyVersion)
+            ? 'crypto_integrity_failure'
+            : 'crypto_key_failure', { operation: 'session_csrf' });
           await auditDenied(transaction, input, 'session_authentication_denied', 'csrf_integrity_failed', session);
           return null;
         }
@@ -951,7 +998,13 @@ export function createPrismaBrowserSessionStore(client: PrismaClient, config: Se
         };
         csrf.fill(0);
         return snapshot;
-      });
+        });
+        recordLookup('inspect', startedAt, databaseStartedAt, result ? 'hit' : 'miss');
+        return result;
+      } catch (error) {
+        recordLookup('inspect', startedAt, databaseStartedAt, 'failure');
+        throw error;
+      }
     },
 
     async rotate(input) {
@@ -1007,12 +1060,16 @@ export function createPrismaBrowserSessionStore(client: PrismaClient, config: Se
           await auditDenied(transaction, input, 'mfa_policy_denied', 'insufficient_authentication_assurance', session);
           return { status: 'denied' };
         }
-        if (!await creationAllowed(transaction, session.accountId)) {
+        const creationLimit = await rateLimiter.check('session_creation_account', session.accountId);
+        if (!creationLimit.allowed) {
           await auditDenied(transaction, input, 'session_rotation_denied', 'session_creation_rate_limited', session);
           return { status: 'denied' };
         }
         const csrf = decryptCsrf(config, session);
         if (!csrf) {
+          alerts.emit(config.csrfKeys.has(session.csrfKeyVersion)
+            ? 'crypto_integrity_failure'
+            : 'crypto_key_failure', { operation: 'session_csrf' });
           await auditDenied(transaction, input, 'session_rotation_denied', 'csrf_integrity_failed', session);
           return { status: 'denied' };
         }
@@ -1052,6 +1109,7 @@ export function createPrismaBrowserSessionStore(client: PrismaClient, config: Se
           userAgentHash: input.userAgent === undefined ? session.userAgentHash : userAgentDigest(input.userAgent),
           metadata: { membershipChanged: membership.id !== session.id }
         });
+        metrics.increment('auth_database_writes_total', { operation: 'session_rotate', outcome: 'success' });
         const result: SessionRotationResult = {
           status: 'rotated', sessionToken, csrfToken: csrf.toString('base64url'),
           identity: identityFor(sessionId, membership), absoluteExpiresAt: stored.absoluteExpiresAt
@@ -1063,7 +1121,8 @@ export function createPrismaBrowserSessionStore(client: PrismaClient, config: Se
 
     async revoke(input) {
       if (!validSessionToken(input.sessionToken)) return 'unavailable';
-      return client.$transaction(async (transaction): Promise<SessionRevocationResult> => {
+      const startedAt = performance.now();
+      const result = await client.$transaction(async (transaction): Promise<SessionRevocationResult> => {
         const session = await loadSession(transaction, digest(input.sessionToken), true);
         if (!session) {
           await auditDenied(transaction, input, 'session_revocation_denied', 'invalid_session');
@@ -1087,6 +1146,9 @@ export function createPrismaBrowserSessionStore(client: PrismaClient, config: Se
         });
         return 'revoked';
       });
+      metrics.observe('auth_session_revocation_seconds', (performance.now() - startedAt) / 1000, { operation: 'current', outcome: result });
+      if (result === 'revoked') metrics.increment('auth_database_writes_total', { operation: 'session_revoke', outcome: 'success' });
+      return result;
     },
 
     async revokeAll(input) {
@@ -1171,13 +1233,27 @@ export function createBrowserSessionService(store: BrowserSessionStore): Browser
   };
 }
 
-export function createBrowserSessionAuthenticator(store: BrowserSessionStore): Authenticator {
+export function createBrowserSessionAuthenticator(store: BrowserSessionStore, rateLimiter?: AuthRateLimiter): Authenticator {
   return {
     async authenticate(request: FastifyRequest) {
+      const ipPrefix = requestIpPrefix(request);
+      const rejectAuthenticationFailure = async (
+        statusCode: 401 | 403,
+        code: 'authentication_required' | 'csrf_required',
+        headers: Record<string, string>
+      ): Promise<never> => {
+        const limited = await rateLimiter?.check('authentication_failure_ip', ipPrefix);
+        if (limited && !limited.allowed) {
+          throw new AuthenticationError(429, 'authentication_temporarily_unavailable', {
+            'cache-control': 'no-store', 'retry-after': String(limited.retryAfterSeconds)
+          });
+        }
+        throw new AuthenticationError(statusCode, code, headers);
+      };
       const token = parseBrowserSessionCookie(request.headers.cookie);
       if (!token) {
         if (!hasBrowserSessionCookie(request.headers.cookie)) return null;
-        throw new AuthenticationError(401, 'authentication_required', {
+        return rejectAuthenticationFailure(401, 'authentication_required', {
           'cache-control': 'no-store',
           'set-cookie': CLEARED_SESSION_COOKIE
         });
@@ -1185,7 +1261,7 @@ export function createBrowserSessionAuthenticator(store: BrowserSessionStore): A
       if (!['GET', 'HEAD', 'OPTIONS'].includes(request.method)) {
         const identity = await store.authenticate(token, request.id, false);
         if (!identity) {
-          throw new AuthenticationError(401, 'authentication_required', {
+          return rejectAuthenticationFailure(401, 'authentication_required', {
             'cache-control': 'no-store',
             'set-cookie': CLEARED_SESSION_COOKIE
           });
@@ -1217,11 +1293,11 @@ export function createBrowserSessionAuthenticator(store: BrowserSessionStore): A
           && /^application\/json(?:\s*;\s*charset=[A-Za-z0-9._-]+)?$/i.test(contentType)
           && suppliedCsrf?.length === 32;
         const snapshot = evidenceValid
-          ? await store.inspect({ sessionToken: token, requestCorrelationId: request.id, extendIdle: false })
+          ? await store.inspect({ sessionToken: token, requestCorrelationId: request.id, ipPrefix, extendIdle: false })
           : null;
         if (evidenceValid && !snapshot) {
           suppliedCsrf?.fill(0);
-          throw new AuthenticationError(401, 'authentication_required', {
+          return rejectAuthenticationFailure(401, 'authentication_required', {
             'cache-control': 'no-store',
             'set-cookie': CLEARED_SESSION_COOKIE
           });
@@ -1234,13 +1310,14 @@ export function createBrowserSessionAuthenticator(store: BrowserSessionStore): A
         if (!csrfValid) {
           await store.recordCsrfFailure?.({
             requestCorrelationId: request.id,
+            ipPrefix,
             userAgent: typeof request.headers['user-agent'] === 'string' ? request.headers['user-agent'] : null
           });
-          throw new AuthenticationError(403, 'csrf_required', { 'cache-control': 'no-store' });
+          return rejectAuthenticationFailure(403, 'csrf_required', { 'cache-control': 'no-store' });
         }
         const finalIdentity = await store.authenticate(token, request.id, true);
         if (!finalIdentity) {
-          throw new AuthenticationError(401, 'authentication_required', {
+          return rejectAuthenticationFailure(401, 'authentication_required', {
             'cache-control': 'no-store',
             'set-cookie': CLEARED_SESSION_COOKIE
           });
@@ -1250,7 +1327,7 @@ export function createBrowserSessionAuthenticator(store: BrowserSessionStore): A
       }
       const identity = await store.authenticate(token, request.id);
       if (!identity) {
-        throw new AuthenticationError(401, 'authentication_required', {
+        return rejectAuthenticationFailure(401, 'authentication_required', {
           'cache-control': 'no-store',
           'set-cookie': CLEARED_SESSION_COOKIE
         });
@@ -1263,9 +1340,10 @@ export function createBrowserSessionAuthenticator(store: BrowserSessionStore): A
 export function createCredentialRouter(
   store: BrowserSessionStore,
   deviceAuthenticator: Authenticator,
-  developmentAuthenticator?: Authenticator
+  developmentAuthenticator?: Authenticator,
+  rateLimiter?: AuthRateLimiter
 ): Authenticator {
-  const browserAuthenticator = createBrowserSessionAuthenticator(store);
+  const browserAuthenticator = createBrowserSessionAuthenticator(store, rateLimiter);
   return {
     async authenticate(request) {
       const hasSession = hasBrowserSessionCookie(request.headers.cookie);
