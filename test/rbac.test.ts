@@ -9,6 +9,7 @@ import type { Role } from '../src/auth.js';
 const CONDOMINIO_ID = '00000000-0000-4000-8000-000000000001';
 const OTHER_CONDOMINIO_ID = '00000000-0000-4000-8000-000000000002';
 const MORADOR_ID = '00000000-0000-4000-8000-000000000101';
+const CONVIDADO_ID = '00000000-0000-4000-8000-000000000201';
 const createdAt = new Date('2026-01-01T00:00:00.000Z');
 const authenticator = createDevelopmentHeaderAuthenticator(true);
 
@@ -35,6 +36,21 @@ const morador = {
 
 const otherCondominio = { ...condominio, id: OTHER_CONDOMINIO_ID, nome: 'Residencial Horizonte' };
 const otherMorador = { ...morador, id: '00000000-0000-4000-8000-000000000102', condominioId: OTHER_CONDOMINIO_ID };
+const convidado = {
+  id: CONVIDADO_ID,
+  createdAt,
+  deletedAt: null,
+  nome: 'Convidado',
+  condominioId: CONDOMINIO_ID,
+  moradorId: MORADOR_ID,
+  ultimoUsoEm: null
+};
+const otherConvidado = {
+  ...convidado,
+  id: '00000000-0000-4000-8000-000000000202',
+  condominioId: OTHER_CONDOMINIO_ID,
+  moradorId: otherMorador.id
+};
 
 function createAuthorizationStore(): AppStore {
   return {
@@ -69,6 +85,29 @@ function createAuthorizationStore(): AppStore {
       async updateMany({ where }) {
         const found = [morador, otherMorador].some(
           (row) => row.id === where.id && row.condominioId === where.condominioId
+        );
+        return { count: found ? 1 : 0 };
+      }
+    },
+    convidado: {
+      async create({ data }) {
+        return { ...convidado, ...data };
+      },
+      async findMany({ where }) {
+        return [convidado, otherConvidado].filter(
+          (row) => row.condominioId === where.condominioId && row.moradorId === where.moradorId
+        );
+      },
+      async findFirst({ where }) {
+        return (
+          [convidado, otherConvidado].find(
+            (row) => row.id === where.id && row.condominioId === where.condominioId && row.moradorId === where.moradorId
+          ) ?? null
+        );
+      },
+      async updateMany({ where }) {
+        const found = [convidado, otherConvidado].some(
+          (row) => row.id === where.id && row.condominioId === where.condominioId && row.moradorId === where.moradorId
         );
         return { count: found ? 1 : 0 };
       }
@@ -154,12 +193,62 @@ const endpoints: Endpoint[] = [
     request: { method: 'DELETE', url: `/condominios/${CONDOMINIO_ID}/moradores/${MORADOR_ID}` },
     roles: ['provedor', 'sindico'],
     successStatus: 204
+  },
+  {
+    name: 'list recent guests',
+    request: { method: 'GET', url: `/condominios/${CONDOMINIO_ID}/moradores/${MORADOR_ID}/convidados/recentes` },
+    roles: ['provedor', 'sindico', 'morador'],
+    successStatus: 200
+  },
+  {
+    name: 'create guest',
+    request: {
+      method: 'POST',
+      url: `/condominios/${CONDOMINIO_ID}/moradores/${MORADOR_ID}/convidados`,
+      payload: { nome: 'Convidado' }
+    },
+    roles: ['provedor', 'sindico', 'morador'],
+    successStatus: 201
+  },
+  {
+    name: 'list guests',
+    request: { method: 'GET', url: `/condominios/${CONDOMINIO_ID}/moradores/${MORADOR_ID}/convidados` },
+    roles: ['provedor', 'sindico', 'morador'],
+    successStatus: 200
+  },
+  {
+    name: 'read guest',
+    request: {
+      method: 'GET',
+      url: `/condominios/${CONDOMINIO_ID}/moradores/${MORADOR_ID}/convidados/${CONVIDADO_ID}`
+    },
+    roles: ['provedor', 'sindico', 'morador'],
+    successStatus: 200
+  },
+  {
+    name: 'update guest',
+    request: {
+      method: 'PATCH',
+      url: `/condominios/${CONDOMINIO_ID}/moradores/${MORADOR_ID}/convidados/${CONVIDADO_ID}`,
+      payload: { nome: 'Novo nome' }
+    },
+    roles: ['provedor', 'sindico', 'morador'],
+    successStatus: 200
+  },
+  {
+    name: 'delete guest',
+    request: {
+      method: 'DELETE',
+      url: `/condominios/${CONDOMINIO_ID}/moradores/${MORADOR_ID}/convidados/${CONVIDADO_ID}`
+    },
+    roles: ['provedor', 'sindico', 'morador'],
+    successStatus: 204
   }
 ];
 
 function developmentHeaders(role: Role) {
   return {
-    'x-development-user-id': `${role}-1`,
+    'x-development-user-id': role === 'morador' ? MORADOR_ID : `${role}-1`,
     'x-development-user-role': role,
     'x-development-condominio-id': role === 'provedor' ? '*' : CONDOMINIO_ID
   };
@@ -217,7 +306,10 @@ test('tenant matrix prevents a sindico from reaching another condominium before 
     ...endpoint,
     request: {
       ...endpoint.request,
-      url: endpoint.request.url.replaceAll(CONDOMINIO_ID, OTHER_CONDOMINIO_ID).replaceAll(MORADOR_ID, otherMorador.id),
+      url: endpoint.request.url
+        .replaceAll(CONDOMINIO_ID, OTHER_CONDOMINIO_ID)
+        .replaceAll(MORADOR_ID, otherMorador.id)
+        .replaceAll(CONVIDADO_ID, otherConvidado.id),
       payload: endpoint.request.payload
         ? { ...endpoint.request.payload, condominioId: OTHER_CONDOMINIO_ID }
         : undefined
@@ -269,6 +361,24 @@ test('tenant matrix prevents a sindico from reaching another condominium before 
             storeCalls += 1;
             return store.morador.updateMany(args);
           }
+        },
+        convidado: {
+          create: async (args) => {
+            storeCalls += 1;
+            return store.convidado.create(args);
+          },
+          findMany: async (args) => {
+            storeCalls += 1;
+            return store.convidado.findMany(args);
+          },
+          findFirst: async (args) => {
+            storeCalls += 1;
+            return store.convidado.findFirst(args);
+          },
+          updateMany: async (args) => {
+            storeCalls += 1;
+            return store.convidado.updateMany(args);
+          }
         }
       };
       const app = createApp({ db, authenticator });
@@ -288,6 +398,32 @@ test('tenant matrix prevents a sindico from reaching another condominium before 
   }
 });
 
+test('resident guest ownership is enforced before any store access', async () => {
+  let storeCalls = 0;
+  const inaccessible = async () => {
+    storeCalls += 1;
+    throw new Error('Authorization boundary reached the store');
+  };
+  const db: AppStore = {
+    condominio: { create: inaccessible, findMany: inaccessible, findFirst: inaccessible, updateMany: inaccessible },
+    morador: { create: inaccessible, findMany: inaccessible, findFirst: inaccessible, updateMany: inaccessible },
+    convidado: { create: inaccessible, findMany: inaccessible, findFirst: inaccessible, updateMany: inaccessible }
+  };
+
+  for (const endpoint of endpoints.slice(10)) {
+    const app = createApp({ db, authenticator });
+    const request = {
+      ...endpoint.request,
+      url: endpoint.request.url.replaceAll(MORADOR_ID, otherMorador.id)
+    };
+    const response = await app.inject({ ...request, headers: developmentHeaders('morador') });
+
+    assert.equal(response.statusCode, 403, endpoint.name);
+    assert.equal(storeCalls, 0, endpoint.name);
+    await app.close();
+  }
+});
+
 test('route inventory keeps every business route in the RBAC matrix', async () => {
   const app = createApp();
   await app.ready();
@@ -299,12 +435,15 @@ test('route inventory keeps every business route in the RBAC matrix', async () =
       '├── /condominios (POST, GET, HEAD)',
       '│   └── /:id|:condominioId (GET, HEAD, PATCH, DELETE)',
       '│       └── /moradores (GET, HEAD)',
-      '│           └── /:id (GET, HEAD, PATCH, DELETE)',
+      '│           └── /:id|:moradorId (GET, HEAD, PATCH, DELETE)',
+      '│               └── /convidados (POST, GET, HEAD)',
+      '│                   ├── /recentes (GET, HEAD)',
+      '│                   └── /:id (GET, HEAD, PATCH, DELETE)',
       '└── /moradores (POST)',
       ''
     ].join('\n')
   );
-  assert.equal(endpoints.length, 10);
+  assert.equal(endpoints.length, 16);
 
   await app.close();
 });

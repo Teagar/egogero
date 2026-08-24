@@ -1,8 +1,8 @@
 import Fastify from 'fastify';
-import type { FastifyReply } from 'fastify';
 
 import { authorize, isUuid, unauthenticatedAuthenticator } from './auth.js';
 import type { Authenticator } from './auth.js';
+import { registerConvidadoRoutes } from './convidados.js';
 import { prisma as defaultPrisma } from './lib/prisma.js';
 
 type CondominioRecord = {
@@ -66,6 +66,14 @@ type ConvidadoRecord = {
 type ConvidadoCreateData = { nome: string; condominioId: string; moradorId: string };
 type ConvidadoUpdateData = { nome?: string; ultimoUsoEm?: Date | null; deletedAt?: Date };
 type ConvidadoOrderBy = { ultimoUsoEm: { sort: 'desc'; nulls: 'last' } } | { createdAt: 'desc' } | { id: 'desc' };
+type ConvidadoWhere = {
+  id?: string;
+  condominioId: string;
+  moradorId: string;
+  deletedAt: null;
+  condominio: { deletedAt: null };
+  morador: { is: { deletedAt: null } };
+};
 
 export type AppStore = {
   condominio: {
@@ -88,18 +96,16 @@ export type AppStore = {
       data: MoradorUpdateData;
     }): Promise<{ count: number }>;
   };
-  convidado?: {
-    create(args: { data: ConvidadoCreateData }): Promise<ConvidadoRecord>;
+  convidado: {
+    create(args: { data: ConvidadoCreateData }): Promise<ConvidadoRecord | null>;
     findMany(args: {
-      where: { condominioId: string; moradorId: string; deletedAt: null };
+      where: ConvidadoWhere;
       orderBy: ConvidadoOrderBy[];
       take?: number;
     }): Promise<ConvidadoRecord[]>;
-    findFirst(args: {
-      where: { id: string; condominioId: string; moradorId: string; deletedAt: null };
-    }): Promise<ConvidadoRecord | null>;
+    findFirst(args: { where: ConvidadoWhere & { id: string } }): Promise<ConvidadoRecord | null>;
     updateMany(args: {
-      where: { id: string; condominioId: string; moradorId: string; deletedAt: null };
+      where: ConvidadoWhere & { id: string };
       data: ConvidadoUpdateData;
     }): Promise<{ count: number }>;
   };
@@ -110,7 +116,6 @@ export type CondominioStore = AppStore;
 type CondominioBody = Partial<Record<keyof CondominioCreateData, unknown>>;
 type MoradorBody = Partial<Record<'nome' | 'condominioId' | 'endereco', unknown>>;
 type EnderecoBody = Partial<Record<'rua' | 'numero' | 'bloco' | 'apartamento', unknown>>;
-type ConvidadoBody = Partial<Record<'nome', unknown>>;
 
 function readRequiredString(body: Partial<Record<string, unknown>>, field: string) {
   const value = body[field];
@@ -273,20 +278,6 @@ function parseMoradorUpdateBody(body: unknown) {
   return Object.keys(data).length > 0 ? data : null;
 }
 
-function parseConvidadoBody(body: unknown) {
-  if (!body || typeof body !== 'object' || Array.isArray(body)) return null;
-  const nome = readRequiredString(body as ConvidadoBody, 'nome');
-  return nome ? { nome } : null;
-}
-
-function parseLimit(query: unknown) {
-  if (!query || typeof query !== 'object' || Array.isArray(query)) return 10;
-  const value = (query as Record<string, unknown>).limite ?? (query as Record<string, unknown>).limit;
-  if (value === undefined) return 10;
-  const parsed = typeof value === 'string' && /^[1-9][0-9]*$/.test(value) ? Number(value) : NaN;
-  return Number.isInteger(parsed) && parsed <= 100 ? parsed : null;
-}
-
 function toCondominioResponse(condominio: CondominioRecord) {
   return {
     id: condominio.id,
@@ -309,39 +300,6 @@ function toMoradorResponse(morador: MoradorRecord) {
     nome: morador.nome,
     endereco
   };
-}
-
-function toConvidadoResponse(convidado: ConvidadoRecord) {
-  return {
-    id: convidado.id,
-    createdAt: convidado.createdAt.toISOString(),
-    condominioId: convidado.condominioId,
-    moradorId: convidado.moradorId,
-    nome: convidado.nome,
-    ultimoUsoEm: convidado.ultimoUsoEm?.toISOString() ?? null
-  };
-}
-
-async function ensureActiveCondominio(db: AppStore, condominioId: string) {
-  return db.condominio.findFirst({ where: { id: condominioId, deletedAt: null } });
-}
-
-async function ensureActiveMorador(db: AppStore, condominioId: string, moradorId: string) {
-  return db.morador.findFirst({
-    where: { id: moradorId, condominioId, deletedAt: null, condominio: activeCondominio }
-  });
-}
-
-async function ensureActiveGuestScope(db: AppStore, condominioId: string, moradorId: string) {
-  if (!await ensureActiveCondominio(db, condominioId)) {
-    return 'condominio' as const;
-  }
-
-  return await ensureActiveMorador(db, condominioId, moradorId) ? null : 'morador' as const;
-}
-
-function guestScopeNotFound(reply: FastifyReply, inactiveParent: 'condominio' | 'morador') {
-  return reply.status(404).send({ error: inactiveParent === 'condominio' ? 'Condominium not found' : 'Resident not found' });
 }
 
 const activeCondominio = { deletedAt: null } as const;
@@ -370,7 +328,31 @@ const defaultStore: AppStore = {
     findFirst: (args) => defaultPrisma.morador.findFirst(args),
     updateMany: (args) => defaultPrisma.morador.updateMany(args)
   },
-  convidado: defaultPrisma.convidado
+  convidado: {
+    async create({ data }) {
+      return defaultPrisma.$transaction(async (transaction) => {
+        const activeMoradores = await transaction.$queryRaw<Array<{ id: string }>>`
+          SELECT morador.id
+          FROM "Morador" AS morador
+          JOIN "Condominio" AS condominio ON condominio.id = morador."condominioId"
+          WHERE morador.id = ${data.moradorId}
+            AND morador."condominioId" = ${data.condominioId}
+            AND morador."deletedAt" IS NULL
+            AND condominio."deletedAt" IS NULL
+          FOR UPDATE OF morador, condominio
+        `;
+
+        if (activeMoradores.length === 0) {
+          return null;
+        }
+
+        return transaction.convidado.create({ data });
+      });
+    },
+    findMany: (args) => defaultPrisma.convidado.findMany(args),
+    findFirst: (args) => defaultPrisma.convidado.findFirst(args),
+    updateMany: (args) => defaultPrisma.convidado.updateMany(args)
+  }
 };
 
 export function createApp(
@@ -394,14 +376,6 @@ export function createApp(
   const nestedMoradorManagement = {
     preHandler: authorize(authenticator, 'moradores:manage', (request) =>
       parseUuidParam(request.params, 'condominioId')
-    )
-  };
-  const guestManagement = {
-    preHandler: authorize(
-      authenticator,
-      'convidados:manage',
-      (request) => parseUuidParam(request.params, 'condominioId'),
-      (request) => parseUuidParam(request.params, 'moradorId')
     )
   };
 
@@ -606,82 +580,7 @@ export function createApp(
     return reply.status(204).send();
   });
 
-  app.get('/condominios/:condominioId/moradores/:moradorId/convidados/recentes', guestManagement, async (request, reply) => {
-    const condominioId = parseUuidParam(request.params, 'condominioId');
-    const moradorId = parseUuidParam(request.params, 'moradorId');
-    const limit = parseLimit(request.query);
-    if (!condominioId || !moradorId || !limit) return reply.status(400).send({ error: 'Invalid recent guests query' });
-    const inactiveParent = await ensureActiveGuestScope(db, condominioId, moradorId);
-    if (inactiveParent) return guestScopeNotFound(reply, inactiveParent);
-    const convidados = await db.convidado!.findMany({
-      where: { condominioId, moradorId, deletedAt: null },
-      orderBy: [{ ultimoUsoEm: { sort: 'desc', nulls: 'last' } }, { createdAt: 'desc' }, { id: 'desc' }],
-      take: limit
-    });
-    return convidados.map(toConvidadoResponse);
-  });
-
-  app.post('/condominios/:condominioId/moradores/:moradorId/convidados', guestManagement, async (request, reply) => {
-    const condominioId = parseUuidParam(request.params, 'condominioId');
-    const moradorId = parseUuidParam(request.params, 'moradorId');
-    const data = parseConvidadoBody(request.body);
-    if (!condominioId || !moradorId || !data) return reply.status(400).send({ error: 'Invalid guest payload' });
-    const inactiveParent = await ensureActiveGuestScope(db, condominioId, moradorId);
-    if (inactiveParent) return guestScopeNotFound(reply, inactiveParent);
-    const convidado = await db.convidado!.create({ data: { ...data, condominioId, moradorId } });
-    return reply.status(201).send(toConvidadoResponse(convidado));
-  });
-
-  app.get('/condominios/:condominioId/moradores/:moradorId/convidados', guestManagement, async (request, reply) => {
-    const condominioId = parseUuidParam(request.params, 'condominioId');
-    const moradorId = parseUuidParam(request.params, 'moradorId');
-    if (!condominioId || !moradorId) return reply.status(400).send({ error: 'Invalid guest scope' });
-    const inactiveParent = await ensureActiveGuestScope(db, condominioId, moradorId);
-    if (inactiveParent) return guestScopeNotFound(reply, inactiveParent);
-    const convidados = await db.convidado!.findMany({
-      where: { condominioId, moradorId, deletedAt: null },
-      orderBy: [{ ultimoUsoEm: { sort: 'desc', nulls: 'last' } }, { createdAt: 'desc' }, { id: 'desc' }]
-    });
-    return convidados.map(toConvidadoResponse);
-  });
-
-  app.get('/condominios/:condominioId/moradores/:moradorId/convidados/:id', guestManagement, async (request, reply) => {
-    const condominioId = parseUuidParam(request.params, 'condominioId');
-    const moradorId = parseUuidParam(request.params, 'moradorId');
-    const id = parseId(request.params);
-    if (!condominioId || !moradorId || !id) return reply.status(400).send({ error: 'Invalid guest id' });
-    const inactiveParent = await ensureActiveGuestScope(db, condominioId, moradorId);
-    if (inactiveParent) return guestScopeNotFound(reply, inactiveParent);
-    const convidado = await db.convidado!.findFirst({ where: { id, condominioId, moradorId, deletedAt: null } });
-    if (!convidado) return reply.status(404).send({ error: 'Guest not found' });
-    return toConvidadoResponse(convidado);
-  });
-
-  app.patch('/condominios/:condominioId/moradores/:moradorId/convidados/:id', guestManagement, async (request, reply) => {
-    const condominioId = parseUuidParam(request.params, 'condominioId');
-    const moradorId = parseUuidParam(request.params, 'moradorId');
-    const id = parseId(request.params);
-    const data = parseConvidadoBody(request.body);
-    if (!condominioId || !moradorId || !id || !data) return reply.status(400).send({ error: 'Invalid guest payload' });
-    const inactiveParent = await ensureActiveGuestScope(db, condominioId, moradorId);
-    if (inactiveParent) return guestScopeNotFound(reply, inactiveParent);
-    const result = await db.convidado!.updateMany({ where: { id, condominioId, moradorId, deletedAt: null }, data });
-    if (!result.count) return reply.status(404).send({ error: 'Guest not found' });
-    const convidado = await db.convidado!.findFirst({ where: { id, condominioId, moradorId, deletedAt: null } });
-    return convidado ? toConvidadoResponse(convidado) : reply.status(404).send({ error: 'Guest not found' });
-  });
-
-  app.delete('/condominios/:condominioId/moradores/:moradorId/convidados/:id', guestManagement, async (request, reply) => {
-    const condominioId = parseUuidParam(request.params, 'condominioId');
-    const moradorId = parseUuidParam(request.params, 'moradorId');
-    const id = parseId(request.params);
-    if (!condominioId || !moradorId || !id) return reply.status(400).send({ error: 'Invalid guest id' });
-    const inactiveParent = await ensureActiveGuestScope(db, condominioId, moradorId);
-    if (inactiveParent) return guestScopeNotFound(reply, inactiveParent);
-    const result = await db.convidado!.updateMany({ where: { id, condominioId, moradorId, deletedAt: null }, data: { deletedAt: new Date() } });
-    if (!result.count) return reply.status(404).send({ error: 'Guest not found' });
-    return reply.status(204).send();
-  });
+  registerConvidadoRoutes(app, db, authenticator);
 
   return app;
 }

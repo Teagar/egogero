@@ -4,12 +4,12 @@ export const ROLES = ['provedor', 'sindico', 'morador', 'portaria'] as const;
 
 export type Role = (typeof ROLES)[number];
 
-export type Permission = 'condominios:manage' | 'moradores:manage';
+export type Permission = 'condominios:manage' | 'moradores:manage' | 'convidados:manage';
 
 export const ROLE_PERMISSIONS = {
-  provedor: ['condominios:manage', 'moradores:manage'],
-  sindico: ['moradores:manage'],
-  morador: [],
+  provedor: ['condominios:manage', 'moradores:manage', 'convidados:manage'],
+  sindico: ['moradores:manage', 'convidados:manage'],
+  morador: ['convidados:manage'],
   portaria: []
 } as const satisfies Record<Role, readonly Permission[]>;
 
@@ -76,7 +76,8 @@ export function createDevelopmentHeaderAuthenticator(enabled: boolean): Authenti
 export function authorize(
   authenticator: Authenticator,
   permission: Permission,
-  getCondominioId?: (request: FastifyRequest) => string | null
+  getCondominioId?: (request: FastifyRequest) => string | null,
+  getMoradorId?: (request: FastifyRequest) => string | null
 ) {
   return async function authorizationHook(request: FastifyRequest, reply: FastifyReply) {
     const identity = await authenticator.authenticate(request);
@@ -95,6 +96,12 @@ export function authorize(
     const globallyAuthorized = identity.role === 'provedor' && identity.condominioIds === null;
 
     if (condominioId && !globallyAuthorized && !identity.condominioIds?.includes(condominioId)) {
+      return reply.status(403).send({ error: 'Forbidden' });
+    }
+
+    const moradorId = getMoradorId?.(request);
+
+    if (moradorId && identity.role === 'morador' && identity.id !== moradorId) {
       return reply.status(403).send({ error: 'Forbidden' });
     }
   };

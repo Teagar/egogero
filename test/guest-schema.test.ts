@@ -13,6 +13,9 @@ test('guest ownership migration preserves legacy guests and enforces condominium
 
   assert.match(migration, /ADD COLUMN "moradorId" TEXT;/);
   assert.doesNotMatch(migration, /ADD COLUMN "moradorId" TEXT NOT NULL/);
+  assert.match(migration, /^BEGIN;/);
+  assert.match(migration, /cross-tenant rows exist/);
+  assert.match(migration, /COMMIT;\s*$/);
   assert.match(migration, /UNIQUE \("id", "condominioId"\)/);
   assert.match(migration, /FOREIGN KEY \("moradorId", "condominioId"\) REFERENCES "Morador"\("id", "condominioId"\)/);
   assert.match(migration, /FOREIGN KEY \("convidadoId", "condominioId"\) REFERENCES "Convidado"\("id", "condominioId"\)/);

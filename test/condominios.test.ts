@@ -87,6 +87,20 @@ function createFakeStore() {
       async updateMany() {
         throw new Error('Unexpected resident updateMany');
       }
+    },
+    convidado: {
+      async create() {
+        throw new Error('Unexpected guest create');
+      },
+      async findMany() {
+        throw new Error('Unexpected guest findMany');
+      },
+      async findFirst() {
+        throw new Error('Unexpected guest findFirst');
+      },
+      async updateMany() {
+        throw new Error('Unexpected guest updateMany');
+      }
     }
   };
 
