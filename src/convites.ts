@@ -13,6 +13,22 @@ const TOKEN_LIMIT = 1_000_000;
 const MAX_TOKEN_ATTEMPTS = 32;
 const BATCH_EXPIRATION_MS = 24 * 60 * 60 * 1000;
 
+export type InvitationMessage = { subject: string; body: string };
+export interface EmailSender { send(to: string, message: InvitationMessage): Promise<void>; }
+export interface SmsSender { send(to: string, body: string): Promise<void>; }
+export type NotificationSender = { email: EmailSender; sms: SmsSender };
+export function createDevelopmentNotificationSender(): NotificationSender {
+  return { email: { async send() {} }, sms: { async send() {} } };
+}
+export function invitationMessage(input: { guestName: string; type: TipoConvite; expiresAt: Date; token: string }): InvitationMessage {
+  const values = { '{CONVIDADO_NOME}': input.guestName, '{TIPO_CONVITE}': input.type, '{EXPIRA_EM}': input.expiresAt.toISOString(), '{TOKEN}': input.token };
+  const replace = (text: string) => Object.entries(values).reduce((result, [placeholder, value]) => result.replaceAll(placeholder, value), text);
+  return {
+    subject: replace('Convite de acesso - {TIPO_CONVITE}'),
+    body: replace('Olá, {CONVIDADO_NOME}! Você recebeu um convite de acesso ({TIPO_CONVITE}). Seu código é {TOKEN}. Ele expira em {EXPIRA_EM}.')
+  };
+}
+
 export type InvitationRecord = {
   id: string;
   createdAt: Date;
@@ -421,7 +437,8 @@ export function registerConviteRoutes(
   app: FastifyInstance,
   db: ConvitesStore,
   store: InvitationStore | undefined,
-  authenticator: Authenticator
+  authenticator: Authenticator,
+  notifications: NotificationSender = createDevelopmentNotificationSender()
 ) {
   const singlePath = '/condominios/:condominioId/moradores/:moradorId/convidados/:convidadoId/convites';
   const batchPath = '/condominios/:condominioId/moradores/:moradorId/convites/multiplos';
@@ -448,11 +465,20 @@ export function registerConviteRoutes(
       return reply.status(503).send({ error: 'Invitation service unavailable' });
     }
 
+    const convidado = await db.convidado.findFirst({ where: { id: convidadoId, condominioId, moradorId, deletedAt: null, ...activeGuestParents } });
+    if (!convidado) return reply.status(404).send({ error: 'Guest not found' });
+
     try {
       const result = await createInvitation(store, { condominioId, moradorId, convidadoId, ...body });
-      return result
-        ? reply.header('cache-control', 'no-store').status(201).send(invitationResponse(result.convite, result.token))
-        : reply.status(404).send({ error: 'Guest not found' });
+      if (!result) return reply.status(404).send({ error: 'Guest not found' });
+      const message = invitationMessage({ guestName: convidado.nome, type: body.tipo, expiresAt: body.expiresAt, token: result.token });
+      try {
+        if (convidado.email) await notifications.email.send(convidado.email, message);
+        if (convidado.telefone) await notifications.sms.send(convidado.telefone, message.body);
+      } catch {
+        return reply.header('cache-control', 'no-store').status(502).send({ error: 'Invitation created but notification delivery failed', invitationId: result.convite.id });
+      }
+      return reply.header('cache-control', 'no-store').status(201).send(invitationResponse(result.convite, result.token));
     } catch (error) {
       if (error instanceof RangeError) {
         return reply.status(400).send({ error: 'Invitation expiration must be in the future' });
