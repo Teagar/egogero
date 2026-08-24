@@ -51,6 +51,15 @@ function exactHttpsUrl(value: string, name: string) {
   return url.toString();
 }
 
+export function exactOidcIssuer(value: string, name = 'OIDC issuer') {
+  let url: URL;
+  try { url = new URL(value); } catch { throw new Error(`${name} must be an exact HTTPS URL`); }
+  if (url.protocol !== 'https:' || url.username || url.password || url.search || url.hash || !url.hostname) {
+    throw new Error(`${name} must be an exact HTTPS URL`);
+  }
+  return value;
+}
+
 function required(environment: NodeJS.ProcessEnv, name: string) {
   const value = environment[name];
   if (!value || value.trim() !== value) throw new Error(`${name} is required`);
@@ -96,7 +105,7 @@ export function humanAdministrationConfigFromEnvironment(
   }
   const recoveryUrl = exactHttpsUrl(required(environment, 'OIDC_RECOVERY_URL'), 'OIDC_RECOVERY_URL');
   const issuers = required(environment, 'RECOVERY_WEBHOOK_ISSUERS').split(',').map((issuer) =>
-    exactHttpsUrl(issuer.trim(), 'RECOVERY_WEBHOOK_ISSUERS').replace(/\/$/, '')
+    exactOidcIssuer(issuer.trim(), 'RECOVERY_WEBHOOK_ISSUERS')
   );
   if (issuers.length === 0 || new Set(issuers).size !== issuers.length) {
     throw new Error('RECOVERY_WEBHOOK_ISSUERS must be a unique exact issuer allowlist');
@@ -295,7 +304,7 @@ export function createHumanAdministrationService(client: PrismaClient, config: H
         const inserted = await transaction.$queryRaw<Array<{ id: string }>>(Prisma.sql`
           INSERT INTO "RecoveryWebhookEvent" (id, "eventId", "eventDigest", issuer, subject, "processedAt")
           VALUES (${randomUUID()}::uuid, ${input.eventId}, ${eventDigest}, ${input.issuer}, ${input.subject}, clock_timestamp())
-          ON CONFLICT ("eventId") DO NOTHING RETURNING id
+          ON CONFLICT (issuer, "eventId") DO NOTHING RETURNING id
         `);
         if (!inserted[0]) return true;
         const identities = await transaction.$queryRaw<Array<{ accountId: string }>>(Prisma.sql`

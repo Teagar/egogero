@@ -44,12 +44,18 @@ ALTER TABLE "OidcLoginTransaction"
   ADD CONSTRAINT "OidcLoginTransaction_invitation_digest_check"
     CHECK ("invitationTokenDigest" IS NULL OR octet_length("invitationTokenDigest") = 32),
   ADD CONSTRAINT "OidcLoginTransaction_intent_check"
-    CHECK (NOT ("recoveryIntent" AND "invitationTokenDigest" IS NOT NULL));
+    CHECK (
+      NOT ("recoveryIntent" AND "invitationTokenDigest" IS NOT NULL)
+      AND NOT ("recoveryIntent" AND "reauthenticationIntent")
+    );
 
 ALTER TABLE "OidcValidatedHandoff"
   ADD COLUMN "authenticationMethods" TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
   ADD COLUMN "assuranceContext" TEXT,
   ADD COLUMN "recoveryIntent" BOOLEAN NOT NULL DEFAULT false,
+  ADD CONSTRAINT "OidcValidatedHandoff_intent_check" CHECK (
+    NOT ("recoveryIntent" AND "reauthenticationIntent")
+  ),
   ADD CONSTRAINT "OidcValidatedHandoff_assurance_check" CHECK (
     cardinality("authenticationMethods") BETWEEN 0 AND 16
     AND NOT ('' = ANY("authenticationMethods"))
@@ -80,7 +86,7 @@ CREATE TABLE "RecoveryWebhookEvent" (
   CONSTRAINT "RecoveryWebhookEvent_issuer_check" CHECK (issuer ~ '^https://[^/?#[:space:]]+([^?#[:space:]]*)?$'),
   CONSTRAINT "RecoveryWebhookEvent_subject_check" CHECK (length(subject) BETWEEN 1 AND 255)
 );
-CREATE UNIQUE INDEX "RecoveryWebhookEvent_eventId_key" ON "RecoveryWebhookEvent"("eventId");
+CREATE UNIQUE INDEX "RecoveryWebhookEvent_issuer_eventId_key" ON "RecoveryWebhookEvent"(issuer, "eventId");
 CREATE UNIQUE INDEX "RecoveryWebhookEvent_eventDigest_key" ON "RecoveryWebhookEvent"("eventDigest");
 CREATE INDEX "RecoveryWebhookEvent_createdAt_idx" ON "RecoveryWebhookEvent"("createdAt");
 

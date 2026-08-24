@@ -42,6 +42,12 @@ test('human administration environment requires exact recovery, webhook, and com
   assert.throws(() => humanAdministrationConfigFromEnvironment({ ...base, RECOVERY_WEBHOOK_SECRET: 'short' }), /at least 32 bytes/);
   assert.throws(() => humanAdministrationConfigFromEnvironment({ ...base, OIDC_RECOVERY_URL: 'http://identity.test/recovery' }), /HTTPS/);
   assert.throws(() => humanAdministrationConfigFromEnvironment({ ...base, HUMAN_MFA_ROLE_POLICY: '{}' }), /every role/);
+  assert.deepEqual(
+    [...humanAdministrationConfigFromEnvironment({ ...base,
+      RECOVERY_WEBHOOK_ISSUERS: 'https://identity.example.test/,https://identity.example.test'
+    })!.recoveryWebhookIssuers],
+    ['https://identity.example.test/', 'https://identity.example.test']
+  );
   assert.throws(() => humanAdministrationConfigFromEnvironment({ ...base,
     HUMAN_MFA_ROLE_POLICY: JSON.stringify({ ...policy, provedor: { amr: ['otp'], acr: ['strong'] } })
   }), /unsafe method/);

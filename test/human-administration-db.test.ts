@@ -3,6 +3,7 @@ import { createHash, createHmac, randomBytes, randomUUID } from 'node:crypto';
 import test from 'node:test';
 
 import { PrismaClient } from '@prisma/client';
+import { Client } from 'pg';
 
 import { createHumanAdministrationService } from '../src/human-administration.js';
 import { createPrismaOidcLoginStore } from '../src/oidc.js';
@@ -90,9 +91,10 @@ test('PostgreSQL invitation binding is one-time, email-exact, concurrent, tenant
 test('signed recovery webhook validates issuer, timestamp, signature, and replay before global revocation', { skip: !run }, async () => {
   const prisma = new PrismaClient();
   const secret = randomBytes(32);
+  const trailingIssuer = `${issuer}/`;
   const service = createHumanAdministrationService(prisma, {
     publicApplicationOrigin: 'https://app.example.test', recoveryUrl: `${issuer}/recovery`,
-    recoveryWebhookIssuers: new Set([issuer]), recoveryWebhookSecret: secret, mfaPolicy: policy
+    recoveryWebhookIssuers: new Set([issuer, trailingIssuer]), recoveryWebhookSecret: secret, mfaPolicy: policy
   });
   const accountId = randomUUID();
   const membershipId = randomUUID();
@@ -100,9 +102,11 @@ test('signed recovery webhook validates issuer, timestamp, signature, and replay
   const sessionId = randomUUID();
   const eventId = randomUUID();
   const subject = `recovery-${accountId}`;
+  const trailingSubject = `trailing-${accountId}`;
   try {
     await prisma.humanAccount.create({ data: { id: accountId, displayName: 'Recovery', status: 'active' } });
     await prisma.externalIdentity.create({ data: { id: externalIdentityId, accountId, issuer, subject } });
+    await prisma.externalIdentity.create({ data: { accountId, issuer: trailingIssuer, subject: trailingSubject } });
     await prisma.humanMembership.create({ data: { id: membershipId, accountId, role: 'provedor', status: 'active' } });
     const now = new Date();
     await prisma.browserSession.create({ data: {
@@ -114,21 +118,30 @@ test('signed recovery webhook validates issuer, timestamp, signature, and replay
       accountSessionVersion: 0, activeMembershipId: membershipId
     } });
     const timestamp = Math.floor(Date.now() / 1000);
-    const signature = createHmac('sha256', secret).update(`${timestamp}.${eventId}.${issuer}.${subject}`).digest('hex');
-    const request = { eventId, issuer, subject, timestamp, signature, requestCorrelationId: randomUUID() };
+    const signature = createHmac('sha256', secret)
+      .update(`${timestamp}.${eventId}.${trailingIssuer}.${trailingSubject}`).digest('hex');
+    const request = { eventId, issuer: trailingIssuer, subject: trailingSubject,
+      timestamp, signature, requestCorrelationId: randomUUID() };
     assert.equal(await service.processRecoveryWebhook({ ...request, signature: '0'.repeat(64) }), false);
     assert.equal(await service.processRecoveryWebhook({ ...request, timestamp: timestamp - 301,
-      signature: createHmac('sha256', secret).update(`${timestamp - 301}.${eventId}.${issuer}.${subject}`).digest('hex') }), false);
+      signature: createHmac('sha256', secret)
+        .update(`${timestamp - 301}.${eventId}.${trailingIssuer}.${trailingSubject}`).digest('hex') }), false);
     assert.equal(await service.processRecoveryWebhook({ ...request, issuer: 'https://other.example.test',
-      signature: createHmac('sha256', secret).update(`${timestamp}.${eventId}.https://other.example.test.${subject}`).digest('hex') }), false);
+      signature: createHmac('sha256', secret)
+        .update(`${timestamp}.${eventId}.https://other.example.test.${trailingSubject}`).digest('hex') }), false);
     assert.equal(await service.processRecoveryWebhook(request), true);
     assert.equal(await service.processRecoveryWebhook(request), true);
     assert.equal((await prisma.humanAccount.findUniqueOrThrow({ where: { id: accountId } })).sessionVersion, 1);
     assert.equal((await prisma.browserSession.findUniqueOrThrow({ where: { id: sessionId } })).revokeReason, 'provider_recovery_event');
-    const event = await prisma.recoveryWebhookEvent.findUniqueOrThrow({ where: { eventId } });
-    assert.equal(event.accountId, accountId);
-    assert.equal(Buffer.from(event.eventDigest).length, 32);
-    assert.equal(JSON.stringify(event).includes(signature), false);
+    const secondSignature = createHmac('sha256', secret)
+      .update(`${timestamp}.${eventId}.${issuer}.${subject}`).digest('hex');
+    assert.equal(await service.processRecoveryWebhook({ ...request, issuer, subject, signature: secondSignature }), true);
+    assert.equal((await prisma.humanAccount.findUniqueOrThrow({ where: { id: accountId } })).sessionVersion, 2);
+    const events = await prisma.recoveryWebhookEvent.findMany({ where: { eventId }, orderBy: { issuer: 'asc' } });
+    assert.equal(events.length, 2);
+    assert.deepEqual(new Set(events.map((event) => event.issuer)), new Set([issuer, trailingIssuer]));
+    assert.ok(events.every((event) => event.accountId === accountId && Buffer.from(event.eventDigest).length === 32));
+    assert.equal(JSON.stringify(events).includes(signature), false);
   } finally {
     await prisma.recoveryWebhookEvent.deleteMany({ where: { eventId } });
     await prisma.browserSession.deleteMany({ where: { accountId } });
@@ -136,6 +149,136 @@ test('signed recovery webhook validates issuer, timestamp, signature, and replay
     await prisma.externalIdentity.deleteMany({ where: { accountId } });
     await prisma.humanAccount.deleteMany({ where: { id: accountId } });
     await prisma.$disconnect();
+  }
+});
+
+test('PostgreSQL rejects combined recovery and reauthentication intent at both OIDC stages', { skip: !run }, async () => {
+  const prisma = new PrismaClient();
+  const accountId = randomUUID();
+  const identityId = randomUUID();
+  const transactionId = randomUUID();
+  const rejectedTransactionId = randomUUID();
+  try {
+    await assert.rejects(prisma.oidcLoginTransaction.create({ data: {
+      id: rejectedTransactionId, expiresAt: new Date(Date.now() + 60_000), stateDigest: randomBytes(32),
+      nonceDigest: randomBytes(32), pkceVerifierCiphertext: randomBytes(43), pkceVerifierNonce: randomBytes(12),
+      pkceVerifierAuthTag: randomBytes(16), pkceKeyVersion: 1, issuer, clientId: 'intent-check',
+      redirectUri: 'https://app.example.test/auth/callback', returnTo: '/', recoveryIntent: true,
+      reauthenticationIntent: true, reauthenticationFamilyId: randomUUID()
+    } }), /constraint|violates check/i);
+    await prisma.humanAccount.create({ data: { id: accountId, displayName: 'Intent', status: 'active' } });
+    await prisma.externalIdentity.create({ data: { id: identityId, accountId, issuer, subject: `intent-${accountId}` } });
+    await prisma.oidcLoginTransaction.create({ data: {
+      id: transactionId, expiresAt: new Date(Date.now() + 60_000), stateDigest: randomBytes(32),
+      nonceDigest: randomBytes(32), pkceVerifierCiphertext: randomBytes(43), pkceVerifierNonce: randomBytes(12),
+      pkceVerifierAuthTag: randomBytes(16), pkceKeyVersion: 1, issuer, clientId: 'intent-check',
+      redirectUri: 'https://app.example.test/auth/callback', returnTo: '/'
+    } });
+    await assert.rejects(prisma.oidcValidatedHandoff.create({ data: {
+      expiresAt: new Date(Date.now() + 60_000), handleDigest: randomBytes(32), loginTransactionId: transactionId,
+      accountId, externalIdentityId: identityId, authenticatedAt: new Date(), authenticationMethods: ['webauthn'],
+      recoveryIntent: true, reauthenticationIntent: true, reauthenticationFamilyId: randomUUID()
+    } }), /constraint|violates check/i);
+  } finally {
+    await prisma.oidcValidatedHandoff.deleteMany({ where: { loginTransactionId: transactionId } });
+    await prisma.oidcLoginTransaction.deleteMany({ where: { id: { in: [transactionId, rejectedTransactionId] } } });
+    await prisma.externalIdentity.deleteMany({ where: { accountId } });
+    await prisma.humanAccount.deleteMany({ where: { id: accountId } });
+    await prisma.$disconnect();
+  }
+});
+
+test('concurrent condominium disable waits for session issue and revokes the inserted session permanently', { skip: !run }, async () => {
+  const rawUrl = new URL(process.env.DATABASE_URL!);
+  const pgUrl = new URL(rawUrl);
+  pgUrl.searchParams.delete('schema');
+  const issuePrisma = new PrismaClient();
+  const disablePrisma = new PrismaClient();
+  const observer = new Client({ connectionString: pgUrl.toString() });
+  const store = createPrismaBrowserSessionStore(issuePrisma, {
+    currentCsrfKeyVersion: 1, csrfKeys: new Map([[1, randomBytes(32)]]),
+    publicApplicationOrigin: 'https://app.example.test', mfaPolicy: policy
+  });
+  const accountId = randomUUID();
+  const identityId = randomUUID();
+  const condominiumId = randomUUID();
+  const membershipId = randomUUID();
+  const transactionId = randomUUID();
+  const handoffToken = generateSessionToken();
+  let issuing: ReturnType<typeof store.issueFromHandoff> | undefined;
+  async function waitForIssueToBlock() {
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const result = await observer.query<{ waiting: boolean }>(`
+        SELECT EXISTS (
+          SELECT 1 FROM pg_stat_activity
+          WHERE pid <> pg_backend_pid() AND wait_event_type = 'Lock'
+            AND wait_event = 'advisory'
+        ) AS waiting
+      `);
+      if (result.rows[0]?.waiting) return;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    throw new Error('session issue did not reach the controlled advisory lock point');
+  }
+  try {
+    await observer.connect();
+    await issuePrisma.$connect();
+    await disablePrisma.condominio.create({ data: { id: condominiumId, nome: 'Race', responsavel: 'Owner', tipo: 'residencial', timezone: 'UTC' } });
+    await disablePrisma.humanAccount.create({ data: { id: accountId, displayName: 'Race', status: 'active' } });
+    await disablePrisma.externalIdentity.create({ data: { id: identityId, accountId, issuer, subject: `race-${accountId}` } });
+    await disablePrisma.humanMembership.create({ data: { id: membershipId, accountId, role: 'sindico', condominioId: condominiumId, status: 'active' } });
+    await disablePrisma.oidcLoginTransaction.create({ data: {
+      id: transactionId, expiresAt: new Date(Date.now() + 60_000), stateDigest: randomBytes(32), nonceDigest: randomBytes(32),
+      pkceVerifierCiphertext: randomBytes(43), pkceVerifierNonce: randomBytes(12), pkceVerifierAuthTag: randomBytes(16),
+      pkceKeyVersion: 1, issuer, clientId: 'race', redirectUri: 'https://app.example.test/auth/callback', returnTo: '/'
+    } });
+    await disablePrisma.oidcValidatedHandoff.create({ data: {
+      expiresAt: new Date(Date.now() + 60_000), handleDigest: createHash('sha256').update(handoffToken).digest(),
+      loginTransactionId: transactionId, accountId, externalIdentityId: identityId, authenticatedAt: new Date(),
+      authenticationMethods: ['webauthn'], assuranceContext: 'strong'
+    } });
+
+    await observer.query(`
+      CREATE FUNCTION pc27_test_block_session_insert() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN
+        PERFORM pg_advisory_xact_lock(270027);
+        RETURN NEW;
+      END;
+      $$
+    `);
+    await observer.query(`
+      CREATE TRIGGER pc27_test_block_session_insert
+      BEFORE INSERT ON "BrowserSession"
+      FOR EACH ROW EXECUTE FUNCTION pc27_test_block_session_insert()
+    `);
+    await observer.query('BEGIN');
+    await observer.query('SELECT pg_advisory_xact_lock(270027)');
+    issuing = store.issueFromHandoff({ handoffToken, requestCorrelationId: 'condominium-race' });
+    await waitForIssueToBlock();
+    const disabling = disablePrisma.condominio.update({ where: { id: condominiumId }, data: { deletedAt: new Date() } });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    await observer.query('COMMIT');
+    const [issued] = await Promise.all([issuing, disabling]);
+    assert.ok(issued);
+    const persisted = await disablePrisma.browserSession.findUniqueOrThrow({ where: { id: issued.identity.sessionId } });
+    assert.equal(persisted.revokeReason, 'condominium_disabled');
+    await disablePrisma.condominio.update({ where: { id: condominiumId }, data: { deletedAt: null } });
+    assert.equal(await store.authenticate(issued.sessionToken, 'restored-condominium'), null);
+  } finally {
+    await observer.query('ROLLBACK').catch(() => undefined);
+    await issuing?.catch(() => undefined);
+    await disablePrisma.browserSession.deleteMany({ where: { accountId } });
+    await disablePrisma.oidcValidatedHandoff.deleteMany({ where: { loginTransactionId: transactionId } });
+    await disablePrisma.oidcLoginTransaction.deleteMany({ where: { id: transactionId } });
+    await disablePrisma.humanMembership.deleteMany({ where: { accountId } });
+    await disablePrisma.externalIdentity.deleteMany({ where: { accountId } });
+    await disablePrisma.humanAccount.deleteMany({ where: { id: accountId } });
+    await disablePrisma.condominio.deleteMany({ where: { id: condominiumId } });
+    await observer.query('DROP TRIGGER IF EXISTS pc27_test_block_session_insert ON "BrowserSession"').catch(() => undefined);
+    await observer.query('DROP FUNCTION IF EXISTS pc27_test_block_session_insert()').catch(() => undefined);
+    await observer.end().catch(() => undefined);
+    await issuePrisma.$disconnect();
+    await disablePrisma.$disconnect();
   }
 });
 

@@ -19,7 +19,7 @@ import * as oidc from 'openid-client';
 
 import { hasBrowserSessionCookie, parseBrowserSessionCookie } from './sessions.js';
 import type { BrowserSessionService, BrowserSessionStore } from './sessions.js';
-import { digestSecret, normalizeProvisioningEmail } from './human-administration.js';
+import { digestSecret, exactOidcIssuer, normalizeProvisioningEmail } from './human-administration.js';
 import type { HumanAdministrationService } from './human-administration.js';
 
 const LOGIN_TRANSACTION_TTL_MS = 10 * 60 * 1000;
@@ -231,7 +231,7 @@ export function oidcConfigFromEnvironment(environment: NodeJS.ProcessEnv): OidcR
     throw new Error('HUMAN_AUTH_ENABLED must be true or false');
   }
 
-  const issuer = parseExactHttpsUrl(requireEnvironment(environment, 'OIDC_ISSUER'), 'OIDC_ISSUER');
+  const issuer = exactOidcIssuer(requireEnvironment(environment, 'OIDC_ISSUER'), 'OIDC_ISSUER');
   const authorizationEndpoint = parseExactHttpsUrl(
     requireEnvironment(environment, 'OIDC_AUTHORIZATION_ENDPOINT'),
     'OIDC_AUTHORIZATION_ENDPOINT'

@@ -371,13 +371,14 @@ model HumanProvisioningInvitation {
 model RecoveryWebhookEvent {
   id          String   @id @default(uuid()) @db.Uuid
   createdAt   DateTime @default(now()) @db.Timestamptz(3)
-  eventId     String   @unique
+  eventId     String
   eventDigest Bytes    @unique
   issuer      String
   subject     String
   accountId   String?  @db.Uuid
   processedAt DateTime @db.Timestamptz(3)
 
+  @@unique([issuer, eventId])
   @@index([createdAt])
 }
 

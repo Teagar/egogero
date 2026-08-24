@@ -427,6 +427,28 @@ async function loadTargetMembership(
   return rows[0] ?? null;
 }
 
+async function lockLiveMembershipScope(transaction: Prisma.TransactionClient, membership: MembershipRow) {
+  if (membership.role === 'provedor') return membership.condominioId === null && membership.residentId === null;
+  if (!membership.condominioId) return false;
+  const condominiums = await transaction.$queryRaw<Array<{ id: string }>>(Prisma.sql`
+    SELECT id FROM "Condominio"
+    WHERE id = ${membership.condominioId} AND "deletedAt" IS NULL
+    FOR SHARE
+  `);
+  if (condominiums.length !== 1) return false;
+  if (membership.role === 'morador') {
+    if (!membership.residentId) return false;
+    const rows = await transaction.$queryRaw<Array<{ id: string }>>(Prisma.sql`
+      SELECT id FROM "Morador"
+      WHERE id = ${membership.residentId} AND "condominioId" = ${membership.condominioId}
+        AND "deletedAt" IS NULL
+      FOR SHARE
+    `);
+    return rows.length === 1;
+  }
+  return true;
+}
+
 async function creationAllowed(transaction: Prisma.TransactionClient, accountId: string) {
   const rows = await transaction.$queryRaw<Array<{ allowed: boolean }>>(Prisma.sql`
     SELECT COUNT(*) < ${SESSION_CREATION_LIMIT} AS allowed
@@ -643,6 +665,40 @@ export function createPrismaBrowserSessionStore(client: PrismaClient, config: Se
           });
           return null;
         }
+        const membership = handoff.reauthenticationIntent
+          ? oldCandidate && oldCandidate.accountId === account.id
+            ? await loadTargetMembership(transaction, account.id, oldCandidate.id)
+            : null
+          : await chooseMembership(transaction, account.id, config.mfaPolicy, {
+              amr: handoff.authenticationMethods,
+              acr: handoff.assuranceContext
+            });
+        if (!membership && !handoff.reauthenticationIntent) {
+          const liveMembership = config.mfaPolicy ? await chooseMembership(transaction, account.id) : null;
+          await insertAudit(transaction, {
+            eventType: liveMembership ? 'mfa_policy_denied' : 'session_issue_denied', outcome: 'denied',
+            reasonCode: liveMembership ? 'insufficient_authentication_assurance' : 'no_active_membership',
+            requestCorrelationId: input.requestCorrelationId, accountId: account.id,
+            externalIdentityId: handoff.externalIdentityId, membershipId: liveMembership?.id,
+            condominioId: liveMembership?.condominioId, ipPrefix: input.ipPrefix,
+            userAgentHash: userAgentDigest(input.userAgent)
+          });
+          return null;
+        }
+        const membershipScopeLive = membership
+          ? await lockLiveMembershipScope(transaction, membership)
+          : false;
+        if (!membershipScopeLive && !handoff.reauthenticationIntent) {
+          if (!membership) return null;
+          await insertAudit(transaction, {
+            eventType: 'session_issue_denied', outcome: 'denied', reasonCode: 'membership_scope_inactive',
+            requestCorrelationId: input.requestCorrelationId, accountId: account.id,
+            externalIdentityId: handoff.externalIdentityId, membershipId: membership.id,
+            condominioId: membership.condominioId, ipPrefix: input.ipPrefix,
+            userAgentHash: userAgentDigest(input.userAgent)
+          });
+          return null;
+        }
         const oldSession = input.oldSessionToken && oldCandidate
           ? await loadSession(transaction, digest(input.oldSessionToken), true)
           : null;
@@ -658,9 +714,8 @@ export function createPrismaBrowserSessionStore(client: PrismaClient, config: Se
             });
             return null;
           }
-          const membership = await loadTargetMembership(transaction, account.id, oldSession.id);
           const csrf = decryptCsrf(config, oldSession);
-          if (!membership || !csrf) {
+          if (!membership || !membershipScopeLive || !csrf) {
             csrf?.fill(0);
             await auditDenied(transaction, input, 'session_reauthentication_denied', 'session_integrity_failed', oldSession);
             return null;
@@ -704,22 +759,7 @@ export function createPrismaBrowserSessionStore(client: PrismaClient, config: Se
           csrf.fill(0);
           return result;
         }
-        const membership = await chooseMembership(transaction, account.id, config.mfaPolicy, {
-          amr: handoff.authenticationMethods,
-          acr: handoff.assuranceContext
-        });
-        if (!membership) {
-          const liveMembership = config.mfaPolicy ? await chooseMembership(transaction, account.id) : null;
-          await insertAudit(transaction, {
-            eventType: liveMembership ? 'mfa_policy_denied' : 'session_issue_denied', outcome: 'denied',
-            reasonCode: liveMembership ? 'insufficient_authentication_assurance' : 'no_active_membership',
-            requestCorrelationId: input.requestCorrelationId, accountId: account.id,
-            externalIdentityId: handoff.externalIdentityId, membershipId: liveMembership?.id,
-            condominioId: liveMembership?.condominioId, ipPrefix: input.ipPrefix,
-            userAgentHash: userAgentDigest(input.userAgent)
-          });
-          return null;
-        }
+        if (!membership) return null;
         if (config.mfaPolicy && !evidenceSatisfiesRole(config.mfaPolicy, membership.role, {
           amr: handoff.authenticationMethods, acr: handoff.assuranceContext
         })) {
@@ -924,12 +964,23 @@ export function createPrismaBrowserSessionStore(client: PrismaClient, config: Se
             SELECT id FROM "HumanAccount" WHERE id = ${candidate.accountId}::uuid FOR UPDATE
           `);
         }
+        const targetMembershipValid = !input.targetMembershipId || UUID_PATTERN.test(input.targetMembershipId);
+        const membership = candidate && targetMembershipValid
+          ? await loadTargetMembership(
+              transaction,
+              candidate.accountId,
+              input.targetMembershipId ?? candidate.id
+            )
+          : null;
+        const membershipScopeLive = membership
+          ? await lockLiveMembershipScope(transaction, membership)
+          : false;
         const session = await loadSession(transaction, tokenDigest, true);
         if (!session) {
           await auditDenied(transaction, input, 'session_rotation_denied', 'invalid_session');
           return { status: 'denied' };
         }
-        if (input.targetMembershipId && !UUID_PATTERN.test(input.targetMembershipId)) {
+        if (!targetMembershipValid) {
           await auditDenied(transaction, input, 'session_rotation_denied', 'target_membership_invalid', session);
           return { status: 'denied' };
         }
@@ -942,11 +993,12 @@ export function createPrismaBrowserSessionStore(client: PrismaClient, config: Se
           await auditDenied(transaction, input, 'session_rotation_denied', reason, session);
           return { status: 'denied' };
         }
-        const membership = input.targetMembershipId
-          ? await loadTargetMembership(transaction, session.accountId, input.targetMembershipId)
-          : await loadTargetMembership(transaction, session.accountId, session.id);
         if (!membership) {
           await auditDenied(transaction, input, 'session_rotation_denied', 'target_membership_inactive', session);
+          return { status: 'denied' };
+        }
+        if (!membershipScopeLive) {
+          await auditDenied(transaction, input, 'session_rotation_denied', 'membership_scope_inactive', session);
           return { status: 'denied' };
         }
         if (config.mfaPolicy && !evidenceSatisfiesRole(config.mfaPolicy, membership.role, {
