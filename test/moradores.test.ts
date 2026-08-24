@@ -399,3 +399,64 @@ test('resident endpoints validate payload and authorization boundary', async () 
 
   await app.close();
 });
+
+test('provider or scoped sindico configures daily invitation limits, but residents cannot', async () => {
+  const app = createApp({ db: createFakeStore(), authenticator });
+  const firstCondominio = await createCondominio(app, 'Residencial A');
+  const secondCondominio = await createCondominio(app, 'Residencial B');
+  const resident = await createMorador(app, firstCondominio.id);
+  const scopedSindicoHeaders = { ...sindicoHeaders, 'x-development-condominio-id': firstCondominio.id };
+
+  const condominiumLimit = await app.inject({
+    method: 'PATCH',
+    url: `/condominios/${firstCondominio.id}/limite-diario-convites`,
+    headers: scopedSindicoHeaders,
+    payload: { dailyInvitationLimit: 10 }
+  });
+  assert.equal(condominiumLimit.statusCode, 200);
+  assert.deepEqual(condominiumLimit.json(), { dailyInvitationLimit: 10 });
+
+  const residentLimit = await app.inject({
+    method: 'PATCH',
+    url: `/condominios/${firstCondominio.id}/moradores/${resident.id}/limite-diario-convites`,
+    headers: scopedSindicoHeaders,
+    payload: { dailyInvitationLimit: 3 }
+  });
+  assert.equal(residentLimit.statusCode, 200);
+  assert.deepEqual(residentLimit.json(), { dailyInvitationLimit: 3 });
+
+  const crossTenant = await app.inject({
+    method: 'PATCH',
+    url: `/condominios/${secondCondominio.id}/limite-diario-convites`,
+    headers: scopedSindicoHeaders,
+    payload: { dailyInvitationLimit: 1 }
+  });
+  assert.equal(crossTenant.statusCode, 403);
+
+  const selfRaise = await app.inject({
+    method: 'PATCH',
+    url: `/condominios/${firstCondominio.id}/moradores/${resident.id}/limite-diario-convites`,
+    headers: { ...moradorHeaders, 'x-development-user-id': resident.id, 'x-development-condominio-id': firstCondominio.id },
+    payload: { dailyInvitationLimit: 100_000 }
+  });
+  assert.equal(selfRaise.statusCode, 403);
+
+  for (const payload of [{ dailyInvitationLimit: -1 }, { dailyInvitationLimit: 1.5 }, { dailyInvitationLimit: 100_001 }, {}]) {
+    const invalid = await app.inject({
+      method: 'PATCH',
+      url: `/condominios/${firstCondominio.id}/limite-diario-convites`,
+      headers: providerHeaders,
+      payload
+    });
+    assert.equal(invalid.statusCode, 400);
+  }
+
+  const unlimited = await app.inject({
+    method: 'PATCH',
+    url: `/condominios/${firstCondominio.id}/limite-diario-convites`,
+    headers: providerHeaders,
+    payload: { dailyInvitationLimit: null }
+  });
+  assert.deepEqual(unlimited.json(), { dailyInvitationLimit: null });
+  await app.close();
+});

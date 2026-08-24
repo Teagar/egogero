@@ -4,11 +4,11 @@ export const ROLES = ['provedor', 'sindico', 'morador', 'portaria'] as const;
 
 export type Role = (typeof ROLES)[number];
 
-export type Permission = 'condominios:manage' | 'moradores:manage' | 'convidados:manage' | 'convites:create';
+export type Permission = 'condominios:manage' | 'moradores:manage' | 'convidados:manage' | 'convites:create' | 'convites:limits:manage';
 
 export const ROLE_PERMISSIONS = {
-  provedor: ['condominios:manage', 'moradores:manage', 'convidados:manage', 'convites:create'],
-  sindico: ['moradores:manage', 'convidados:manage', 'convites:create'],
+  provedor: ['condominios:manage', 'moradores:manage', 'convidados:manage', 'convites:create', 'convites:limits:manage'],
+  sindico: ['moradores:manage', 'convidados:manage', 'convites:create', 'convites:limits:manage'],
   morador: ['convidados:manage', 'convites:create'],
   portaria: []
 } as const satisfies Record<Role, readonly Permission[]>;

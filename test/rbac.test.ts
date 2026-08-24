@@ -286,6 +286,22 @@ const endpoints: Endpoint[] = [
     },
     roles: ['provedor', 'sindico', 'morador'],
     successStatus: 201
+  },
+  {
+    name: 'update condominium invitation limit',
+    request: { method: 'PATCH', url: `/condominios/${CONDOMINIO_ID}/limite-diario-convites`, payload: { dailyInvitationLimit: 10 } },
+    roles: ['provedor', 'sindico'],
+    successStatus: 200
+  },
+  {
+    name: 'update resident invitation limit',
+    request: {
+      method: 'PATCH',
+      url: `/condominios/${CONDOMINIO_ID}/moradores/${MORADOR_ID}/limite-diario-convites`,
+      payload: { dailyInvitationLimit: 10 }
+    },
+    roles: ['provedor', 'sindico'],
+    successStatus: 200
   }
 ];
 
@@ -450,7 +466,9 @@ test('tenant matrix prevents a sindico from reaching another condominium before 
       if (role === 'provedor') {
         assert.equal(response.statusCode, endpoint.successStatus, `${role}: ${endpoint.name}`);
         assert.ok(storeCalls > 0, `${role}: ${endpoint.name} should reach its tenant data`);
-        assert.equal(condominioStoreCalls, 0, `${role}: ${endpoint.name} used a preliminary condominium check`);
+        if (endpoint.name !== 'update condominium invitation limit') {
+          assert.equal(condominioStoreCalls, 0, `${role}: ${endpoint.name} used a preliminary condominium check`);
+        }
       } else {
         assert.equal(response.statusCode, 403, `${role}: ${endpoint.name}`);
         assert.equal(storeCalls, 0, `${role}: ${endpoint.name} crossed the authorization boundary`);
@@ -498,8 +516,10 @@ test('route inventory keeps every business route in the RBAC matrix', async () =
       '├── /health (GET, HEAD)',
       '├── /condominios (POST, GET, HEAD)',
       '│   └── /:id|:condominioId (GET, HEAD, PATCH, DELETE)',
+      '│       ├── /limite-diario-convites (PATCH)',
       '│       └── /moradores (GET, HEAD)',
       '│           └── /:id|:moradorId (GET, HEAD, PATCH, DELETE)',
+      '│               ├── /limite-diario-convites (PATCH)',
       '│               ├── /convidados (POST, GET, HEAD)',
       '│               │   ├── /recentes (GET, HEAD)',
       '│               │   └── /:id|:convidadoId (GET, HEAD, PATCH, DELETE)',
@@ -509,7 +529,7 @@ test('route inventory keeps every business route in the RBAC matrix', async () =
       ''
     ].join('\n')
   );
-  assert.equal(endpoints.length, 18);
+  assert.equal(endpoints.length, 20);
 
   await app.close();
 });

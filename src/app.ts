@@ -14,6 +14,7 @@ type CondominioRecord = {
   nome: string;
   responsavel: string;
   tipo: string;
+  dailyInvitationLimit?: number | null;
 };
 
 type CondominioCreateData = {
@@ -23,6 +24,7 @@ type CondominioCreateData = {
 };
 
 type CondominioUpdateData = Partial<CondominioCreateData> & {
+  dailyInvitationLimit?: number | null;
   deletedAt?: Date;
 };
 
@@ -36,6 +38,7 @@ type MoradorRecord = {
   enderecoNumero: string | null;
   enderecoBloco: string | null;
   enderecoApartamento: string | null;
+  dailyInvitationLimit?: number | null;
 };
 
 type MoradorEnderecoData = {
@@ -52,6 +55,7 @@ type MoradorCreateData = MoradorEnderecoData & {
 
 type MoradorUpdateData = Partial<Pick<MoradorCreateData, 'nome'>> &
   Partial<MoradorEnderecoData> & {
+    dailyInvitationLimit?: number | null;
     deletedAt?: Date;
   };
 
@@ -282,6 +286,19 @@ function parseMoradorUpdateBody(body: unknown) {
   return Object.keys(data).length > 0 ? data : null;
 }
 
+function parseDailyInvitationLimit(body: unknown) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    return undefined;
+  }
+  const value = (body as Record<string, unknown>).dailyInvitationLimit;
+  if (value === null) {
+    return null;
+  }
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 && value <= 100_000
+    ? value
+    : undefined;
+}
+
 function toCondominioResponse(condominio: CondominioRecord) {
   return {
     id: condominio.id,
@@ -389,6 +406,11 @@ export function createApp(
       parseUuidParam(request.params, 'condominioId')
     )
   };
+  const invitationLimitManagement = {
+    preHandler: authorize(authenticator, 'convites:limits:manage', (request) =>
+      parseUuidParam(request.params, 'condominioId') ?? parseUuidParam(request.params, 'id')
+    )
+  };
 
   app.get('/health', async () => ({ status: 'ok' }));
 
@@ -473,6 +495,19 @@ export function createApp(
     }
 
     return reply.status(204).send();
+  });
+
+  app.patch('/condominios/:id/limite-diario-convites', invitationLimitManagement, async (request, reply) => {
+    const id = parseId(request.params);
+    const dailyInvitationLimit = parseDailyInvitationLimit(request.body);
+    if (!id || dailyInvitationLimit === undefined) {
+      return reply.status(400).send({ error: 'Invalid daily invitation limit' });
+    }
+    const result = await db.condominio.updateMany({ where: { id, deletedAt: null }, data: { dailyInvitationLimit } });
+    if (result.count === 0) {
+      return reply.status(404).send({ error: 'Condominium not found' });
+    }
+    return { dailyInvitationLimit };
   });
 
   app.post('/moradores', createMoradorManagement, async (request, reply) => {
@@ -589,6 +624,23 @@ export function createApp(
     }
 
     return reply.status(204).send();
+  });
+
+  app.patch('/condominios/:condominioId/moradores/:id/limite-diario-convites', invitationLimitManagement, async (request, reply) => {
+    const condominioId = parseUuidParam(request.params, 'condominioId');
+    const id = parseId(request.params);
+    const dailyInvitationLimit = parseDailyInvitationLimit(request.body);
+    if (!condominioId || !id || dailyInvitationLimit === undefined) {
+      return reply.status(400).send({ error: 'Invalid daily invitation limit' });
+    }
+    const result = await db.morador.updateMany({
+      where: { id, condominioId, deletedAt: null, condominio: activeCondominio },
+      data: { dailyInvitationLimit }
+    });
+    if (result.count === 0) {
+      return reply.status(404).send({ error: 'Resident not found' });
+    }
+    return { dailyInvitationLimit };
   });
 
   registerConvidadoRoutes(app, db, authenticator);

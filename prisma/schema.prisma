@@ -14,6 +14,7 @@ model Condominio {
   nome        String
   responsavel String
   tipo        String
+  dailyInvitationLimit Int?
   moradores   Morador[]
   convidados  Convidado[]
   convites    Convite[]
@@ -28,6 +29,7 @@ model Morador {
   enderecoNumero      String?
   enderecoBloco       String?
   enderecoApartamento String?
+  dailyInvitationLimit Int?
   condominioId        String
   condominio          Condominio  @relation(fields: [condominioId], references: [id], onDelete: Restrict)
   convites            Convite[] @relation("ConviteMorador")
@@ -72,6 +74,7 @@ model Convite {
 
   @@index([condominioId])
   @@index([moradorId])
+  @@index([condominioId, moradorId, createdAt])
   @@index([convidadoId])
   @@index([condominioId, expiresAt])
 }
