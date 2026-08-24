@@ -8,7 +8,6 @@ import { createApp } from '../src/app.js';
 import { createDevelopmentHeaderAuthenticator } from '../src/auth.js';
 import {
   DailyInvitationLimitError,
-  consumeInvitationToken,
   createInvitation,
   createInvitations,
   createPrismaInvitationStore
@@ -63,6 +62,12 @@ test('PostgreSQL invitation creation is secure, atomic, scoped, and one-use', { 
       'x-development-user-role': 'morador',
       'x-development-condominio-id': condominioId
     };
+    const validate = (token: string) => store.validateActive({
+      token,
+      condominiumId: condominioId,
+      deviceId: `database-test-${randomUUID()}`,
+      accessType: 'pedestre'
+    }, new Date());
     const singleResponse = await app.inject({
       method: 'POST',
       url: `/condominios/${condominioId}/moradores/${moradorId}/convidados/${guestIds[0]}/convites`,
@@ -147,8 +152,8 @@ test('PostgreSQL invitation creation is secure, atomic, scoped, and one-use', { 
     );
     assert.deepEqual(retried?.map((result) => result.token), ['333333', '444444']);
 
-    assert.equal(await consumeInvitationToken(store, single.token), true);
-    assert.equal(await consumeInvitationToken(store, single.token), false);
+    assert.equal((await validate(single.token)).allowed, true);
+    assert.equal((await validate(single.token)).allowed, false);
     const consumed = await prisma.convite.findUniqueOrThrow({ where: { id: single.id } });
     assert.equal(consumed.tokenDigest, null);
     assert.ok(consumed.usedAt);
@@ -168,7 +173,7 @@ test('PostgreSQL invitation creation is secure, atomic, scoped, and one-use', { 
       204,
       'repeating a successful revocation is idempotent'
     );
-    assert.equal(await consumeInvitationToken(store, batch.convites[0]!.token), false, 'revocation denies consumption immediately');
+    assert.equal((await validate(batch.convites[0]!.token)).allowed, false, 'revocation denies consumption immediately');
     const revokedRecord = await prisma.convite.findUniqueOrThrow({ where: { id: batch.convites[0]!.id } });
     assert.equal(revokedRecord.tokenDigest, null);
     assert.equal(revokedRecord.usedAt, null);
@@ -179,11 +184,11 @@ test('PostgreSQL invitation creation is secure, atomic, scoped, and one-use', { 
       { condominioId, moradorId, convidadoId: guestIds[6]!, tipo: 'visitante', expiresAt }
     );
     assert.ok(race);
-    const [raceConsumed, raceRevoked] = await Promise.all([
-      consumeInvitationToken(store, race.token),
+    const [raceValidation, raceRevoked] = await Promise.all([
+      validate(race.token),
       store.revokeActive({ id: race.convite.id, condominioId, moradorId }, new Date())
     ]);
-    assert.equal(Number(raceConsumed) + Number(raceRevoked === 'revoked'), 1, 'consume and revoke cannot both win');
+    assert.equal(Number(raceValidation.allowed) + Number(raceRevoked === 'revoked'), 1, 'consume and revoke cannot both win');
     const racedRecord = await prisma.convite.findUniqueOrThrow({ where: { id: race.convite.id } });
     assert.equal(Boolean(racedRecord.usedAt) && Boolean(racedRecord.revokedAt), false);
 
@@ -221,7 +226,7 @@ test('PostgreSQL invitation creation is secure, atomic, scoped, and one-use', { 
     await prisma.condominio.update({ where: { id: condominioId }, data: { deletedAt: null } });
 
     await prisma.convidado.update({ where: { id: guestIds[1] }, data: { deletedAt: new Date() } });
-    assert.equal(await consumeInvitationToken(store, batch.convites[0]!.token), false);
+    assert.equal((await validate(batch.convites[0]!.token)).allowed, false);
     await app.close();
   } finally {
     await prisma.$disconnect();
@@ -318,6 +323,18 @@ test('PostgreSQL gatehouse validation is tenant-scoped, one-use, and fail-closed
     assert.equal(persistedValid.tokenDigest, null);
     assert.ok((await prisma.convidado.findUniqueOrThrow({ where: { id: guestIds[0]! } })).ultimoUsoEm);
     assert.equal(await prisma.notificacao.count({ where: { conviteId: valid.convite.id, deletedAt: null } }), 1);
+    await assert.rejects(
+      prisma.$executeRaw`
+        INSERT INTO "Notificacao" (
+          id, tipo, mensagem, "nomeConvidado", "entrouEm",
+          "condominioId", "moradorId", "convidadoId", "conviteId"
+        ) VALUES (
+          ${randomUUID()}, 'entrada_visitante', 'invalid tenant relation', 'Guest 0', clock_timestamp(),
+          ${condominioId}, ${otherMoradorId}, ${guestIds[7]!}, ${wrongTenant.convite.id}
+        )
+      `,
+      /foreign key constraint/i
+    );
     const residentNotifications = await app.inject({
       method: 'GET',
       url: `/condominios/${condominioId}/moradores/${moradorId}/notificacoes?unread=true`,
@@ -328,6 +345,8 @@ test('PostgreSQL gatehouse validation is tenant-scoped, one-use, and fail-closed
       }
     });
     assert.equal(residentNotifications.statusCode, 200);
+    assert.equal(residentNotifications.headers['cache-control'], 'no-store');
+    assert.equal(residentNotifications.headers.pragma, 'no-cache');
     assert.equal(residentNotifications.json().length, 1);
     const notificationId = residentNotifications.json()[0].id as string;
     assert.equal((await app.inject({
@@ -365,6 +384,26 @@ test('PostgreSQL gatehouse validation is tenant-scoped, one-use, and fail-closed
     assert.deepEqual((await validate(deletedGuest.token)).json(), denied);
 
     await prisma.morador.update({ where: { id: moradorId }, data: { deletedAt: new Date() } });
+    const inactiveResidentNotifications = await app.inject({
+      method: 'GET',
+      url: `/condominios/${condominioId}/moradores/${moradorId}/notificacoes`,
+      headers: {
+        'x-development-user-id': moradorId,
+        'x-development-user-role': 'morador',
+        'x-development-condominio-id': condominioId
+      }
+    });
+    assert.equal(inactiveResidentNotifications.statusCode, 200);
+    assert.deepEqual(inactiveResidentNotifications.json(), []);
+    assert.equal((await app.inject({
+      method: 'PATCH',
+      url: `/condominios/${condominioId}/moradores/${moradorId}/notificacoes/${notificationId}`,
+      headers: {
+        'x-development-user-id': moradorId,
+        'x-development-user-role': 'morador',
+        'x-development-condominio-id': condominioId
+      }
+    })).statusCode, 404);
     assert.deepEqual((await validate(deletedResident.token)).json(), denied);
     assert.equal(await prisma.notificacao.count({ where: { conviteId: deletedResident.convite.id } }), 0);
     await prisma.morador.update({ where: { id: moradorId }, data: { deletedAt: null } });
@@ -577,7 +616,12 @@ test('PostgreSQL daily limits use resident precedence, UTC days, and serialized 
     await prisma.convite.deleteMany();
     const used = await createInvitation(store, invitation(guestIds[0]!));
     assert.ok(used);
-    assert.equal(await consumeInvitationToken(store, used.token), true);
+    assert.equal((await store.validateActive({
+      token: used.token,
+      condominiumId: condominioId,
+      deviceId: `daily-limit-test-${randomUUID()}`,
+      accessType: 'pedestre'
+    }, new Date())).allowed, true);
     await assert.rejects(createInvitation(store, invitation(guestIds[1]!)), DailyInvitationLimitError);
     await prisma.convite.update({ where: { id: used.convite.id }, data: { deletedAt: new Date() } });
     const revocable = await createInvitation(store, invitation(guestIds[1]!));

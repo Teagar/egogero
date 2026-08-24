@@ -10,6 +10,7 @@ const CONDOMINIO_ID = '00000000-0000-4000-8000-000000000001';
 const OTHER_CONDOMINIO_ID = '00000000-0000-4000-8000-000000000002';
 const MORADOR_ID = '00000000-0000-4000-8000-000000000101';
 const CONVIDADO_ID = '00000000-0000-4000-8000-000000000201';
+const NOTIFICATION_ID = '00000000-0000-4000-8000-000000000401';
 const createdAt = new Date('2026-01-01T00:00:00.000Z');
 const authenticator = createDevelopmentHeaderAuthenticator(true);
 
@@ -132,9 +133,6 @@ function createAuthorizationStore(): AppDependencies {
       async createBatchActive(data) {
         return data.map((item, index) => ({ ...convite, ...item, id: `convite-${index}` }));
       },
-      async consumeActive() {
-        return true;
-      },
       async validateActive(_args, now) {
         return {
           allowed: true,
@@ -155,6 +153,14 @@ function createAuthorizationStore(): AppDependencies {
       },
       async revokeActive() {
         return 'revoked' as const;
+      }
+    },
+    notificacao: {
+      async list() {
+        return [];
+      },
+      async markRead() {
+        return 'read' as const;
       }
     }
   };
@@ -341,6 +347,18 @@ const endpoints: Endpoint[] = [
     successStatus: 200
   },
   {
+    name: 'list own notifications',
+    request: { method: 'GET', url: `/condominios/${CONDOMINIO_ID}/moradores/${MORADOR_ID}/notificacoes` },
+    roles: ['morador'],
+    successStatus: 200
+  },
+  {
+    name: 'mark own notification read',
+    request: { method: 'PATCH', url: `/condominios/${CONDOMINIO_ID}/moradores/${MORADOR_ID}/notificacoes/${NOTIFICATION_ID}` },
+    roles: ['morador'],
+    successStatus: 200
+  },
+  {
     name: 'validate invitation at gatehouse',
     request: { method: 'POST', url: '/portaria/convites/validar', payload: { token: '123456', tipoAcesso: 'pedestre' } },
     roles: ['portaria'],
@@ -497,10 +515,6 @@ test('tenant matrix prevents a sindico from reaching another condominium before 
             storeCalls += 1;
             return store.convite!.createBatchActive(args);
           },
-          consumeActive: async (token, now) => {
-            storeCalls += 1;
-            return store.convite!.consumeActive(token, now);
-          },
           validateActive: async (args, now) => {
             storeCalls += 1;
             return store.convite!.validateActive(args, now);
@@ -544,7 +558,7 @@ test('resident guest ownership is enforced before any store access', async () =>
     condominio: { create: inaccessible, findMany: inaccessible, findFirst: inaccessible, updateMany: inaccessible },
     morador: { create: inaccessible, findMany: inaccessible, findFirst: inaccessible, updateMany: inaccessible },
     convidado: { create: inaccessible, findMany: inaccessible, findFirst: inaccessible, updateMany: inaccessible },
-    convite: { createActive: inaccessible, createBatchActive: inaccessible, consumeActive: inaccessible, validateActive: inaccessible, listOwnedAudits: inaccessible, revokeActive: inaccessible }
+    convite: { createActive: inaccessible, createBatchActive: inaccessible, validateActive: inaccessible, listOwnedAudits: inaccessible, revokeActive: inaccessible }
   };
 
   for (const endpoint of endpoints.slice(10)) {
@@ -589,7 +603,7 @@ test('route inventory keeps every business route in the RBAC matrix', async () =
       ''
     ].join('\n')
   );
-  assert.equal(endpoints.length, 23);
+  assert.equal(endpoints.length, 25);
 
   await app.close();
 });

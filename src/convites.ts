@@ -16,6 +16,7 @@ const TOKEN_PATTERN = /^[0-9]{6}$/;
 const TOKEN_LIMIT = 1_000_000;
 const MAX_TOKEN_ATTEMPTS = 32;
 const BATCH_EXPIRATION_MS = 24 * 60 * 60 * 1000;
+const MAX_BATCH_SIZE = 100;
 
 export type InvitationMessage = { subject: string; body: string };
 export interface EmailSender { send(to: string, message: InvitationMessage): Promise<void>; }
@@ -111,7 +112,6 @@ export type AccessAuditRecord = {
 export interface InvitationStore {
   createActive(args: InvitationAllocation): Promise<InvitationRecord | null>;
   createBatchActive(args: readonly InvitationAllocation[]): Promise<readonly InvitationRecord[] | null>;
-  consumeActive(token: string, now: Date): Promise<boolean>;
   validateActive(args: {
     token: string | null;
     condominiumId: string;
@@ -200,14 +200,6 @@ export async function createInvitation(
 ) {
   const results = await createInvitations(store, [data], options);
   return results?.[0] ?? null;
-}
-
-export function consumeInvitationToken(store: InvitationStore, token: string, now = new Date()) {
-  if (!TOKEN_PATTERN.test(token)) {
-    return Promise.resolve(false);
-  }
-
-  return store.consumeActive(token, now);
 }
 
 export function invitationStatus(invitation: Pick<InvitationRecord, 'usedAt' | 'revokedAt' | 'expiresAt'>, now = new Date()) {
@@ -500,50 +492,6 @@ export function createPrismaInvitationStore(client: PrismaClient, tokenSecret: s
 
     createBatchActive: inTransaction,
 
-    async consumeActive(token) {
-      const tokenDigest = digestToken(token);
-      return client.$transaction(async (transaction) => {
-        await verifyTokenSecret(transaction);
-        const activeInvitations = await transaction.$queryRaw<Array<{ id: string }>>`
-          SELECT convite.id
-          FROM "Convite" AS convite
-          JOIN "Convidado" AS convidado
-            ON convidado.id = convite."convidadoId"
-           AND convidado."condominioId" = convite."condominioId"
-          JOIN "Morador" AS morador
-            ON morador.id = convite."moradorId"
-           AND morador."condominioId" = convite."condominioId"
-          JOIN "Condominio" AS condominio ON condominio.id = convite."condominioId"
-          WHERE convite."tokenDigest" = ${tokenDigest}
-            AND convite."deletedAt" IS NULL
-            AND convite."usedAt" IS NULL
-            AND convite."revokedAt" IS NULL
-            AND convite."expiresAt" > clock_timestamp()
-            AND convidado."deletedAt" IS NULL
-            AND morador."deletedAt" IS NULL
-            AND condominio."deletedAt" IS NULL
-          FOR UPDATE OF convite, convidado, morador, condominio
-        `;
-
-        const id = activeInvitations[0]?.id;
-        if (!id) {
-          return false;
-        }
-
-        const consumed = await transaction.$executeRaw`
-          UPDATE "Convite"
-          SET "tokenDigest" = NULL, "usedAt" = clock_timestamp()
-          WHERE id = ${id}
-            AND "tokenDigest" = ${tokenDigest}
-            AND "deletedAt" IS NULL
-            AND "usedAt" IS NULL
-            AND "revokedAt" IS NULL
-            AND "expiresAt" > clock_timestamp()
-        `;
-        return consumed === 1;
-      });
-    },
-
     validateActive(args) {
       return validateActive(args);
     },
@@ -681,7 +629,10 @@ function parseGuestIds(body: unknown) {
   }
 
   const convidadoIds = (body as Record<string, unknown>).convidadoIds;
-  if (!Array.isArray(convidadoIds) || convidadoIds.length === 0 || !convidadoIds.every(isUuid)) {
+  if (!Array.isArray(convidadoIds)
+    || convidadoIds.length === 0
+    || convidadoIds.length > MAX_BATCH_SIZE
+    || !convidadoIds.every(isUuid)) {
     return null;
   }
 
@@ -795,6 +746,9 @@ export function registerConviteRoutes(
       ? identity.condominioIds[0]
       : null;
     if (!condominiumId || !identity) {
+      return reply.status(403).send({ error: 'Forbidden' });
+    }
+    if (identity.id.length === 0 || identity.id.length > 128) {
       return reply.status(403).send({ error: 'Forbidden' });
     }
 

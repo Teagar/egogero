@@ -17,6 +17,7 @@ test('access audit schema stores only identifiers and rejects every mutation in 
   assert.match(migration, /CREATE TYPE "ResultadoAcesso" AS ENUM \('permitido', 'negado'\)/);
   assert.match(migration, /BEFORE UPDATE OR DELETE ON "AuditoriaAcesso"/);
   assert.match(migration, /BEFORE TRUNCATE ON "AuditoriaAcesso"/);
+  assert.match(migration, /length\("dispositivoId"\) BETWEEN 1 AND 128/);
   assert.match(migration, /RAISE EXCEPTION 'access audit rows are immutable'/);
   assert.doesNotMatch(migration, /token|digest|nome|email|telefone/i);
   assert.match(migration, /COMMIT;\s*$/);

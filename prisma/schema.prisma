@@ -84,6 +84,7 @@ model Convite {
   @@index([condominioId, moradorId, createdAt])
   @@index([convidadoId])
   @@index([condominioId, expiresAt])
+  @@unique([id, condominioId, moradorId, convidadoId])
 }
 
 model AuditoriaAcesso {
@@ -136,9 +137,10 @@ model Notificacao {
   convidadoId   String
   conviteId     String    @unique
   condominio    Condominio @relation(fields: [condominioId], references: [id], onDelete: Restrict)
-  morador       Morador   @relation(fields: [moradorId], references: [id], onDelete: Restrict)
-  convidado     Convidado @relation(fields: [convidadoId], references: [id], onDelete: Restrict)
-  convite       Convite   @relation(fields: [conviteId], references: [id], onDelete: Cascade)
+  morador       Morador   @relation(fields: [moradorId, condominioId], references: [id, condominioId], onDelete: Restrict)
+  convidado     Convidado @relation(fields: [convidadoId, condominioId], references: [id, condominioId], onDelete: Restrict)
+  convite       Convite   @relation(fields: [conviteId, condominioId, moradorId, convidadoId], references: [id, condominioId, moradorId, convidadoId], onDelete: Cascade)
 
   @@index([condominioId, moradorId, deletedAt, createdAt])
+  @@unique([conviteId, condominioId, moradorId, convidadoId])
 }

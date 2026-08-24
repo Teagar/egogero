@@ -13,7 +13,8 @@ The link has this form:
 `https://public.example/portaria/convites/validar#token=123456`
 
 The scanner/client MUST read the fragment locally, remove it from any network
-request, and POST `{ "token": "123456" }` to
+request, obtain the access type from the gatehouse workflow, and POST
+`{ "token": "123456", "tipoAcesso": "pedestre" }` (or `veiculo`) to
 `/portaria/convites/validar` using the existing portaria authentication. A GET
 to the link is not a validation operation and must not be implemented as one.
 The fragment prevents bearer-token disclosure through HTTP request and access

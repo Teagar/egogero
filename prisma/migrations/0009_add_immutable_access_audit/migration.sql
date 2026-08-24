@@ -16,7 +16,7 @@ CREATE TABLE "AuditoriaAcesso" (
   "tipoAcesso" "TipoAcesso" NOT NULL,
   "resultado" "ResultadoAcesso" NOT NULL,
   CONSTRAINT "AuditoriaAcesso_pkey" PRIMARY KEY ("id"),
-  CONSTRAINT "AuditoriaAcesso_dispositivoId_check" CHECK (length("dispositivoId") > 0)
+  CONSTRAINT "AuditoriaAcesso_dispositivoId_check" CHECK (length("dispositivoId") BETWEEN 1 AND 128)
 );
 
 CREATE INDEX "AuditoriaAcesso_condominioId_moradorId_createdAt_idx"

@@ -8,7 +8,6 @@ import type { AppDependencies, AppStore } from '../src/app.js';
 import { createDevelopmentHeaderAuthenticator } from '../src/auth.js';
 import {
   ActiveTokenCollisionError,
-  consumeInvitationToken,
   createInvitation,
   createInvitations,
   generateSixDigitToken,
@@ -86,9 +85,6 @@ function uniqueMemoryStore(initialTokens: string[] = []): InvitationStore & {
     async createActive(input: InvitationAllocation) {
       const records = await store.createBatchActive([input]);
       return records[0] ?? null;
-    },
-    async consumeActive(token: string) {
-      return activeTokens.delete(token);
     },
     async validateActive({ token, condominiumId, deviceId, accessType }: {
       token: string | null;
@@ -239,11 +235,17 @@ test('single and batch allocation retry collisions through the same algorithm', 
   assert.equal(batchStore.activeTokens.has('222222'), false, 'failed attempt must not partially persist');
 });
 
-test('atomic consumption rejects replay and malformed tokens without store access', async () => {
+test('gatehouse validation is the only atomic consumption path', async () => {
   const store = uniqueMemoryStore(['123456']);
-  assert.equal(await consumeInvitationToken(store, '123456', NOW), true);
-  assert.equal(await consumeInvitationToken(store, '123456', NOW), false);
-  assert.equal(await consumeInvitationToken(store, 'not-a-token', NOW), false);
+  const args = {
+    token: '123456',
+    condominiumId: CONDOMINIO_ID,
+    deviceId: 'gatehouse-device',
+    accessType: 'pedestre' as const
+  };
+  assert.equal((await store.validateActive(args, NOW)).allowed, true);
+  assert.equal((await store.validateActive(args, NOW)).allowed, false);
+  assert.equal((await store.validateActive({ ...args, token: null }, NOW)).allowed, false);
 });
 
 test('invitation lifecycle derives active and expired from time while used and revoked are terminal', () => {
@@ -260,7 +262,6 @@ test('revocation route is scoped, idempotent for revoked invitations, and fails 
   const store: InvitationStore = {
     async createActive() { throw new Error('Unexpected create'); },
     async createBatchActive() { throw new Error('Unexpected create'); },
-    async consumeActive() { throw new Error('Unexpected consume'); },
     async validateActive() { throw new Error('Unexpected validate'); },
     async listOwnedAudits() { throw new Error('Unexpected audit query'); },
     async revokeActive(args) {
@@ -348,6 +349,21 @@ test('link and QR output are opt-in, fragment-only, and fail closed without conf
   await app.close();
 });
 
+test('batch invitation input is bounded before database access', async () => {
+  const store = uniqueMemoryStore();
+  const app = Fastify({ logger: false });
+  registerConviteRoutes(app, batchStore(), store, authenticator);
+  const response = await app.inject({
+    method: 'POST',
+    url: `/condominios/${CONDOMINIO_ID}/moradores/${MORADOR_ID}/convites/multiplos`,
+    headers: residentHeaders,
+    payload: { convidadoIds: Array.from({ length: 101 }, (_, index) => uuid(1_000 + index)) }
+  });
+  assert.equal(response.statusCode, 400);
+  assert.equal(store.batchCalls, 0);
+  await app.close();
+});
+
 test('gatehouse validation is portaria-only, tenant-scoped, non-oracular, and minimal', async () => {
   const token = '123456';
   const store = uniqueMemoryStore([token]);
@@ -420,6 +436,13 @@ test('gatehouse validation is portaria-only, tenant-scoped, non-oracular, and mi
     payload: { token: '654321' }
   });
   assert.equal(invalidAccessType.statusCode, 400);
+  const oversizedDevice = await app.inject({
+    method: 'POST',
+    url: '/portaria/convites/validar',
+    headers: { ...portariaHeaders, 'x-development-user-id': 'x'.repeat(129) },
+    payload: { token: '654321', tipoAcesso: 'pedestre' }
+  });
+  assert.equal(oversizedDevice.statusCode, 403);
   assert.equal(store.audits.length, 6, 'contract and RBAC rejections are not validation attempts');
   await app.close();
 });

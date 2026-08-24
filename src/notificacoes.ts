@@ -1,5 +1,5 @@
 import type { Prisma, PrismaClient } from '@prisma/client';
-import type { FastifyInstance } from 'fastify';
+import type { FastifyInstance, FastifyReply } from 'fastify';
 
 import { authorize, isUuid } from './auth.js';
 import type { Authenticator } from './auth.js';
@@ -48,14 +48,31 @@ export function createPrismaNotificationStore(client: PrismaClient): Notificatio
   return {
     async list({ condominiumId, residentId, unreadOnly, limit }) {
       const rows = await client.notificacao.findMany({
-        where: { condominioId: condominiumId, moradorId: residentId, deletedAt: null, ...(unreadOnly ? { lidaEm: null } : {}) },
+        where: {
+          condominioId: condominiumId,
+          moradorId: residentId,
+          deletedAt: null,
+          condominio: { deletedAt: null },
+          morador: { deletedAt: null },
+          ...(unreadOnly ? { lidaEm: null } : {})
+        },
         orderBy: { createdAt: 'desc' },
         take: limit
       });
       return rows.map((row) => ({ id: row.id, createdAt: row.createdAt, readAt: row.lidaEm, message: row.mensagem, guestName: row.nomeConvidado, enteredAt: row.entrouEm, invitationId: row.conviteId, guestId: row.convidadoId }));
     },
     async markRead({ id, condominiumId, residentId, now }) {
-      const result = await client.notificacao.updateMany({ where: { id, condominioId: condominiumId, moradorId: residentId, deletedAt: null }, data: { lidaEm: now } });
+      const result = await client.notificacao.updateMany({
+        where: {
+          id,
+          condominioId: condominiumId,
+          moradorId: residentId,
+          deletedAt: null,
+          condominio: { deletedAt: null },
+          morador: { deletedAt: null }
+        },
+        data: { lidaEm: now }
+      });
       return result.count === 1 ? 'read' : 'unavailable';
     }
   };
@@ -70,7 +87,11 @@ function uuidParam(params: unknown, name: string) {
 export function registerNotificationRoutes(app: FastifyInstance, store: NotificationStore | undefined, authenticator: Authenticator) {
   const path = '/condominios/:condominioId/moradores/:moradorId/notificacoes';
   const scope = authorize(authenticator, 'notificacoes:read', (request) => uuidParam(request.params, 'condominioId'), (request) => uuidParam(request.params, 'moradorId'));
-  app.get(path, { preHandler: scope }, async (request, reply) => {
+  const noStore = async (_request: unknown, reply: FastifyReply) => {
+    reply.header('cache-control', 'no-store');
+    reply.header('pragma', 'no-cache');
+  };
+  app.get(path, { onRequest: noStore, preHandler: scope }, async (request, reply) => {
     const condominiumId = uuidParam(request.params, 'condominioId');
     const residentId = uuidParam(request.params, 'moradorId');
     if (!condominiumId || !residentId) return reply.status(400).send({ error: 'Invalid notification scope' });
@@ -79,7 +100,7 @@ export function registerNotificationRoutes(app: FastifyInstance, store: Notifica
     const rows = await store.list({ condominiumId, residentId, unreadOnly, limit: 100 });
     return rows.map((row) => ({ id: row.id, createdAt: row.createdAt.toISOString(), readAt: row.readAt?.toISOString() ?? null, message: row.message, guestName: row.guestName, enteredAt: row.enteredAt.toISOString(), invitationId: row.invitationId, guestId: row.guestId }));
   });
-  app.patch(`${path}/:notificationId`, { preHandler: scope }, async (request, reply) => {
+  app.patch(`${path}/:notificationId`, { onRequest: noStore, preHandler: scope }, async (request, reply) => {
     const condominiumId = uuidParam(request.params, 'condominioId');
     const residentId = uuidParam(request.params, 'moradorId');
     const notificationId = uuidParam(request.params, 'notificationId');
