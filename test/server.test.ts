@@ -6,6 +6,8 @@ import test from 'node:test';
 
 import { getEnv } from '../src/env.js';
 
+const INVITATION_TOKEN_SECRET = 'test-invitation-token-secret-at-least-32-bytes';
+
 async function reservePort() {
   const server = createServer();
   server.listen(0, '127.0.0.1');
@@ -27,6 +29,7 @@ async function startRuntime(nodeEnvironment: string, localDevelopmentAuth: boole
     env: {
       ...process.env,
       DATABASE_URL: 'postgresql://unused:unused@127.0.0.1:1/unused',
+      INVITATION_TOKEN_SECRET,
       HOST: '127.0.0.1',
       LOCAL_DEVELOPMENT_AUTH: localDevelopmentAuth ? 'true' : '',
       NODE_ENV: nodeEnvironment,
@@ -121,10 +124,18 @@ test('explicit local development mode starts with scoped header authentication',
 test('local development authentication binds to loopback by default', () => {
   const env = getEnv({
     DATABASE_URL: 'postgresql://unused:unused@127.0.0.1:1/unused',
+    INVITATION_TOKEN_SECRET,
     LOCAL_DEVELOPMENT_AUTH: 'true'
   });
 
   assert.equal(env.host, '127.0.0.1');
+});
+
+test('startup rejects a missing or weak invitation token secret', () => {
+  assert.throws(
+    () => getEnv({ DATABASE_URL: 'postgresql://unused', INVITATION_TOKEN_SECRET: 'too-short' }),
+    /at least 32 bytes/
+  );
 });
 
 test('bootstrap configuration failures exit cleanly through the startup handler', async () => {

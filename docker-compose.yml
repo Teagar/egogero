@@ -24,6 +24,7 @@ services:
       HOST: 0.0.0.0
       PORT: 3000
       DATABASE_URL: postgresql://office:office@db:5432/office?schema=public
+      INVITATION_TOKEN_SECRET: local-development-invitation-secret-change-me
     ports:
       - "127.0.0.1:3001:3000"
     depends_on:

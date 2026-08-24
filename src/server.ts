@@ -9,7 +9,7 @@ export async function startServer(environment: NodeJS.ProcessEnv = process.env) 
   const authenticator = env.localDevelopmentAuth
     ? createDevelopmentHeaderAuthenticator(true)
     : unauthenticatedAuthenticator;
-  const app = createApp({ authenticator });
+  const app = createApp({ authenticator, invitationTokenSecret: env.invitationTokenSecret });
 
   await app.listen({ host: env.host, port: env.port });
   return app;

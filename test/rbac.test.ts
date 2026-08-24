@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { createApp } from '../src/app.js';
-import type { AppStore } from '../src/app.js';
+import type { AppDependencies } from '../src/app.js';
 import { ROLES, createDevelopmentHeaderAuthenticator } from '../src/auth.js';
 import type { Role } from '../src/auth.js';
 
@@ -51,8 +51,20 @@ const otherConvidado = {
   condominioId: OTHER_CONDOMINIO_ID,
   moradorId: otherMorador.id
 };
+const convite = {
+  id: '00000000-0000-4000-8000-000000000301',
+  createdAt,
+  deletedAt: null,
+  condominioId: CONDOMINIO_ID,
+  moradorId: MORADOR_ID,
+  convidadoId: CONVIDADO_ID,
+  tipo: 'visitante' as const,
+  expiresAt: new Date('2099-01-01T00:00:00.000Z'),
+  usedAt: null,
+  tokenDigest: null
+};
 
-function createAuthorizationStore(): AppStore {
+function createAuthorizationStore(): AppDependencies {
   return {
     condominio: {
       async create({ data }) {
@@ -110,6 +122,14 @@ function createAuthorizationStore(): AppStore {
           (row) => row.id === where.id && row.condominioId === where.condominioId && row.moradorId === where.moradorId
         );
         return { count: found ? 1 : 0 };
+      }
+    },
+    convite: {
+      async createActive(data) {
+        return { ...convite, ...data };
+      },
+      async consumeActive() {
+        return true;
       }
     }
   };
@@ -243,6 +263,16 @@ const endpoints: Endpoint[] = [
     },
     roles: ['provedor', 'sindico', 'morador'],
     successStatus: 204
+  },
+  {
+    name: 'create invitation',
+    request: {
+      method: 'POST',
+      url: `/condominios/${CONDOMINIO_ID}/moradores/${MORADOR_ID}/convidados/${CONVIDADO_ID}/convites`,
+      payload: { tipo: 'visitante', expiresAt: '2099-01-01T00:00:00.000Z' }
+    },
+    roles: ['provedor', 'sindico', 'morador'],
+    successStatus: 201
   }
 ];
 
@@ -321,7 +351,7 @@ test('tenant matrix prevents a sindico from reaching another condominium before 
       let storeCalls = 0;
       let condominioStoreCalls = 0;
       const store = createAuthorizationStore();
-      const db: AppStore = {
+      const db: AppDependencies = {
         condominio: {
           create: async (args) => {
             storeCalls += 1;
@@ -379,6 +409,16 @@ test('tenant matrix prevents a sindico from reaching another condominium before 
             storeCalls += 1;
             return store.convidado.updateMany(args);
           }
+        },
+        convite: {
+          createActive: async (args) => {
+            storeCalls += 1;
+            return store.convite!.createActive(args);
+          },
+          consumeActive: async (token, now) => {
+            storeCalls += 1;
+            return store.convite!.consumeActive(token, now);
+          }
         }
       };
       const app = createApp({ db, authenticator });
@@ -404,10 +444,11 @@ test('resident guest ownership is enforced before any store access', async () =>
     storeCalls += 1;
     throw new Error('Authorization boundary reached the store');
   };
-  const db: AppStore = {
+  const db: AppDependencies = {
     condominio: { create: inaccessible, findMany: inaccessible, findFirst: inaccessible, updateMany: inaccessible },
     morador: { create: inaccessible, findMany: inaccessible, findFirst: inaccessible, updateMany: inaccessible },
-    convidado: { create: inaccessible, findMany: inaccessible, findFirst: inaccessible, updateMany: inaccessible }
+    convidado: { create: inaccessible, findMany: inaccessible, findFirst: inaccessible, updateMany: inaccessible },
+    convite: { createActive: inaccessible, consumeActive: inaccessible }
   };
 
   for (const endpoint of endpoints.slice(10)) {
@@ -438,12 +479,13 @@ test('route inventory keeps every business route in the RBAC matrix', async () =
       '│           └── /:id|:moradorId (GET, HEAD, PATCH, DELETE)',
       '│               └── /convidados (POST, GET, HEAD)',
       '│                   ├── /recentes (GET, HEAD)',
-      '│                   └── /:id (GET, HEAD, PATCH, DELETE)',
+      '│                   └── /:id|:convidadoId (GET, HEAD, PATCH, DELETE)',
+      '│                       └── /convites (POST)',
       '└── /moradores (POST)',
       ''
     ].join('\n')
   );
-  assert.equal(endpoints.length, 16);
+  assert.equal(endpoints.length, 17);
 
   await app.close();
 });
