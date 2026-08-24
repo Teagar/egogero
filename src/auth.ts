@@ -4,18 +4,30 @@ export const ROLES = ['provedor', 'sindico', 'morador', 'portaria'] as const;
 
 export type Role = (typeof ROLES)[number];
 
-export type Permission = 'condominios:manage' | 'moradores:manage' | 'convidados:manage' | 'convites:create' | 'convites:limits:manage';
+export type Permission =
+  | 'condominios:manage'
+  | 'moradores:manage'
+  | 'convidados:manage'
+  | 'convites:create'
+  | 'convites:limits:manage'
+  | 'convites:validate';
 
 export const ROLE_PERMISSIONS = {
   provedor: ['condominios:manage', 'moradores:manage', 'convidados:manage', 'convites:create', 'convites:limits:manage'],
   sindico: ['moradores:manage', 'convidados:manage', 'convites:create', 'convites:limits:manage'],
   morador: ['convidados:manage', 'convites:create'],
-  portaria: []
+  portaria: ['convites:validate']
 } as const satisfies Record<Role, readonly Permission[]>;
 
 export type AuthenticatedIdentity =
   | { id: string; role: 'provedor'; condominioIds: null }
   | { id: string; role: Exclude<Role, 'provedor'>; condominioIds: readonly string[] };
+
+declare module 'fastify' {
+  interface FastifyRequest {
+    authenticatedIdentity?: AuthenticatedIdentity;
+  }
+}
 
 export interface Authenticator {
   authenticate(request: FastifyRequest): Promise<AuthenticatedIdentity | null>;
@@ -104,5 +116,7 @@ export function authorize(
     if (moradorId && identity.role === 'morador' && identity.id !== moradorId) {
       return reply.status(403).send({ error: 'Forbidden' });
     }
+
+    request.authenticatedIdentity = identity;
   };
 }

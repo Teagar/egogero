@@ -74,11 +74,36 @@ export type InvitationCreateData = {
 
 export type InvitationAllocation = InvitationCreateData & { token: string; now: Date };
 
+export type InvitationValidationEvent = {
+  invitationId: string;
+  condominiumId: string;
+  residentId: string;
+  guestId: string;
+  invitationType: TipoConvite;
+  usedAt: Date;
+};
+
+export type InvitationValidationResult =
+  | { allowed: false; reason: 'invalid_or_unavailable' }
+  | {
+      allowed: true;
+      guest: { name: string };
+      invitation: { type: TipoConvite };
+      event: InvitationValidationEvent;
+    };
+
 export interface InvitationStore {
   createActive(args: InvitationAllocation): Promise<InvitationRecord | null>;
   createBatchActive(args: readonly InvitationAllocation[]): Promise<readonly InvitationRecord[] | null>;
   consumeActive(token: string, now: Date): Promise<boolean>;
+  validateActive(args: { token: string; condominiumId: string }, now: Date): Promise<InvitationValidationResult>;
   revokeActive(args: { id: string; condominioId: string; moradorId: string }, now: Date): Promise<'revoked' | 'already-revoked' | 'unavailable'>;
+}
+
+export class InvitationSecretMismatchError extends Error {
+  constructor() {
+    super('Invitation token secret does not match database configuration');
+  }
 }
 
 export class ActiveTokenCollisionError extends Error {
@@ -193,7 +218,7 @@ export function createPrismaInvitationStore(client: PrismaClient, tokenSecret: s
       SELECT fingerprint FROM "SecurityKey" WHERE name = 'invitation-token'
     `;
     if (configured[0]?.fingerprint.trim() !== secretFingerprint) {
-      throw new Error('Invitation token secret does not match database configuration');
+      throw new InvitationSecretMismatchError();
     }
   }
 
@@ -294,6 +319,93 @@ export function createPrismaInvitationStore(client: PrismaClient, tokenSecret: s
     }
   }
 
+  async function validateActive(token: string, condominiumId: string): Promise<InvitationValidationResult> {
+    const tokenDigest = digestToken(token);
+    return client.$transaction(async (transaction) => {
+      await verifyTokenSecret(transaction);
+      const activeInvitations = await transaction.$queryRaw<Array<{
+        id: string;
+        condominioId: string;
+        moradorId: string;
+        convidadoId: string;
+        tipo: TipoConvite;
+        guestName: string;
+      }>>`
+        SELECT convite.id,
+               convite."condominioId",
+               convite."moradorId",
+               convite."convidadoId",
+               convite.tipo,
+               convidado.nome AS "guestName"
+        FROM "Convite" AS convite
+        JOIN "Convidado" AS convidado
+          ON convidado.id = convite."convidadoId"
+         AND convidado."condominioId" = convite."condominioId"
+        JOIN "Morador" AS morador
+          ON morador.id = convite."moradorId"
+         AND morador."condominioId" = convite."condominioId"
+        JOIN "Condominio" AS condominio ON condominio.id = convite."condominioId"
+        WHERE convite."tokenDigest" = ${tokenDigest}
+          AND convite."condominioId" = ${condominiumId}
+          AND convite."deletedAt" IS NULL
+          AND convite."usedAt" IS NULL
+          AND convite."revokedAt" IS NULL
+          AND convite."expiresAt" > clock_timestamp()
+          AND convidado."deletedAt" IS NULL
+          AND morador."deletedAt" IS NULL
+          AND condominio."deletedAt" IS NULL
+        FOR UPDATE OF convite, convidado, morador, condominio
+      `;
+
+      const invitation = activeInvitations[0];
+      if (!invitation) {
+        return { allowed: false, reason: 'invalid_or_unavailable' };
+      }
+
+      const consumed = await transaction.$queryRaw<Array<{ usedAt: Date }>>`
+        UPDATE "Convite"
+        SET "tokenDigest" = NULL, "usedAt" = clock_timestamp()
+        WHERE id = ${invitation.id}
+          AND "tokenDigest" = ${tokenDigest}
+          AND "condominioId" = ${condominiumId}
+          AND "deletedAt" IS NULL
+          AND "usedAt" IS NULL
+          AND "revokedAt" IS NULL
+          AND "expiresAt" > clock_timestamp()
+        RETURNING "usedAt"
+      `;
+      const usedAt = consumed[0]?.usedAt;
+      if (!usedAt) {
+        return { allowed: false, reason: 'invalid_or_unavailable' };
+      }
+
+      const guestUpdated = await transaction.$executeRaw`
+        UPDATE "Convidado"
+        SET "ultimoUsoEm" = ${usedAt}
+        WHERE id = ${invitation.convidadoId}
+          AND "condominioId" = ${condominiumId}
+          AND "deletedAt" IS NULL
+      `;
+      if (guestUpdated !== 1) {
+        throw new Error('Invitation guest became unavailable during validation');
+      }
+
+      return {
+        allowed: true,
+        guest: { name: invitation.guestName },
+        invitation: { type: invitation.tipo },
+        event: {
+          invitationId: invitation.id,
+          condominiumId,
+          residentId: invitation.moradorId,
+          guestId: invitation.convidadoId,
+          invitationType: invitation.tipo,
+          usedAt
+        }
+      };
+    });
+  }
+
   return {
     async createActive(data) {
       const records = await inTransaction([data]);
@@ -344,6 +456,10 @@ export function createPrismaInvitationStore(client: PrismaClient, tokenSecret: s
         `;
         return consumed === 1;
       });
+    },
+
+    validateActive({ token, condominiumId }) {
+      return validateActive(token, condominiumId);
     },
 
     async revokeActive({ id, condominioId, moradorId }, _now) {
@@ -441,6 +557,18 @@ function parseGuestIds(body: unknown) {
   return convidadoIds;
 }
 
+function parseValidationToken(body: unknown) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    return null;
+  }
+
+  const payload = body as Record<string, unknown>;
+  const keys = Object.keys(payload);
+  return keys.length === 1 && keys[0] === 'token' && typeof payload.token === 'string' && TOKEN_PATTERN.test(payload.token)
+    ? payload.token
+    : null;
+}
+
 function invitationResponse(convite: InvitationRecord, token: string) {
   return {
     id: convite.id,
@@ -464,6 +592,7 @@ export function registerConviteRoutes(
   const singlePath = '/condominios/:condominioId/moradores/:moradorId/convidados/:convidadoId/convites';
   const batchPath = '/condominios/:condominioId/moradores/:moradorId/convites/multiplos';
   const revokePath = '/condominios/:condominioId/moradores/:moradorId/convites/:conviteId';
+  const validationPath = '/portaria/convites/validar';
   const management = {
     preHandler: authorize(
       authenticator,
@@ -472,6 +601,43 @@ export function registerConviteRoutes(
       (request) => parseUuidParam(request.params, 'moradorId')
     )
   };
+
+  app.post(validationPath, {
+    onRequest: async (_request, reply) => {
+      reply.header('cache-control', 'no-store');
+      reply.header('pragma', 'no-cache');
+      reply.header('expires', '0');
+    },
+    preHandler: authorize(authenticator, 'convites:validate')
+  }, async (request, reply) => {
+    const identity = request.authenticatedIdentity;
+    const condominiumId = identity?.role === 'portaria' && identity.condominioIds.length === 1
+      ? identity.condominioIds[0]
+      : null;
+    if (!condominiumId) {
+      return reply.status(403).send({ error: 'Forbidden' });
+    }
+
+    const token = parseValidationToken(request.body);
+    if (!token) {
+      return { allowed: false, reason: 'invalid_or_unavailable' };
+    }
+    if (!store) {
+      return reply.status(503).send({ allowed: false, reason: 'service_unavailable' });
+    }
+
+    try {
+      const result = await store.validateActive({ token, condominiumId }, new Date());
+      return result.allowed
+        ? { allowed: true, guest: result.guest, invitation: result.invitation }
+        : result;
+    } catch (error) {
+      if (error instanceof InvitationSecretMismatchError) {
+        return reply.status(503).send({ allowed: false, reason: 'service_unavailable' });
+      }
+      throw error;
+    }
+  });
 
   app.post(singlePath, management, async (request, reply) => {
     const condominioId = parseUuidParam(request.params, 'condominioId');
