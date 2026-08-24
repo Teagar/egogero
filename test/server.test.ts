@@ -1,14 +1,22 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { once } from 'node:events';
 import { createServer } from 'node:net';
 import test from 'node:test';
 
+import { PrismaClient } from '@prisma/client';
+
 import { getEnv, normalizePublicValidationBaseUrl } from '../src/env.js';
 
-const INVITATION_TOKEN_SECRET = 'test-invitation-token-secret-at-least-32-bytes';
+const INVITATION_TOKEN_SECRET = 'idempotency-db-invitation-token-secret-minimum-32-bytes';
 const DEVICE_API_KEY_SECRET = 'test-device-api-key-secret-at-least-32-bytes';
-const IDEMPOTENCY_CACHE_SECRET = 'test-idempotency-cache-secret-at-least-32-bytes';
+const IDEMPOTENCY_CACHE_SECRET = 'idempotency-db-cache-secret-minimum-32-bytes';
+const runDatabaseTests = process.env.RUN_DATABASE_TESTS === 'true';
+
+function fingerprint(value: string) {
+  return createHash('sha256').update(value).digest('hex');
+}
 
 async function reservePort() {
   const server = createServer();
@@ -24,13 +32,17 @@ async function reservePort() {
   return address.port;
 }
 
-async function startRuntime(nodeEnvironment: string, localDevelopmentAuth: boolean) {
+async function startRuntime(
+  nodeEnvironment: string,
+  localDevelopmentAuth: boolean,
+  databaseUrl = process.env.DATABASE_URL ?? 'postgresql://unused:unused@127.0.0.1:1/unused'
+) {
   const port = await reservePort();
   const child = spawn(process.execPath, ['--import', 'tsx', 'src/server.ts'], {
     cwd: process.cwd(),
     env: {
       ...process.env,
-      DATABASE_URL: 'postgresql://unused:unused@127.0.0.1:1/unused',
+      DATABASE_URL: databaseUrl,
       INVITATION_TOKEN_SECRET,
       DEVICE_API_KEY_SECRET,
       IDEMPOTENCY_CACHE_SECRET,
@@ -77,18 +89,30 @@ async function stopRuntime(child: ReturnType<typeof spawn>) {
   }
 }
 
-test('production device authentication fails closed without credentials', async () => {
-  const runtime = await startRuntime('production', false);
-
+test('matching idempotency fingerprint starts before production authentication fails closed', { skip: !runDatabaseTests }, async () => {
+  const prisma = new PrismaClient();
+  await prisma.securityKey.upsert({
+    where: { name: 'invitation-token' },
+    create: { name: 'invitation-token', fingerprint: fingerprint(INVITATION_TOKEN_SECRET) },
+    update: { fingerprint: fingerprint(INVITATION_TOKEN_SECRET) }
+  });
+  await prisma.securityKey.upsert({
+    where: { name: 'idempotency-cache-v1' },
+    create: { name: 'idempotency-cache-v1', fingerprint: fingerprint(`idempotency-cache:${IDEMPOTENCY_CACHE_SECRET}`) },
+    update: { fingerprint: fingerprint(`idempotency-cache:${IDEMPOTENCY_CACHE_SECRET}`) }
+  });
+  let runtime: Awaited<ReturnType<typeof startRuntime>> | undefined;
   try {
+    runtime = await startRuntime('production', false);
     const response = await fetch(`${runtime.url}/condominios`);
     assert.equal(response.status, 401);
   } finally {
-    await stopRuntime(runtime.child);
+    if (runtime) await stopRuntime(runtime.child);
+    await prisma.$disconnect();
   }
 });
 
-test('NODE_ENV alone never enables development header authentication', async () => {
+test('NODE_ENV alone never enables development header authentication', { skip: !runDatabaseTests }, async () => {
   const runtime = await startRuntime('development', false);
 
   try {
@@ -105,7 +129,7 @@ test('NODE_ENV alone never enables development header authentication', async () 
   }
 });
 
-test('explicit local development mode starts with scoped header authentication', async () => {
+test('explicit local development mode starts with scoped header authentication', { skip: !runDatabaseTests }, async () => {
   const runtime = await startRuntime('production', true);
 
   try {
@@ -173,6 +197,31 @@ test('startup rejects a missing or weak idempotency cache secret and invalid rep
   assert.equal(getEnv({ ...base, IDEMPOTENCY_CACHE_SECRET }).idempotencyTtlMs, 24 * 60 * 60 * 1000);
 });
 
+test('startup fails before listen on an idempotency fingerprint mismatch', { skip: !runDatabaseTests }, async () => {
+  const prisma = new PrismaClient();
+  try {
+    await prisma.securityKey.upsert({
+      where: { name: 'idempotency-cache-v1' },
+      create: { name: 'idempotency-cache-v1', fingerprint: '0'.repeat(64) },
+      update: { fingerprint: '0'.repeat(64) }
+    });
+    await assert.rejects(startRuntime('production', false), /does not match database configuration/);
+  } finally {
+    await prisma.securityKey.update({
+      where: { name: 'idempotency-cache-v1' },
+      data: { fingerprint: fingerprint(`idempotency-cache:${IDEMPOTENCY_CACHE_SECRET}`) }
+    });
+    await prisma.$disconnect();
+  }
+});
+
+test('startup fails before listen when PostgreSQL is unavailable', async () => {
+  await assert.rejects(
+    startRuntime('production', false, 'postgresql://unused:unused@127.0.0.1:1/unused'),
+    /Can't reach database server|connect ECONNREFUSED/
+  );
+});
+
 test('public validation URL is optional but rejects unsafe values', () => {
   const base = getEnv({
     DATABASE_URL: 'postgresql://unused',
@@ -186,7 +235,7 @@ test('public validation URL is optional but rejects unsafe values', () => {
   assert.throws(() => normalizePublicValidationBaseUrl('https://access.example.test/?token=secret'), /without credentials/);
 });
 
-test('production gatehouse validation rejects HTTP and untrusted forwarded protocol', async () => {
+test('production gatehouse validation rejects HTTP and untrusted forwarded protocol', { skip: !runDatabaseTests }, async () => {
   const runtime = await startRuntime('production', false);
 
   try {

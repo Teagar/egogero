@@ -1,6 +1,6 @@
 # Invitation idempotency and delivery outbox
 
-Both invitation creation endpoints require an `Idempotency-Key` containing 16 to 128 ASCII letters, digits, `.`, `_`, `:`, or `-`. A key is scoped by authenticated actor, condominium, HTTP method, and route template. Object keys in the request body are sorted before SHA-256 hashing; array order remains significant.
+Both invitation creation endpoints require an `Idempotency-Key` containing 16 to 128 ASCII letters, digits, `.`, `_`, `:`, or `-`. A key is scoped by authenticated actor, condominium, HTTP method, and route template. Object keys in the request body are sorted by locale-independent UTF-16 code-unit order before SHA-256 hashing; array order remains significant. Creation payloads are closed schemas, so unknown keys and non-boolean representation flags are rejected before hashing.
 
 The database transaction claims the scoped key through `IdempotencyRecord_scope_key`, creates every invitation, stores one encrypted delivery intent per invitation/channel, and encrypts the exact HTTP 201 JSON response before commit. A concurrent loser waits on PostgreSQL's unique index. It replays after the winner commits or proceeds as the new writer if the winner rolls back. Reusing a live key with a different request hash returns HTTP 409.
 

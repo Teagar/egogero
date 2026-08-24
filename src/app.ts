@@ -413,6 +413,8 @@ const defaultStore: AppStore = {
 export function createApp(
   {
     db: suppliedDb,
+    invitationStore,
+    deviceStore,
     authenticator = unauthenticatedAuthenticator,
     invitationTokenSecret = process.env.INVITATION_TOKEN_SECRET,
     idempotencyCacheSecret = process.env.IDEMPOTENCY_CACHE_SECRET,
@@ -426,6 +428,8 @@ export function createApp(
     trustProxy = false
   }: {
     db?: AppDependencies;
+    invitationStore?: InvitationStore;
+    deviceStore?: DeviceStore;
     authenticator?: Authenticator;
     invitationTokenSecret?: string;
     idempotencyCacheSecret?: string;
@@ -441,12 +445,12 @@ export function createApp(
 ) {
   const db: AppDependencies = suppliedDb ?? {
     ...defaultStore,
-    convite: invitationTokenSecret
+    convite: invitationStore ?? (invitationTokenSecret
       ? createPrismaInvitationStore(defaultPrisma, invitationTokenSecret, idempotencyCacheSecret, idempotencyTtlMs)
-      : undefined,
-    dispositivo: deviceApiKeySecret
+      : undefined),
+    dispositivo: deviceStore ?? (deviceApiKeySecret
       ? createPrismaDeviceStore(defaultPrisma, deviceApiKeySecret)
-      : undefined,
+      : undefined),
     notificacao: createPrismaNotificationStore(defaultPrisma)
   };
   const effectiveNotificationSender = notificationSender

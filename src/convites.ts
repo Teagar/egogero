@@ -205,11 +205,13 @@ function canonicalJson(value: unknown): string {
   if (value && typeof value === 'object') {
     return `{${Object.entries(value as Record<string, unknown>)
       .filter(([, item]) => item !== undefined)
-      .sort(([left], [right]) => left.localeCompare(right))
+      .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)
       .map(([key, item]) => `${JSON.stringify(key)}:${canonicalJson(item)}`)
       .join(',')}}`;
   }
-  return JSON.stringify(value);
+  const serialized = JSON.stringify(value);
+  if (serialized === undefined) throw new TypeError('Canonical request contains a non-JSON value');
+  return serialized;
 }
 
 export function canonicalRequestHash(body: unknown) {
@@ -547,7 +549,13 @@ export function createPrismaInvitationStore(
           }
 
           const convites = await persistBatch(transaction, allocations);
-          if (!convites) return null;
+          if (!convites) {
+            await transaction.$executeRaw`
+              DELETE FROM "IdempotencyRecord"
+              WHERE id = ${recordId}::uuid AND "confirmedAt" IS NULL
+            `;
+            return null;
+          }
           const results = convites.map((convite, index) => ({ convite, token: allocations[index]!.token }));
           const responseText = JSON.stringify(await args.buildResponse(results));
 
@@ -801,7 +809,10 @@ export function createPrismaInvitationStore(
     issueIdempotent,
 
     verifyIdempotencyConfiguration() {
-      return client.$transaction((transaction) => verifyIdempotencySecret(transaction));
+      return client.$transaction(async (transaction) => {
+        await verifyTokenSecret(transaction);
+        await verifyIdempotencySecret(transaction);
+      });
     },
 
     async createActive(data) {
@@ -925,6 +936,12 @@ function parseInvitationBody(body: unknown) {
   }
 
   const payload = body as Record<string, unknown>;
+  const keys = Object.keys(payload);
+  if (keys.some((key) => !['tipo', 'expiresAt', 'link', 'qrCode'].includes(key))
+    || (payload.link !== undefined && typeof payload.link !== 'boolean')
+    || (payload.qrCode !== undefined && typeof payload.qrCode !== 'boolean')) {
+    return null;
+  }
   const tipo = INVITATION_TYPES.find((candidate) => candidate === payload.tipo);
   const isTimestamp = typeof payload.expiresAt === 'string'
     && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?(?:Z|[+-]\d{2}:\d{2})$/.test(payload.expiresAt);
@@ -938,27 +955,26 @@ function parseInvitationBody(body: unknown) {
   return { tipo, expiresAt, link: link || qrCode, qrCode };
 }
 
-function parseGuestIds(body: unknown) {
+function parseBatchBody(body: unknown) {
   if (!body || typeof body !== 'object' || Array.isArray(body)) {
     return null;
   }
 
-  const convidadoIds = (body as Record<string, unknown>).convidadoIds;
+  const payload = body as Record<string, unknown>;
+  const keys = Object.keys(payload);
+  const convidadoIds = payload.convidadoIds;
   if (!Array.isArray(convidadoIds)
     || convidadoIds.length === 0
     || convidadoIds.length > MAX_BATCH_SIZE
-    || !convidadoIds.every(isUuid)) {
+    || !convidadoIds.every(isUuid)
+    || keys.some((key) => !['convidadoIds', 'link', 'qrCode'].includes(key))
+    || (payload.link !== undefined && typeof payload.link !== 'boolean')
+    || (payload.qrCode !== undefined && typeof payload.qrCode !== 'boolean')) {
     return null;
   }
 
-  return convidadoIds;
-}
-
-function parseRepresentations(body: unknown) {
-  if (!body || typeof body !== 'object' || Array.isArray(body)) return { link: false, qrCode: false };
-  const payload = body as Record<string, unknown>;
   const qrCode = payload.qrCode === true;
-  return { link: payload.link === true || qrCode, qrCode };
+  return { convidadoIds, link: payload.link === true || qrCode, qrCode };
 }
 
 function invitationLink(baseUrl: string | undefined, token: string) {
@@ -1232,11 +1248,11 @@ export function registerConviteRoutes(
   app.post(batchPath, management, async (request, reply) => {
     const condominioId = parseUuidParam(request.params, 'condominioId');
     const moradorId = parseUuidParam(request.params, 'moradorId');
-    const convidadoIds = parseGuestIds(request.body);
-    const representations = parseRepresentations(request.body);
-    if (!condominioId || !moradorId || !convidadoIds) {
+    const body = parseBatchBody(request.body);
+    if (!condominioId || !moradorId || !body) {
       return reply.status(400).send({ error: 'Invalid batch invitation payload' });
     }
+    const { convidadoIds, ...representations } = body;
     if (new Set(convidadoIds).size !== convidadoIds.length) {
       return reply.status(400).send({ error: 'Guest ids must be unique' });
     }

@@ -2,7 +2,11 @@ import { pathToFileURL } from 'node:url';
 
 import { createApp } from './app.js';
 import { createCompositeAuthenticator, createDevelopmentHeaderAuthenticator } from './auth.js';
-import { createDevelopmentNotificationSender, createUnavailableNotificationSender } from './convites.js';
+import {
+  createDevelopmentNotificationSender,
+  createPrismaInvitationStore,
+  createUnavailableNotificationSender
+} from './convites.js';
 import { createDeviceAuthenticator, createPrismaDeviceRateLimiter, createPrismaDeviceStore } from './dispositivos.js';
 import { getEnv } from './env.js';
 import { prisma } from './lib/prisma.js';
@@ -10,6 +14,13 @@ import { prisma } from './lib/prisma.js';
 export async function startServer(environment: NodeJS.ProcessEnv = process.env) {
   const env = getEnv(environment);
   const deviceStore = createPrismaDeviceStore(prisma, env.deviceApiKeySecret);
+  const invitationStore = createPrismaInvitationStore(
+    prisma,
+    env.invitationTokenSecret,
+    env.idempotencyCacheSecret,
+    env.idempotencyTtlMs
+  );
+  await invitationStore.verifyIdempotencyConfiguration!();
   const deviceAuthenticator = createDeviceAuthenticator(deviceStore);
   const authenticator = env.localDevelopmentAuth
     ? createCompositeAuthenticator(deviceAuthenticator, createDevelopmentHeaderAuthenticator(true))
@@ -19,10 +30,8 @@ export async function startServer(environment: NodeJS.ProcessEnv = process.env) 
     : createUnavailableNotificationSender();
   const app = createApp({
     authenticator,
-    invitationTokenSecret: env.invitationTokenSecret,
-    idempotencyCacheSecret: env.idempotencyCacheSecret,
-    idempotencyTtlMs: env.idempotencyTtlMs,
-    deviceApiKeySecret: env.deviceApiKeySecret,
+    invitationStore,
+    deviceStore,
     deviceRateLimiter: createPrismaDeviceRateLimiter(prisma),
     notificationSender,
     publicValidationBaseUrl: env.publicValidationBaseUrl,

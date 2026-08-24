@@ -174,3 +174,76 @@ test('PostgreSQL serializes idempotent invitation issuance, rollback, replay, ou
     await prisma.$disconnect();
   }
 });
+
+test('PostgreSQL releases single and batch idempotency claims after an intended 404', { skip: !runDatabaseTests }, async () => {
+  const prisma = new PrismaClient();
+  const condominioId = uuid(101);
+  const moradorId = uuid(102);
+  const validGuestId = uuid(103);
+  const missingSingleId = uuid(104);
+  const missingBatchId = uuid(105);
+  const authenticator = createDevelopmentHeaderAuthenticator(true);
+  const headers = (key: string) => ({
+    'x-development-user-id': moradorId,
+    'x-development-user-role': 'morador',
+    'x-development-condominio-id': condominioId,
+    'idempotency-key': key
+  });
+  const payload = { tipo: 'visitante', expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString() };
+
+  try {
+    await prisma.deliveryIntent.deleteMany();
+    await prisma.idempotencyRecord.deleteMany();
+    await prisma.convite.deleteMany();
+    await prisma.convidado.deleteMany();
+    await prisma.morador.deleteMany();
+    await prisma.condominio.deleteMany();
+    await prisma.securityKey.deleteMany();
+    await prisma.condominio.create({
+      data: { id: condominioId, nome: 'Principal', responsavel: 'Owner', tipo: 'residencial', timezone: 'America/Sao_Paulo' }
+    });
+    await prisma.morador.create({ data: { id: moradorId, nome: 'Resident', condominioId } });
+    await prisma.convidado.create({ data: { id: validGuestId, nome: 'Valid', condominioId, moradorId } });
+
+    const app = createApp({
+      authenticator,
+      invitationTokenSecret: tokenSecret,
+      idempotencyCacheSecret: cacheSecret
+    });
+    const singleUrl = `/condominios/${condominioId}/moradores/${moradorId}/convidados/${missingSingleId}/convites`;
+    const single404 = await app.inject({
+      method: 'POST', url: singleUrl, headers: headers('missing-single-idempotency-key'), payload
+    });
+    assert.equal(single404.statusCode, 404);
+    assert.equal(await prisma.idempotencyRecord.count(), 0);
+    assert.equal(await prisma.convite.count(), 0);
+
+    await prisma.convidado.create({ data: { id: missingSingleId, nome: 'Now active', condominioId, moradorId } });
+    const singleRetry = await app.inject({
+      method: 'POST', url: singleUrl, headers: headers('missing-single-idempotency-key'), payload
+    });
+    assert.equal(singleRetry.statusCode, 201);
+    assert.equal(await prisma.idempotencyRecord.count(), 1);
+    assert.equal(await prisma.convite.count(), 1);
+
+    const batchUrl = `/condominios/${condominioId}/moradores/${moradorId}/convites/multiplos`;
+    const batchPayload = { convidadoIds: [validGuestId, missingBatchId] };
+    const batch404 = await app.inject({
+      method: 'POST', url: batchUrl, headers: headers('missing-batch-idempotency-key'), payload: batchPayload
+    });
+    assert.equal(batch404.statusCode, 404);
+    assert.equal(await prisma.idempotencyRecord.count(), 1);
+    assert.equal(await prisma.convite.count(), 1);
+
+    await prisma.convidado.create({ data: { id: missingBatchId, nome: 'Now active', condominioId, moradorId } });
+    const batchRetry = await app.inject({
+      method: 'POST', url: batchUrl, headers: headers('missing-batch-idempotency-key'), payload: batchPayload
+    });
+    assert.equal(batchRetry.statusCode, 201);
+    assert.equal(await prisma.idempotencyRecord.count(), 2);
+    assert.equal(await prisma.convite.count(), 3);
+    await app.close();
+  } finally {
+    await prisma.$disconnect();
+  }
+});

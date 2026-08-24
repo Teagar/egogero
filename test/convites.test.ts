@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import test from 'node:test';
 
 import Fastify from 'fastify';
@@ -8,6 +9,7 @@ import type { AppDependencies, AppStore } from '../src/app.js';
 import { createDevelopmentHeaderAuthenticator } from '../src/auth.js';
 import {
   ActiveTokenCollisionError,
+  canonicalRequestHash,
   IdempotencyConflictError,
   createInvitation,
   createInvitations,
@@ -335,6 +337,15 @@ test('single creation exposes plaintext once with no-store and enforces scope be
   await app.close();
 });
 
+test('canonical request hashes use locale-independent UTF-16 key ordering', () => {
+  const left = { '😀': 4, 'é': 3, a: { 'β': 2, A: 1 }, Z: 0 };
+  const right = { Z: 0, a: { A: 1, 'β': 2 }, 'é': 3, '😀': 4 };
+  const canonical = '{"Z":0,"a":{"A":1,"β":2},"é":3,"😀":4}';
+  const expected = createHash('sha256').update(canonical).digest('hex');
+  assert.equal(canonicalRequestHash(left), expected);
+  assert.equal(canonicalRequestHash(right), expected);
+});
+
 test('invitation creation requires a bounded idempotency key and replays canonical requests exactly', async () => {
   const store = uniqueMemoryStore();
   const app = Fastify({ logger: false });
@@ -348,6 +359,14 @@ test('invitation creation requires a bounded idempotency key and replays canonic
     const response = await app.inject({
       method: 'POST', url, headers, payload
     });
+    assert.equal(response.statusCode, 400);
+  }
+  for (const invalidPayload of [
+    { ...payload, surpresa: 'não' },
+    { ...payload, link: 'true' },
+    { ...payload, qrCode: 1 }
+  ]) {
+    const response = await app.inject({ method: 'POST', url, headers: residentHeaders, payload: invalidPayload });
     assert.equal(response.statusCode, 400);
   }
   assert.equal(store.batchCalls, 0);
@@ -688,6 +707,9 @@ test('batch validation rejects duplicates, inactive, cross-tenant, and cross-own
   const cases = [
     [{}, 400],
     [{ convidadoIds: [CONVIDADO_ID, CONVIDADO_ID] }, 400],
+    [{ convidadoIds: [CONVIDADO_ID], surpresa: 'não' }, 400],
+    [{ convidadoIds: [CONVIDADO_ID], link: 'true' }, 400],
+    [{ convidadoIds: [CONVIDADO_ID], qrCode: 1 }, 400],
     [{ convidadoIds: [uuid(999)] }, 404],
     [{ convidadoIds: [CONVIDADO_ID, uuid(999)] }, 404],
     [{ convidadoIds: [DELETED_CONVIDADO_ID] }, 404],
