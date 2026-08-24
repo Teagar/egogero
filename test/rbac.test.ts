@@ -483,7 +483,7 @@ test('tenant matrix prevents a sindico from reaching another condominium before 
       if (role === 'provedor') {
         assert.equal(response.statusCode, endpoint.successStatus, `${role}: ${endpoint.name}`);
         assert.ok(storeCalls > 0, `${role}: ${endpoint.name} should reach its tenant data`);
-        if (endpoint.name !== 'update condominium invitation limit') {
+        if (!['create invitation', 'update condominium invitation limit'].includes(endpoint.name)) {
           assert.equal(condominioStoreCalls, 0, `${role}: ${endpoint.name} used a preliminary condominium check`);
         }
       } else {

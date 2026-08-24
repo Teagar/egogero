@@ -282,10 +282,18 @@ test('single creation exposes plaintext once with no-store and enforces scope be
 });
 
 test('invitation template replaces every documented placeholder deterministically', () => {
-  const message = invitationMessage({ guestName: 'Ana', type: 'prestador', expiresAt: EXPIRES_AT, token: '123456' });
-  assert.equal(message.subject, 'Convite de acesso - prestador');
-  assert.equal(message.body, 'Olá, Ana! Você recebeu um convite de acesso (prestador). Seu código é 123456. Ele expira em 2026-08-25T05:00:00.000Z.');
-  assert.doesNotMatch(`${message.subject} ${message.body}`, /\{[^}]+\}/);
+  const message = invitationMessage({
+    condominiumName: 'Residencial A',
+    residentName: 'Maria',
+    generatedAt: NOW,
+    expiresAt: EXPIRES_AT,
+    token: '123456'
+  });
+  assert.equal(message.subject, 'Convite de acesso ao condomínio Residencial A');
+  assert.equal(
+    message.body,
+    'Seu código para a entrada no condomínio Residencial A foi gerado por Maria às 05:00 do dia 24/08/2026 e será expirado em 25/08/2026 às 05:00.\nSeu código é: 123456'
+  );
 });
 
 test('single invitation sends exactly one message per supplied channel and none without contacts', async () => {

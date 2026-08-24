@@ -24,12 +24,29 @@ export function createUnavailableNotificationSender(): NotificationSender {
   const unavailable = async () => { throw new Error('Notification delivery is unavailable'); };
   return { email: { send: unavailable }, sms: { send: unavailable } };
 }
-export function invitationMessage(input: { guestName: string; type: TipoConvite; expiresAt: Date; token: string }): InvitationMessage {
-  const values = { '{CONVIDADO_NOME}': input.guestName, '{TIPO_CONVITE}': input.type, '{EXPIRA_EM}': input.expiresAt.toISOString(), '{TOKEN}': input.token };
-  const replace = (text: string) => Object.entries(values).reduce((result, [placeholder, value]) => result.replaceAll(placeholder, value), text);
+function formatDate(date: Date) {
+  return new Intl.DateTimeFormat('pt-BR', { dateStyle: 'short', timeZone: 'UTC' }).format(date);
+}
+
+function formatTime(date: Date) {
+  return new Intl.DateTimeFormat('pt-BR', {
+    hour: '2-digit',
+    hour12: false,
+    minute: '2-digit',
+    timeZone: 'UTC'
+  }).format(date);
+}
+
+export function invitationMessage(input: {
+  condominiumName: string;
+  residentName: string;
+  generatedAt: Date;
+  expiresAt: Date;
+  token: string;
+}): InvitationMessage {
   return {
-    subject: replace('Convite de acesso - {TIPO_CONVITE}'),
-    body: replace('Olá, {CONVIDADO_NOME}! Você recebeu um convite de acesso ({TIPO_CONVITE}). Seu código é {TOKEN}. Ele expira em {EXPIRA_EM}.')
+    subject: `Convite de acesso ao condomínio ${input.condominiumName}`,
+    body: `Seu código para a entrada no condomínio ${input.condominiumName} foi gerado por ${input.residentName} às ${formatTime(input.generatedAt)} do dia ${formatDate(input.generatedAt)} e será expirado em ${formatDate(input.expiresAt)} às ${formatTime(input.expiresAt)}.\nSeu código é: ${input.token}`
   };
 }
 
@@ -378,7 +395,7 @@ export function createPrismaInvitationStore(client: PrismaClient, tokenSecret: s
   };
 }
 
-type ConvitesStore = Pick<AppStore, 'morador' | 'convidado'>;
+type ConvitesStore = Pick<AppStore, 'condominio' | 'morador' | 'convidado'>;
 const activeCondominio = { deletedAt: null } as const;
 const activeGuestParents = {
   condominio: activeCondominio,
@@ -469,13 +486,29 @@ export function registerConviteRoutes(
       return reply.status(503).send({ error: 'Invitation service unavailable' });
     }
 
-    const convidado = await db.convidado.findFirst({ where: { id: convidadoId, condominioId, moradorId, deletedAt: null, ...activeGuestParents } });
-    if (!convidado) return reply.status(404).send({ error: 'Guest not found' });
+    const [condominio, morador, convidado] = await Promise.all([
+      db.condominio.findFirst({ where: { id: condominioId, deletedAt: null } }),
+      db.morador.findFirst({
+        where: { id: moradorId, condominioId, deletedAt: null, condominio: activeCondominio }
+      }),
+      db.convidado.findFirst({
+        where: { id: convidadoId, condominioId, moradorId, deletedAt: null, ...activeGuestParents }
+      })
+    ]);
+    if (!condominio || !morador || !convidado) {
+      return reply.status(404).send({ error: 'Guest not found' });
+    }
 
     try {
       const result = await createInvitation(store, { condominioId, moradorId, convidadoId, ...body });
       if (!result) return reply.status(404).send({ error: 'Guest not found' });
-      const message = invitationMessage({ guestName: convidado.nome, type: body.tipo, expiresAt: body.expiresAt, token: result.token });
+      const message = invitationMessage({
+        condominiumName: condominio.nome,
+        residentName: morador.nome,
+        generatedAt: result.convite.createdAt,
+        expiresAt: result.convite.expiresAt ?? body.expiresAt,
+        token: result.token
+      });
       try {
         if (convidado.email) await notifications.email.send(convidado.email, message);
         if (convidado.telefone) await notifications.sms.send(convidado.telefone, message.body);
