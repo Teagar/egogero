@@ -6,6 +6,7 @@ import type { FastifyInstance } from 'fastify';
 import type { AppStore } from './app.js';
 import { authorize, isUuid } from './auth.js';
 import type { Authenticator } from './auth.js';
+import { insertEntryNotification } from './notificacoes.js';
 
 export const INVITATION_TYPES = ['visitante', 'prestador', 'entregador'] as const satisfies readonly TipoConvite[];
 const TOKEN_PATTERN = /^[0-9]{6}$/;
@@ -389,6 +390,15 @@ export function createPrismaInvitationStore(client: PrismaClient, tokenSecret: s
       if (guestUpdated !== 1) {
         throw new Error('Invitation guest became unavailable during validation');
       }
+
+      await insertEntryNotification(transaction, {
+        invitationId: invitation.id,
+        condominiumId,
+        residentId: invitation.moradorId,
+        guestId: invitation.convidadoId,
+        guestName: invitation.guestName,
+        enteredAt: usedAt
+      });
 
       return {
         allowed: true,
