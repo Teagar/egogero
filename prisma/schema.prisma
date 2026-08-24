@@ -30,10 +30,11 @@ model Morador {
   enderecoApartamento String?
   condominioId        String
   condominio          Condominio  @relation(fields: [condominioId], references: [id], onDelete: Restrict)
-  convites            Convite[]
-  convidados          Convidado[]
+  convites            Convite[] @relation("ConviteMorador")
+  convidados          Convidado[] @relation("ConvidadoMorador")
 
   @@index([condominioId])
+  @@unique([id, condominioId])
 }
 
 model Convidado {
@@ -42,14 +43,16 @@ model Convidado {
   deletedAt     DateTime?
   nome          String
   condominioId  String
-  moradorId     String
+  moradorId     String?
+  // PC-7 records this when it generates a Convite; guest CRUD never simulates invitation use.
   ultimoUsoEm   DateTime?
   condominio    Condominio @relation(fields: [condominioId], references: [id], onDelete: Restrict)
-  morador       Morador   @relation(fields: [moradorId], references: [id], onDelete: Restrict)
-  convites      Convite[]
+  morador       Morador?  @relation("ConvidadoMorador", fields: [moradorId, condominioId], references: [id, condominioId], onDelete: Restrict)
+  convites      Convite[] @relation("ConviteConvidado")
 
   @@index([condominioId])
   @@index([moradorId, ultimoUsoEm])
+  @@unique([id, condominioId])
 }
 
 model Convite {
@@ -60,8 +63,8 @@ model Convite {
   moradorId    String?
   convidadoId  String?
   condominio   Condominio @relation(fields: [condominioId], references: [id], onDelete: Restrict)
-  morador      Morador?   @relation(fields: [moradorId], references: [id], onDelete: SetNull)
-  convidado    Convidado? @relation(fields: [convidadoId], references: [id], onDelete: SetNull)
+  morador      Morador?   @relation("ConviteMorador", fields: [moradorId, condominioId], references: [id, condominioId], onDelete: Restrict)
+  convidado    Convidado? @relation("ConviteConvidado", fields: [convidadoId, condominioId], references: [id, condominioId], onDelete: Restrict)
 
   @@index([condominioId])
   @@index([moradorId])
