@@ -23,6 +23,7 @@ test('migrations form one exact contiguous immutable sequence', async () => {
     '0014_add_condominium_timezone_and_timestamptz',
     '0015_add_invitation_idempotency_outbox',
     '0016_add_delivery_worker_leases',
-    '0017_add_human_authentication_schema'
+    '0017_add_human_authentication_schema',
+    '0018_add_oidc_validated_handoff'
   ]);
 });

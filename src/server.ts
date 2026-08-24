@@ -10,6 +10,7 @@ import {
 import { createDeviceAuthenticator, createPrismaDeviceRateLimiter, createPrismaDeviceStore } from './dispositivos.js';
 import { getEnv } from './env.js';
 import { prisma } from './lib/prisma.js';
+import { createOidcService, createPrismaOidcLoginStore } from './oidc.js';
 
 export async function startServer(environment: NodeJS.ProcessEnv = process.env) {
   const env = getEnv(environment);
@@ -27,6 +28,9 @@ export async function startServer(environment: NodeJS.ProcessEnv = process.env) 
   const notificationSender = environment.NODE_ENV === 'development'
     ? createDevelopmentNotificationSender()
     : createUnavailableNotificationSender();
+  const oidcService = env.oidc
+    ? await createOidcService(env.oidc, createPrismaOidcLoginStore(prisma))
+    : undefined;
   const app = createApp({
     authenticator,
     invitationStore,
@@ -35,7 +39,8 @@ export async function startServer(environment: NodeJS.ProcessEnv = process.env) 
     notificationSender,
     publicValidationBaseUrl: env.publicValidationBaseUrl,
     secureValidationTransport: env.secureValidationTransport,
-    trustProxy: env.trustProxy
+    trustProxy: env.trustProxy,
+    oidcService
   });
 
   await app.listen({ host: env.host, port: env.port });

@@ -19,6 +19,8 @@ import {
 import type { DeviceRateLimiter, DeviceStore } from './dispositivos.js';
 import { createPrismaNotificationStore, registerNotificationRoutes } from './notificacoes.js';
 import type { NotificationStore } from './notificacoes.js';
+import { registerOidcRoutes } from './oidc.js';
+import type { OidcService } from './oidc.js';
 import { prisma as defaultPrisma } from './lib/prisma.js';
 import { isDatabaseTimeZoneRejection, isValidTimeZone } from './timezones.js';
 
@@ -425,7 +427,8 @@ export function createApp(
     notificationSender,
     publicValidationBaseUrl,
     secureValidationTransport = false,
-    trustProxy = false
+    trustProxy = false,
+    oidcService
   }: {
     db?: AppDependencies;
     invitationStore?: InvitationStore;
@@ -441,6 +444,7 @@ export function createApp(
     publicValidationBaseUrl?: string;
     secureValidationTransport?: boolean;
     trustProxy?: boolean | string;
+    oidcService?: OidcService;
   } = {}
 ) {
   const db: AppDependencies = suppliedDb ?? {
@@ -768,6 +772,7 @@ export function createApp(
     secureValidationTransport
   );
   registerNotificationRoutes(app, db.notificacao, authenticator);
+  registerOidcRoutes(app, oidcService);
 
   return app;
 }

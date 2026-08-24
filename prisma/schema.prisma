@@ -234,17 +234,19 @@ model HumanAccount {
 }
 
 model ExternalIdentity {
-  id            String       @id @default(uuid()) @db.Uuid
-  createdAt     DateTime     @default(now()) @db.Timestamptz(3)
-  lastLoginAt   DateTime?    @db.Timestamptz(3)
-  accountId     String       @db.Uuid
+  id            String                 @id @default(uuid()) @db.Uuid
+  createdAt     DateTime               @default(now()) @db.Timestamptz(3)
+  lastLoginAt   DateTime?              @db.Timestamptz(3)
+  accountId     String                 @db.Uuid
   issuer        String
   subject       String
   email         String?
-  emailVerified Boolean      @default(false)
-  account       HumanAccount @relation(fields: [accountId], references: [id], onDelete: Restrict)
+  emailVerified Boolean                @default(false)
+  account       HumanAccount           @relation(fields: [accountId], references: [id], onDelete: Restrict)
+  oidcHandoffs  OidcValidatedHandoff[]
 
   @@unique([issuer, subject])
+  @@unique([id, accountId])
   @@index([accountId])
 }
 
@@ -269,11 +271,11 @@ model HumanMembership {
 }
 
 model OidcLoginTransaction {
-  id                     String    @id @default(uuid()) @db.Uuid
-  createdAt              DateTime  @default(now()) @db.Timestamptz(3)
-  expiresAt              DateTime  @db.Timestamptz(3)
-  consumedAt             DateTime? @db.Timestamptz(3)
-  stateDigest            Bytes     @unique
+  id                     String                @id @default(uuid()) @db.Uuid
+  createdAt              DateTime              @default(now()) @db.Timestamptz(3)
+  expiresAt              DateTime              @db.Timestamptz(3)
+  consumedAt             DateTime?             @db.Timestamptz(3)
+  stateDigest            Bytes                 @unique
   nonceDigest            Bytes
   pkceVerifierCiphertext Bytes
   pkceVerifierNonce      Bytes
@@ -283,9 +285,27 @@ model OidcLoginTransaction {
   clientId               String
   redirectUri            String
   returnTo               String
-  recoveryIntent         Boolean   @default(false)
+  recoveryIntent         Boolean               @default(false)
+  validatedHandoff       OidcValidatedHandoff?
 
   @@index([expiresAt, consumedAt])
+}
+
+model OidcValidatedHandoff {
+  id                 String               @id @default(uuid()) @db.Uuid
+  createdAt          DateTime             @default(now()) @db.Timestamptz(3)
+  expiresAt          DateTime             @db.Timestamptz(3)
+  consumedAt         DateTime?            @db.Timestamptz(3)
+  handleDigest       Bytes                @unique
+  loginTransactionId String               @unique @db.Uuid
+  accountId          String               @db.Uuid
+  externalIdentityId String               @db.Uuid
+  authenticatedAt    DateTime             @db.Timestamptz(3)
+  loginTransaction   OidcLoginTransaction @relation(fields: [loginTransactionId], references: [id], onDelete: Restrict)
+  externalIdentity   ExternalIdentity     @relation(fields: [externalIdentityId, accountId], references: [id, accountId], onDelete: Restrict)
+
+  @@index([expiresAt, consumedAt])
+  @@index([accountId, createdAt])
 }
 
 model BrowserSession {

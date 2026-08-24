@@ -1,3 +1,5 @@
+import { oidcConfigFromEnvironment } from './oidc.js';
+
 const DEFAULT_PORT = 3000;
 const DEFAULT_IDEMPOTENCY_TTL_SECONDS = 24 * 60 * 60;
 
@@ -66,6 +68,7 @@ export function getEnv(environment: NodeJS.ProcessEnv = process.env) {
     host: environment.HOST ?? (environment.LOCAL_DEVELOPMENT_AUTH === 'true' ? '127.0.0.1' : '0.0.0.0'),
     localDevelopmentAuth: environment.LOCAL_DEVELOPMENT_AUTH === 'true',
     secureValidationTransport: environment.NODE_ENV === 'production',
-    trustProxy: environment.TRUST_PROXY?.trim() || false
+    trustProxy: environment.TRUST_PROXY?.trim() || false,
+    oidc: oidcConfigFromEnvironment(environment)
   };
 }
