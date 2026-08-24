@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 
 import { Prisma, type PrismaClient } from '@prisma/client';
 
@@ -16,9 +16,14 @@ export const AUTH_RATE_LIMIT_POLICIES = {
 
 export type AuthRateLimitAction = keyof typeof AUTH_RATE_LIMIT_POLICIES;
 export type AuthRateLimitDecision = { allowed: boolean; retryAfterSeconds: number; repeatedExcess: boolean };
+export type CallbackRateLimitReservation =
+  | { allowed: true; retryAfterSeconds: 0; repeatedExcess: false; reservationId: string }
+  | { allowed: false; retryAfterSeconds: number; repeatedExcess: boolean; reservationId?: never };
 
 export interface AuthRateLimiter {
   check(action: AuthRateLimitAction, subject: string, consume?: boolean): Promise<AuthRateLimitDecision>;
+  reserveCallback(subject: string): Promise<CallbackRateLimitReservation>;
+  finalizeCallback(reservationId: string, outcome: 'success' | 'failure'): Promise<void>;
   cleanup?(): Promise<number>;
 }
 
@@ -33,6 +38,12 @@ export function createPrismaAuthRateLimiter(
 ): AuthRateLimiter {
   const metrics = safeAuthMetrics(metricsSink);
   const alerts = safeAuthAlerts(alertSink);
+  function observeDecision(action: AuthRateLimitAction, decision: AuthRateLimitDecision) {
+    metrics.increment('auth_rate_limit_decisions_total', { operation: action, outcome: decision.allowed ? 'allowed' : 'denied' });
+    if (!decision.allowed && decision.repeatedExcess) {
+      alerts.emit('rate_limit_repeated_excess', { operation: action, outcome: 'denied' });
+    }
+  }
   return {
     async check(action, rawSubject, consume = true) {
       const policy = AUTH_RATE_LIMIT_POLICIES[action];
@@ -89,11 +100,124 @@ export function createPrismaAuthRateLimiter(
       const decision = row
         ? { allowed: row.allowed, retryAfterSeconds: Math.min(3600, row.retryAfterSeconds), repeatedExcess: row.deniedCount >= 3 }
         : { allowed: true, retryAfterSeconds: 0, repeatedExcess: false };
-      metrics.increment('auth_rate_limit_decisions_total', { operation: action, outcome: decision.allowed ? 'allowed' : 'denied' });
-      if (!decision.allowed && decision.repeatedExcess) {
-        alerts.emit('rate_limit_repeated_excess', { operation: action, outcome: 'denied' });
-      }
+      observeDecision(action, decision);
       return decision;
+    },
+    async reserveCallback(rawSubject) {
+      const action: AuthRateLimitAction = 'callback_failure_ip';
+      const policy = AUTH_RATE_LIMIT_POLICIES[action];
+      const subject = boundedSubject(rawSubject);
+      const reservationId = randomUUID();
+      const result = await client.$transaction(async (transaction): Promise<CallbackRateLimitReservation> => {
+        await transaction.$executeRaw`
+          INSERT INTO "AuthenticationRateLimit" (action, subject, "windowStartedAt", count, "deniedCount", "reservedCount", "updatedAt")
+          VALUES (${action}, ${subject}, clock_timestamp(), 0, 0, 0, clock_timestamp())
+          ON CONFLICT (action, subject) DO NOTHING
+        `;
+        const rows = await transaction.$queryRaw<Array<{
+          windowStartedAt: Date;
+          count: number;
+          deniedCount: number;
+          reservedCount: number;
+          blockedUntil: Date | null;
+          databaseNow: Date;
+        }>>(Prisma.sql`
+          SELECT "windowStartedAt", count, "deniedCount", "reservedCount", "blockedUntil",
+                 clock_timestamp() AS "databaseNow"
+          FROM "AuthenticationRateLimit"
+          WHERE action = ${action} AND subject = ${subject}
+          FOR UPDATE
+        `);
+        const row = rows[0]!;
+        const windowEndsAt = new Date(row.windowStartedAt.getTime() + policy.windowMs);
+        if (windowEndsAt <= row.databaseNow) {
+          await transaction.$executeRaw`
+            DELETE FROM "AuthenticationRateLimitReservation"
+            WHERE action = ${action} AND subject = ${subject}
+          `;
+          row.windowStartedAt = row.databaseNow;
+          row.count = 0;
+          row.deniedCount = 0;
+          row.reservedCount = 0;
+          row.blockedUntil = null;
+          await transaction.$executeRaw`
+            UPDATE "AuthenticationRateLimit"
+            SET "windowStartedAt" = ${row.databaseNow}, count = 0, "deniedCount" = 0,
+                "reservedCount" = 0, "blockedUntil" = NULL, "updatedAt" = clock_timestamp()
+            WHERE action = ${action} AND subject = ${subject}
+          `;
+        }
+        const blocked = row.blockedUntil !== null && row.blockedUntil > row.databaseNow;
+        if (blocked || row.count + row.reservedCount >= policy.limit) {
+          const denied = await transaction.$queryRaw<Array<{ deniedCount: number }>>(Prisma.sql`
+            UPDATE "AuthenticationRateLimit"
+            SET "deniedCount" = "deniedCount" + 1, "updatedAt" = clock_timestamp()
+            WHERE action = ${action} AND subject = ${subject}
+            RETURNING "deniedCount"
+          `);
+          const retryAt = Math.max(
+            row.windowStartedAt.getTime() + policy.windowMs,
+            row.blockedUntil?.getTime() ?? 0
+          );
+          return {
+            allowed: false,
+            retryAfterSeconds: Math.min(3600, Math.max(1, Math.ceil((retryAt - row.databaseNow.getTime()) / 1000))),
+            repeatedExcess: denied[0]!.deniedCount >= 3
+          };
+        }
+        const expiresAt = new Date(row.windowStartedAt.getTime() + policy.windowMs);
+        await transaction.$executeRaw`
+          INSERT INTO "AuthenticationRateLimitReservation" (id, action, subject, "expiresAt")
+          VALUES (${reservationId}::uuid, ${action}, ${subject}, ${expiresAt})
+        `;
+        await transaction.$executeRaw`
+          UPDATE "AuthenticationRateLimit"
+          SET "reservedCount" = "reservedCount" + 1, "updatedAt" = clock_timestamp()
+          WHERE action = ${action} AND subject = ${subject}
+        `;
+        return { allowed: true, retryAfterSeconds: 0, repeatedExcess: false, reservationId };
+      });
+      observeDecision(action, result);
+      return result;
+    },
+    async finalizeCallback(reservationId, outcome) {
+      await client.$transaction(async (transaction) => {
+        const reservations = await transaction.$queryRaw<Array<{
+          action: string;
+          subject: string;
+          expiresAt: Date;
+        }>>(Prisma.sql`
+          SELECT action, subject, "expiresAt"
+          FROM "AuthenticationRateLimitReservation"
+          WHERE id = ${reservationId}::uuid
+        `);
+        const reservation = reservations[0];
+        if (!reservation) return;
+        const buckets = await transaction.$queryRaw<Array<{ windowStartedAt: Date; databaseNow: Date }>>(Prisma.sql`
+          SELECT "windowStartedAt", clock_timestamp() AS "databaseNow"
+          FROM "AuthenticationRateLimit"
+          WHERE action = ${reservation.action} AND subject = ${reservation.subject}
+          FOR UPDATE
+        `);
+        const bucket = buckets[0];
+        if (!bucket) return;
+        const deleted = await transaction.$queryRaw<Array<{ id: string }>>(Prisma.sql`
+          DELETE FROM "AuthenticationRateLimitReservation"
+          WHERE id = ${reservationId}::uuid
+          RETURNING id
+        `);
+        if (!deleted[0]) return;
+        const failureInCurrentWindow = outcome === 'failure'
+          && reservation.expiresAt > bucket.databaseNow
+          && bucket.windowStartedAt.getTime() + AUTH_RATE_LIMIT_POLICIES.callback_failure_ip.windowMs > bucket.databaseNow.getTime();
+        await transaction.$executeRaw`
+          UPDATE "AuthenticationRateLimit"
+          SET "reservedCount" = GREATEST(0, "reservedCount" - 1),
+              count = count + ${failureInCurrentWindow ? 1 : 0},
+              "updatedAt" = clock_timestamp()
+          WHERE action = ${reservation.action} AND subject = ${reservation.subject}
+        `;
+      });
     },
     async cleanup() {
       return client.$executeRaw`

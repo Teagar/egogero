@@ -9,13 +9,18 @@ prefixes. An unparseable trusted-proxy result shares the fail-closed `unknown` b
 | Operation | Limit | External behavior |
 | --- | --- | --- |
 | Login initiation | 5/IP/10 minutes | Generic `429`, bounded `Retry-After` |
-| Failed OIDC callback | 10/IP/15 minutes | State is consumed before denial; no extra provider exchange |
-| Session creation/rotation | 10/account/15 minutes | Denial, progressive PostgreSQL backoff, repeated-excess alert |
+| Failed OIDC callback | 10/IP/15 minutes | State is consumed, then an exact PostgreSQL exchange reservation is acquired before provider I/O |
+| Session creation/rotation | 10/account/15 minutes | Denial, progressive PostgreSQL backoff, repeated-excess alert; recovery revocation happens first |
 | Recovery initiation | 3/IP/30 minutes | Generic `429`, no account input or signal |
 | Reauthentication initiation | 5/account/10 minutes | Generic `429` after authenticated request validation |
 | CSRF/authentication failure | 60/IP/minute | Generic `429` on sustained abuse |
 
-`TRUST_PROXY` accepts only a comma-separated IP/CIDR allowlist. Invalid configuration stops
+Callback reservations are finalized exactly once. Success releases the reservation without
+consuming failure budget; failure converts it into a counted failure. This caps concurrent
+provider exchanges at the remaining failure budget without eventually denying successful
+callbacks. Reservations expire with the counter window and are deleted with their bucket.
+
+`TRUST_PROXY` accepts only a comma-separated IP/CIDR allowlist. Wildcard `/0` networks and invalid configuration stop
 startup. Forwarded addresses are interpreted only by Fastify after the direct peer matches
 that allowlist; untrusted peers cannot select their limiter bucket.
 

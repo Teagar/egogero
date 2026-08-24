@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { randomUUID } from 'node:crypto';
 
 import {
   createAuthTestCollectors,
@@ -17,6 +18,8 @@ import { createPrismaBrowserSessionStore, generateSessionToken } from '../src/se
 test('IP minimization handles IPv4, mapped IPv4, and canonical IPv6 prefixes', () => {
   assert.equal(normalizeIpPrefix('192.0.2.129'), '192.0.2.0/24');
   assert.equal(normalizeIpPrefix('::ffff:192.0.2.129'), '192.0.2.0/24');
+  assert.equal(normalizeIpPrefix('::ffff:c000:0281'), '192.0.2.0/24');
+  assert.equal(normalizeIpPrefix('0:0:0:0:0:ffff:c000:281'), '192.0.2.0/24');
   assert.equal(normalizeIpPrefix('2001:0db8:abcd:1234:5678::1'), '2001:db8:abcd:1234::/64');
   assert.equal(normalizeIpPrefix('not-an-ip'), null);
   assert.equal(normalizeIpPrefix('999.0.0.1'), null);
@@ -25,7 +28,9 @@ test('IP minimization handles IPv4, mapped IPv4, and canonical IPv6 prefixes', (
 test('proxy allowlists fail closed on malformed or broad semantic config', () => {
   assert.equal(trustedProxyFromEnvironment(undefined), false);
   assert.equal(trustedProxyFromEnvironment('127.0.0.1,10.0.0.0/8'), '127.0.0.1,10.0.0.0/8');
-  for (const invalid of [' true', 'true', '127.0.0.1, evil', '10.0.0.0/33', '::1/129', '']) {
+  for (const invalid of [
+    ' true', 'true', '127.0.0.1, evil', '10.0.0.0/33', '::1/129', '0.0.0.0/0', '::/0', ''
+  ]) {
     if (invalid === '') assert.equal(trustedProxyFromEnvironment(invalid), false);
     else assert.throws(() => trustedProxyFromEnvironment(invalid), /TRUST_PROXY/);
   }
@@ -38,7 +43,9 @@ test('Fastify only derives minimized forwarded IP through an explicitly trusted 
       async check(_action, value) {
         subject = value;
         return { allowed: false, retryAfterSeconds: 1, repeatedExcess: false };
-      }
+      },
+      async reserveCallback() { return { allowed: true, retryAfterSeconds: 0, repeatedExcess: false, reservationId: randomUUID() }; },
+      async finalizeCallback() {}
     };
     const app = createApp({
       trustProxy,
@@ -68,7 +75,9 @@ test('recovery initiation is generic, marks recovery intent, and returns Retry-A
         assert.equal(action, 'recovery_ip');
         attempts += 1;
         return { allowed: attempts <= 3, retryAfterSeconds: 60, repeatedExcess: attempts > 5 };
-      }
+      },
+      async reserveCallback() { return { allowed: true, retryAfterSeconds: 0, repeatedExcess: false, reservationId: randomUUID() }; },
+      async finalizeCallback() {}
     },
     oidcService: {
       failurePath: '/auth/error',
@@ -127,7 +136,9 @@ test('aggregate observer emits callback and session SLO alerts with bounded deta
 test('session lookup metrics distinguish database failure from a credential miss', async () => {
   const collectors = createAuthTestCollectors();
   const rateLimiter: AuthRateLimiter = {
-    async check() { return { allowed: true, retryAfterSeconds: 0, repeatedExcess: false }; }
+    async check() { return { allowed: true, retryAfterSeconds: 0, repeatedExcess: false }; },
+    async reserveCallback() { return { allowed: true, retryAfterSeconds: 0, repeatedExcess: false, reservationId: randomUUID() }; },
+    async finalizeCallback() {}
   };
   const failingClient = {
     async $transaction() { throw new Error('database unavailable'); }

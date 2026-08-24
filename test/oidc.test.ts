@@ -316,7 +316,11 @@ test('OIDC callback consumes state but performs no provider exchange after distr
         return consume
           ? { allowed: true, retryAfterSeconds: 0, repeatedExcess: false }
           : { allowed: false, retryAfterSeconds: 30, repeatedExcess: true };
-      }
+      },
+      async reserveCallback() {
+        return { allowed: false, retryAfterSeconds: 30, repeatedExcess: true };
+      },
+      async finalizeCallback() {}
     }
   });
   const authorization = await service.startLogin({ requestCorrelationId: 'limited-login' });
@@ -332,6 +336,41 @@ test('OIDC callback consumes state but performs no provider exchange after distr
   assert.equal(provider.tokenCalls, 0);
   const state = authorization.searchParams.get('state')!;
   assert.equal(database.transactions.get(createHash('sha256').update(state).digest('hex'))!.consumed, true);
+});
+
+test('OIDC callback finalizes exact exchange reservations as success or failure', async () => {
+  const config = configuration();
+  const database = memoryStore();
+  const provider = await mockProvider(config);
+  const finalized: Array<{ reservationId: string; outcome: 'success' | 'failure' }> = [];
+  let sequence = 0;
+  const service = await createOidcService(config, database.store, provider.fetchImplementation, {
+    rateLimiter: {
+      async check() { return { allowed: true, retryAfterSeconds: 0, repeatedExcess: false }; },
+      async reserveCallback() {
+        sequence += 1;
+        return { allowed: true, retryAfterSeconds: 0, repeatedExcess: false, reservationId: `reservation-${sequence}` };
+      },
+      async finalizeCallback(reservationId, outcome) { finalized.push({ reservationId, outcome }); }
+    }
+  });
+
+  const successful = await service.startLogin({ requestCorrelationId: 'reserved-success' });
+  provider.prepare(successful);
+  await service.completeCallback({
+    callbackUrl: callbackUrl(config, successful), requestCorrelationId: 'reserved-success-callback', ipPrefix: '192.0.2.0/24'
+  });
+
+  const failed = await service.startLogin({ requestCorrelationId: 'reserved-failure' });
+  provider.prepare(failed);
+  provider.mode = 'nonce';
+  await assert.rejects(service.completeCallback({
+    callbackUrl: callbackUrl(config, failed), requestCorrelationId: 'reserved-failure-callback', ipPrefix: '192.0.2.0/24'
+  }), OidcCallbackError);
+  assert.deepEqual(finalized, [
+    { reservationId: 'reservation-1', outcome: 'success' },
+    { reservationId: 'reservation-2', outcome: 'failure' }
+  ]);
 });
 
 test('OIDC reauthentication persists trusted intent and requests fresh provider authentication', async () => {

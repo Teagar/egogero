@@ -412,11 +412,24 @@ model AuthenticationRateLimit {
   windowStartedAt DateTime  @default(now()) @db.Timestamptz(3)
   count           Int       @default(0)
   deniedCount     Int       @default(0)
+  reservedCount   Int       @default(0)
   blockedUntil    DateTime? @db.Timestamptz(3)
   updatedAt       DateTime  @default(now()) @db.Timestamptz(3)
+  reservations    AuthenticationRateLimitReservation[]
 
   @@id([action, subject])
   @@index([updatedAt])
+}
+
+model AuthenticationRateLimitReservation {
+  id        String                  @id @default(uuid()) @db.Uuid
+  action    String
+  subject   String
+  createdAt DateTime                @default(now()) @db.Timestamptz(3)
+  expiresAt DateTime                @db.Timestamptz(3)
+  bucket    AuthenticationRateLimit @relation(fields: [action, subject], references: [action, subject], onDelete: Cascade)
+
+  @@index([expiresAt])
 }
 
 enum HumanAccountStatus {

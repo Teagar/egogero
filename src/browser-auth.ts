@@ -58,17 +58,27 @@ export function registerBrowserAuthRoutes(
     return authenticator.authenticate(request);
   }
 
+  async function rejectSessionLookup(request: FastifyRequest, reply: FastifyReply) {
+    reply.header('Set-Cookie', CLEARED_SESSION_COOKIE);
+    const limited = await rateLimiter?.check('authentication_failure_ip', requestIpPrefix(request));
+    if (limited && !limited.allowed) {
+      return reply
+        .header('Retry-After', limited.retryAfterSeconds)
+        .status(429)
+        .send({ error: 'authentication_temporarily_unavailable' });
+    }
+    return reply.status(401).send({ error: 'authentication_required' });
+  }
+
   app.get('/auth/session', unambiguous, async (request, reply) => {
     noStore(reply);
     const token = parseBrowserSessionCookie(request.headers.cookie);
     if (!token) {
-      reply.header('Set-Cookie', CLEARED_SESSION_COOKIE);
-      return reply.status(401).send({ error: 'authentication_required' });
+      return rejectSessionLookup(request, reply);
     }
     const snapshot = await store.inspect({ sessionToken: token, requestCorrelationId: request.id, ipPrefix: requestIpPrefix(request) });
     if (!snapshot) {
-      reply.header('Set-Cookie', CLEARED_SESSION_COOKIE);
-      return reply.status(401).send({ error: 'authentication_required' });
+      return rejectSessionLookup(request, reply);
     }
     return {
       account: snapshot.account,

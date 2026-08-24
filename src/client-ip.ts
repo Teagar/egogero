@@ -38,6 +38,14 @@ export function normalizeIpPrefix(value: string | undefined): string | null {
   if (mapped) return ipv4Prefix(mapped[1]!);
   const hextets = ipv6Hextets(withoutZone);
   if (!hextets) return null;
+  if (hextets.slice(0, 5).every((part) => part === 0) && hextets[5] === 0xffff) {
+    return ipv4Prefix([
+      hextets[6]! >> 8,
+      hextets[6]! & 0xff,
+      hextets[7]! >> 8,
+      hextets[7]! & 0xff
+    ].join('.'));
+  }
   return `${hextets.slice(0, 4).map((part) => part.toString(16)).join(':')}::/64`;
 }
 
@@ -64,7 +72,7 @@ export function trustedProxyFromEnvironment(value: string | undefined): false | 
     if (rawPrefix === undefined) return false;
     if (!/^\d+$/.test(rawPrefix)) return true;
     const prefix = Number(rawPrefix);
-    return prefix < 0 || prefix > (family === 4 ? 32 : 128);
+    return prefix === 0 || prefix > (family === 4 ? 32 : 128);
   })) throw new Error('TRUST_PROXY must be a comma-separated IP/CIDR allowlist');
   return entries.join(',');
 }

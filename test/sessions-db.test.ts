@@ -10,6 +10,7 @@ import {
 } from '../src/sessions.js';
 import type { SessionRuntimeConfig } from '../src/sessions.js';
 import { createPrismaAuthRateLimiter } from '../src/auth-rate-limits.js';
+import type { AuthRateLimiter } from '../src/auth-rate-limits.js';
 
 const runDatabaseTests = process.env.RUN_DATABASE_TESTS === 'true' && Boolean(process.env.DATABASE_URL);
 
@@ -30,8 +31,10 @@ test(
       publicApplicationOrigin: 'https://app.example.test'
     };
     const permissiveRateLimiter = {
-      async check() { return { allowed: true, retryAfterSeconds: 0, repeatedExcess: false }; }
-    };
+      async check() { return { allowed: true, retryAfterSeconds: 0, repeatedExcess: false }; },
+      async reserveCallback() { return { allowed: true, retryAfterSeconds: 0, repeatedExcess: false, reservationId: randomUUID() }; },
+      async finalizeCallback() {}
+    } satisfies AuthRateLimiter;
     const store = createPrismaBrowserSessionStore(prisma, config, { rateLimiter: permissiveRateLimiter });
     const accountId = randomUUID();
     const externalIdentityId = randomUUID();
@@ -569,7 +572,7 @@ test(
   }
 );
 
-test('recovery handoff revokes every old session, increments account version, and issues a fresh family', { skip: !runDatabaseTests }, async () => {
+test('recovery always revokes old sessions before an exhausted replacement-session limit', { skip: !runDatabaseTests }, async () => {
   const prisma = new PrismaClient();
   const accountId = randomUUID();
   const identityId = randomUUID();
@@ -612,15 +615,21 @@ test('recovery handoff revokes every old session, increments account version, an
     });
     const first = await store.issueFromHandoff({ handoffToken: await handoff(false), requestCorrelationId: 'initial' });
     assert.ok(first);
+    const limiter = createPrismaAuthRateLimiter(prisma);
+    for (let index = 1; index < 10; index += 1) {
+      assert.equal((await limiter.check('session_creation_account', accountId)).allowed, true);
+    }
     const recovered = await store.issueFromHandoff({
       handoffToken: await handoff(true), oldSessionToken: first.sessionToken, requestCorrelationId: 'recovery'
     });
-    assert.ok(recovered);
-    assert.notEqual(recovered.identity.sessionId, first.identity.sessionId);
+    assert.equal(recovered, null, 'replacement issuance remains rate limited');
     assert.equal(await store.authenticate(first.sessionToken, 'old-after-recovery'), null);
     assert.equal((await prisma.humanAccount.findUniqueOrThrow({ where: { id: accountId } })).sessionVersion, 1);
     assert.equal(await prisma.authenticationAuditEvent.count({
       where: { accountId, eventType: 'credential_recovery_observed', outcome: 'success' }
+    }), 1);
+    assert.equal(await prisma.authenticationAuditEvent.count({
+      where: { accountId, eventType: 'session_issue_denied', reasonCode: 'session_creation_rate_limited' }
     }), 1);
   } finally {
     await prisma.authenticationRateLimit.deleteMany({ where: { subject: accountId } });
