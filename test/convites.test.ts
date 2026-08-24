@@ -525,6 +525,40 @@ test('gatehouse validation is portaria-only, tenant-scoped, non-oracular, and mi
   await app.close();
 });
 
+test('human portaria fails closed before device limiting or immutable device audit', async () => {
+  const store = uniqueMemoryStore(['123456']);
+  let limiterCalls = 0;
+  const app = Fastify({ logger: false });
+  registerConviteRoutes(
+    app,
+    batchStore(),
+    store,
+    {
+      async authenticate() {
+        return {
+          principalType: 'human' as const,
+          authMethod: 'oidc-session' as const,
+          accountId: uuid(900),
+          sessionId: uuid(901),
+          id: uuid(900),
+          role: 'portaria' as const,
+          condominioIds: [CONDOMINIO_ID]
+        };
+      }
+    },
+    undefined,
+    undefined,
+    { async consume() { limiterCalls += 1; throw new Error('human reached device limiter'); } }
+  );
+  const response = await app.inject({
+    method: 'POST', url: '/portaria/convites/validar', payload: { token: '123456', tipoAcesso: 'pedestre' }
+  });
+  assert.equal(response.statusCode, 403);
+  assert.equal(limiterCalls, 0);
+  assert.equal(store.audits.length, 0);
+  await app.close();
+});
+
 test('gatehouse validation never logs or returns the bearer token', async () => {
   const token = '246810';
   const logs: string[] = [];

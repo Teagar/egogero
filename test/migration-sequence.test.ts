@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { readdir } from 'node:fs/promises';
+import { readFile, readdir } from 'node:fs/promises';
 import test from 'node:test';
 
 const migrationsPath = new URL('../prisma/migrations/', import.meta.url);
@@ -24,6 +24,16 @@ test('migrations form one exact contiguous immutable sequence', async () => {
     '0015_add_invitation_idempotency_outbox',
     '0016_add_delivery_worker_leases',
     '0017_add_human_authentication_schema',
-    '0018_add_oidc_validated_handoff'
+    '0018_add_oidc_validated_handoff',
+    '0019_add_oidc_reauthentication_intent'
   ]);
+});
+
+test('reauthentication migration binds trusted intent to a UUID family in both handoff stages', async () => {
+  const sql = await readFile(new URL(
+    '../prisma/migrations/0019_add_oidc_reauthentication_intent/migration.sql',
+    import.meta.url
+  ), 'utf8');
+  assert.equal((sql.match(/"reauthenticationFamilyId" UUID/g) ?? []).length, 2);
+  assert.equal((sql.match(/"reauthenticationIntent" = \("reauthenticationFamilyId" IS NOT NULL\)/g) ?? []).length, 2);
 });

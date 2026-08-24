@@ -1113,6 +1113,10 @@ export function registerConviteRoutes(
     if (!condominiumId || !identity) {
       return reply.status(403).send({ error: 'Forbidden' });
     }
+    // This legacy route persists a required Dispositivo actor. Human portaria must use a future human-audit route.
+    if (identity.authMethod === 'oidc-session') {
+      return reply.status(403).send({ error: 'Forbidden' });
+    }
     if (identity.id.length === 0 || identity.id.length > 128) {
       return reply.status(403).send({ error: 'Forbidden' });
     }

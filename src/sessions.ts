@@ -30,7 +30,32 @@ const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{
 export type SessionRuntimeConfig = {
   currentCsrfKeyVersion: number;
   csrfKeys: ReadonlyMap<number, Buffer>;
+  publicApplicationOrigin: string;
 };
+
+export type BrowserSessionSnapshot = {
+  identity: HumanSessionIdentity;
+  familyId: string;
+  account: { id: string; displayName: string };
+  memberships: Array<{
+    id: string;
+    role: Role;
+    tenantId: string | null;
+    residentId: string | null;
+  }>;
+  activeTenantId: string | null;
+  csrfToken: string;
+  csrfDigest: Buffer;
+  expiresAt: Date;
+  idleExpiresAt: Date;
+  authenticatedAt: Date;
+};
+
+declare module 'fastify' {
+  interface FastifyRequest {
+    browserSessionSnapshot?: BrowserSessionSnapshot;
+  }
+}
 
 export type IssuedBrowserSession = {
   sessionToken: string;
@@ -52,11 +77,14 @@ export type SessionRequestContext = {
 };
 
 export interface BrowserSessionStore {
+  readonly publicApplicationOrigin: string;
   issueFromHandoff(input: SessionRequestContext & {
     handoffToken: string;
     oldSessionToken?: string;
   }): Promise<IssuedBrowserSession | null>;
-  authenticate(sessionToken: string, requestCorrelationId: string): Promise<HumanSessionIdentity | null>;
+  authenticate(sessionToken: string, requestCorrelationId: string, extendIdle?: boolean): Promise<HumanSessionIdentity | null>;
+  inspect(input: SessionRequestContext & { sessionToken: string; extendIdle?: boolean }): Promise<BrowserSessionSnapshot | null>;
+  isRevoked(sessionToken: string): Promise<boolean>;
   rotate(input: SessionRequestContext & {
     sessionToken: string;
     targetMembershipId?: string;
@@ -65,15 +93,18 @@ export interface BrowserSessionStore {
     sessionToken: string;
     reason?: string;
   }): Promise<SessionRevocationResult>;
-  revokeAll(input: SessionRequestContext & { accountId: string }): Promise<number>;
+  revokeAll(input: SessionRequestContext & { sessionToken: string }): Promise<'revoked' | 'reauthentication-required' | 'unavailable'>;
   recordAmbiguousCredentials(input: SessionRequestContext): Promise<void>;
+  recordCsrfFailure?(input: SessionRequestContext): Promise<void>;
 }
 
 export interface BrowserSessionService {
   issueFromHandoff(input: Parameters<BrowserSessionStore['issueFromHandoff']>[0]): Promise<IssuedBrowserSession | null>;
+  inspect(input: Parameters<BrowserSessionStore['inspect']>[0]): Promise<BrowserSessionSnapshot | null>;
+  isRevoked(sessionToken: string): Promise<boolean>;
   rotate(input: Parameters<BrowserSessionStore['rotate']>[0]): Promise<SessionRotationResult>;
   revoke(input: Parameters<BrowserSessionStore['revoke']>[0]): Promise<SessionRevocationResult>;
-  revokeAll(input: Parameters<BrowserSessionStore['revokeAll']>[0]): Promise<number>;
+  revokeAll(input: Parameters<BrowserSessionStore['revokeAll']>[0]): ReturnType<BrowserSessionStore['revokeAll']>;
   sessionCookie(sessionToken: string): string;
   clearSessionCookie(): string;
 }
@@ -92,6 +123,7 @@ type SessionRow = MembershipRow & {
   accountSessionVersion: number;
   currentSessionVersion: number;
   accountStatus: string;
+  accountDisplayName: string;
   membershipStatus: string;
   condominiumDeletedAt: Date | null;
   residentDeletedAt: Date | null;
@@ -173,7 +205,18 @@ export function sessionConfigFromEnvironment(environment: NodeJS.ProcessEnv): Se
     || !csrfKeys.has(currentCsrfKeyVersion)) {
     throw new Error('SESSION_CSRF_CURRENT_KEY_VERSION must identify an active key');
   }
-  return { currentCsrfKeyVersion, csrfKeys };
+  const rawOrigin = requireEnvironment(environment, 'PUBLIC_APPLICATION_ORIGIN');
+  let origin: URL;
+  try {
+    origin = new URL(rawOrigin);
+  } catch {
+    throw new Error('PUBLIC_APPLICATION_ORIGIN must be an exact HTTPS origin');
+  }
+  if (origin.protocol !== 'https:' || origin.username || origin.password || origin.pathname !== '/'
+    || origin.search || origin.hash || origin.origin !== rawOrigin) {
+    throw new Error('PUBLIC_APPLICATION_ORIGIN must be an exact HTTPS origin');
+  }
+  return { currentCsrfKeyVersion, csrfKeys, publicApplicationOrigin: rawOrigin };
 }
 
 export function generateSessionToken() {
@@ -227,8 +270,14 @@ function csrfAad(sessionId: string, accountId: string) {
   }));
 }
 
-function encryptCsrf(config: SessionRuntimeConfig, sessionId: string, accountId: string, plaintext: Buffer) {
-  const key = config.csrfKeys.get(config.currentCsrfKeyVersion);
+function encryptCsrf(
+  config: SessionRuntimeConfig,
+  sessionId: string,
+  accountId: string,
+  plaintext: Buffer,
+  keyVersion = config.currentCsrfKeyVersion
+) {
+  const key = config.csrfKeys.get(keyVersion);
   if (!key) throw new Error('Current session CSRF key is unavailable');
   const nonce = randomBytes(12);
   const cipher = createCipheriv('aes-256-gcm', key, nonce);
@@ -237,7 +286,7 @@ function encryptCsrf(config: SessionRuntimeConfig, sessionId: string, accountId:
     ciphertext: Buffer.concat([cipher.update(plaintext), cipher.final()]),
     nonce,
     authTag: cipher.getAuthTag(),
-    keyVersion: config.currentCsrfKeyVersion
+    keyVersion
   };
 }
 
@@ -388,11 +437,12 @@ async function insertSession(
     absoluteExpiresAt?: Date;
     tokenDigest: Buffer;
     csrf: Buffer;
+    csrfKeyVersion?: number;
     ipPrefix: string | null;
     userAgentHash: Buffer | null;
   }
 ) {
-  const encrypted = encryptCsrf(config, input.id, input.accountId, input.csrf);
+  const encrypted = encryptCsrf(config, input.id, input.accountId, input.csrf, input.csrfKeyVersion);
   const rows = await transaction.$queryRaw<Array<{ createdAt: Date; absoluteExpiresAt: Date }>>(Prisma.sql`
     WITH db_clock AS MATERIALIZED (SELECT clock_timestamp() AS now)
     INSERT INTO "BrowserSession" (
@@ -439,7 +489,7 @@ async function loadSession(transaction: Prisma.TransactionClient, tokenDigest: B
   const rows = await transaction.$queryRaw<SessionRow[]>(Prisma.sql`
     SELECT session.id AS "sessionId", session."familyId", session."accountId",
            session."accountSessionVersion", account."sessionVersion" AS "currentSessionVersion",
-           account.status::text AS "accountStatus", membership.id,
+           account.status::text AS "accountStatus", account."displayName" AS "accountDisplayName", membership.id,
            membership."accountId", membership.role, membership.status::text AS "membershipStatus",
            membership."condominioId", membership."residentId",
            condominium."deletedAt" AS "condominiumDeletedAt",
@@ -461,6 +511,24 @@ async function loadSession(transaction: Prisma.TransactionClient, tokenDigest: B
     ${lockSql}
   `);
   return rows[0] ?? null;
+}
+
+async function touchSession(transaction: Prisma.TransactionClient, session: SessionRow) {
+  if (session.lastSeenAt.getTime() > session.databaseNow.getTime() - SESSION_TOUCH_INTERVAL_MS) {
+    return session.idleExpiresAt;
+  }
+  const touched = await transaction.$queryRaw<Array<{ idleExpiresAt: Date }>>(Prisma.sql`
+    UPDATE "BrowserSession"
+    SET "lastSeenAt" = clock_timestamp(),
+        "idleExpiresAt" = LEAST(clock_timestamp() + interval '30 minutes', "absoluteExpiresAt")
+    WHERE id = ${session.sessionId}::uuid
+      AND "revokedAt" IS NULL
+      AND "lastSeenAt" <= clock_timestamp() - interval '5 minutes'
+      AND "idleExpiresAt" > clock_timestamp()
+      AND "absoluteExpiresAt" > clock_timestamp()
+    RETURNING "idleExpiresAt"
+  `);
+  return touched[0]?.idleExpiresAt ?? session.idleExpiresAt;
 }
 
 export function createPrismaBrowserSessionStore(client: PrismaClient, config: SessionRuntimeConfig): BrowserSessionStore {
@@ -494,6 +562,7 @@ export function createPrismaBrowserSessionStore(client: PrismaClient, config: Se
   }
 
   return {
+    publicApplicationOrigin: config.publicApplicationOrigin,
     async issueFromHandoff(input) {
       const request = input;
       if (!validSessionToken(input.handoffToken)
@@ -509,13 +578,16 @@ export function createPrismaBrowserSessionStore(client: PrismaClient, config: Se
           accountId: string;
           externalIdentityId: string;
           authenticatedAt: Date;
+          reauthenticationIntent: boolean;
+          reauthenticationFamilyId: string | null;
         }>>(Prisma.sql`
           UPDATE "OidcValidatedHandoff"
           SET "consumedAt" = clock_timestamp()
           WHERE "handleDigest" = ${digest(input.handoffToken)}
             AND "consumedAt" IS NULL
             AND "expiresAt" > clock_timestamp()
-          RETURNING "accountId", "externalIdentityId", "authenticatedAt"
+          RETURNING "accountId", "externalIdentityId", "authenticatedAt", "reauthenticationIntent",
+                    "reauthenticationFamilyId"
         `);
         const handoff = handoffs[0];
         if (!handoff) {
@@ -523,6 +595,12 @@ export function createPrismaBrowserSessionStore(client: PrismaClient, config: Se
           return null;
         }
 
+        const oldCandidate = input.oldSessionToken
+          ? await loadSession(transaction, digest(input.oldSessionToken), false)
+          : null;
+        const accountIds = oldCandidate && oldCandidate.accountId !== handoff.accountId
+          ? [handoff.accountId, oldCandidate.accountId].sort()
+          : [handoff.accountId];
         const accounts = await transaction.$queryRaw<Array<{
           id: string;
           sessionVersion: number;
@@ -531,10 +609,11 @@ export function createPrismaBrowserSessionStore(client: PrismaClient, config: Se
         }>>(Prisma.sql`
           SELECT id, "sessionVersion", status::text, clock_timestamp() AS "databaseNow"
           FROM "HumanAccount"
-          WHERE id = ${handoff.accountId}::uuid
+          WHERE id IN (${Prisma.join(accountIds.map((id) => Prisma.sql`${id}::uuid`))})
+          ORDER BY id
           FOR UPDATE
         `);
-        const account = accounts[0];
+        const account = accounts.find((candidate) => candidate.id === handoff.accountId);
         if (!account || account.status !== 'active') {
           await insertAudit(transaction, {
             eventType: 'session_issue_denied', outcome: 'denied', reasonCode: 'account_inactive',
@@ -543,6 +622,59 @@ export function createPrismaBrowserSessionStore(client: PrismaClient, config: Se
             userAgentHash: userAgentDigest(input.userAgent)
           });
           return null;
+        }
+        const oldSession = input.oldSessionToken && oldCandidate
+          ? await loadSession(transaction, digest(input.oldSessionToken), true)
+          : null;
+        if (handoff.reauthenticationIntent) {
+          if (!oldSession || oldSession.accountId !== account.id
+            || handoff.reauthenticationFamilyId !== oldSession.familyId
+            || sessionDenialReason(oldSession)) {
+            await insertAudit(transaction, {
+              eventType: 'session_reauthentication_denied', outcome: 'denied',
+              reasonCode: 'invalid_session', requestCorrelationId: input.requestCorrelationId,
+              accountId: account.id, externalIdentityId: handoff.externalIdentityId,
+              ipPrefix: input.ipPrefix, userAgentHash: userAgentDigest(input.userAgent)
+            });
+            return null;
+          }
+          const membership = await loadTargetMembership(transaction, account.id, oldSession.id);
+          const csrf = decryptCsrf(config, oldSession);
+          if (!membership || !csrf) {
+            csrf?.fill(0);
+            await auditDenied(transaction, input, 'session_reauthentication_denied', 'session_integrity_failed', oldSession);
+            return null;
+          }
+          const revoked = await transaction.$executeRaw`
+            UPDATE "BrowserSession" SET "revokedAt" = clock_timestamp(), "revokeReason" = 'reauthenticated'
+            WHERE id = ${oldSession.sessionId}::uuid AND "revokedAt" IS NULL
+          `;
+          if (revoked !== 1) {
+            csrf.fill(0);
+            return null;
+          }
+          const sessionToken = generateSessionToken();
+          const sessionId = randomUUID();
+          const stored = await createPersistedSession(transaction, {
+            id: sessionId, familyId: oldSession.familyId, accountId: account.id,
+            accountSessionVersion: oldSession.accountSessionVersion, membershipId: membership.id,
+            authenticatedAt: handoff.authenticatedAt, absoluteExpiresAt: oldSession.absoluteExpiresAt,
+            csrfKeyVersion: Math.max(config.currentCsrfKeyVersion, oldSession.csrfKeyVersion),
+            csrf, ipPrefix: input.ipPrefix ?? oldSession.ipPrefix,
+            userAgentHash: input.userAgent === undefined ? oldSession.userAgentHash : userAgentDigest(input.userAgent)
+          }, sessionToken);
+          await insertAudit(transaction, {
+            eventType: 'session_reauthenticated', outcome: 'success', requestCorrelationId: input.requestCorrelationId,
+            accountId: account.id, externalIdentityId: handoff.externalIdentityId, sessionId,
+            membershipId: membership.id, condominioId: membership.condominioId,
+            ipPrefix: input.ipPrefix, userAgentHash: userAgentDigest(input.userAgent)
+          });
+          const result = {
+            sessionToken, csrfToken: csrf.toString('base64url'), identity: identityFor(sessionId, membership),
+            absoluteExpiresAt: stored.absoluteExpiresAt
+          };
+          csrf.fill(0);
+          return result;
         }
         const membership = await chooseMembership(transaction, account.id);
         if (!membership) {
@@ -563,6 +695,25 @@ export function createPrismaBrowserSessionStore(client: PrismaClient, config: Se
             userAgentHash: userAgentDigest(input.userAgent)
           });
           return null;
+        }
+
+        if (oldSession) {
+          const revoked = await transaction.$executeRaw`
+            UPDATE "BrowserSession"
+            SET "revokedAt" = clock_timestamp(), "revokeReason" = 'login_replaced'
+            WHERE "familyId" = ${oldSession.familyId}::uuid
+              AND "accountId" = ${oldSession.accountId}::uuid
+              AND "revokedAt" IS NULL
+          `;
+          if (revoked > 0) {
+            await insertAudit(transaction, {
+              eventType: 'session_family_replaced', outcome: 'success', reasonCode: 'login_replaced',
+              requestCorrelationId: input.requestCorrelationId, accountId: oldSession.accountId,
+              sessionId: oldSession.sessionId, membershipId: oldSession.id,
+              condominioId: oldSession.condominioId, ipPrefix: input.ipPrefix,
+              userAgentHash: userAgentDigest(input.userAgent), metadata: { revokedSessions: revoked }
+            });
+          }
         }
 
         const sessionToken = generateSessionToken();
@@ -588,32 +739,6 @@ export function createPrismaBrowserSessionStore(client: PrismaClient, config: Se
           metadata: { authenticationMethod: 'oidc' }
         });
 
-        if (input.oldSessionToken) {
-          const replaced = await transaction.$queryRaw<Array<{
-            id: string;
-            accountId: string;
-            activeMembershipId: string;
-            condominioId: string | null;
-          }>>(Prisma.sql`
-            UPDATE "BrowserSession" old_session
-            SET "revokedAt" = clock_timestamp(), "revokeReason" = 'login_replaced'
-            FROM "HumanMembership" membership
-            WHERE old_session."tokenDigest" = ${digest(input.oldSessionToken)}
-              AND old_session."revokedAt" IS NULL
-              AND membership.id = old_session."activeMembershipId"
-            RETURNING old_session.id, old_session."accountId", old_session."activeMembershipId", membership."condominioId"
-          `);
-          if (replaced[0]) {
-            await insertAudit(transaction, {
-              eventType: 'session_revoked', outcome: 'success', reasonCode: 'login_replaced',
-              requestCorrelationId: input.requestCorrelationId, accountId: replaced[0].accountId,
-              sessionId: replaced[0].id, membershipId: replaced[0].activeMembershipId,
-              condominioId: replaced[0].condominioId, ipPrefix: input.ipPrefix,
-              userAgentHash: userAgentDigest(input.userAgent)
-            });
-          }
-        }
-
         const result = {
           sessionToken,
           csrfToken: csrf.toString('base64url'),
@@ -625,7 +750,7 @@ export function createPrismaBrowserSessionStore(client: PrismaClient, config: Se
       });
     },
 
-    async authenticate(sessionToken, requestCorrelationId) {
+    async authenticate(sessionToken, requestCorrelationId, extendIdle = true) {
       const request = { requestCorrelationId };
       if (!validSessionToken(sessionToken)) return null;
       return client.$transaction(async (transaction) => {
@@ -639,19 +764,81 @@ export function createPrismaBrowserSessionStore(client: PrismaClient, config: Se
           await auditDenied(transaction, request, 'session_authentication_denied', reason, session);
           return null;
         }
-        if (session.lastSeenAt.getTime() <= session.databaseNow.getTime() - SESSION_TOUCH_INTERVAL_MS) {
+        if (extendIdle) await touchSession(transaction, session);
+        return identityFor(session.sessionId, session);
+      });
+    },
+
+    async isRevoked(sessionToken) {
+      if (!validSessionToken(sessionToken)) return false;
+      const rows = await client.$queryRaw<Array<{ revoked: boolean }>>(Prisma.sql`
+        SELECT "revokedAt" IS NOT NULL AS revoked
+        FROM "BrowserSession"
+        WHERE "tokenDigest" = ${digest(sessionToken)}
+      `);
+      return rows[0]?.revoked === true;
+    },
+
+    async inspect(input) {
+      if (!validSessionToken(input.sessionToken)) return null;
+      return client.$transaction(async (transaction) => {
+        const session = await loadSession(transaction, digest(input.sessionToken), true);
+        if (!session) {
+          await auditDenied(transaction, input, 'session_authentication_denied', 'invalid_session');
+          return null;
+        }
+        const reason = sessionDenialReason(session);
+        if (reason) {
+          await auditDenied(transaction, input, 'session_authentication_denied', reason, session);
+          return null;
+        }
+        const csrf = decryptCsrf(config, session);
+        if (!csrf) {
+          await auditDenied(transaction, input, 'session_authentication_denied', 'csrf_integrity_failed', session);
+          return null;
+        }
+        if (session.csrfKeyVersion < config.currentCsrfKeyVersion) {
+          const encrypted = encryptCsrf(config, session.sessionId, session.accountId, csrf);
           await transaction.$executeRaw`
             UPDATE "BrowserSession"
-            SET "lastSeenAt" = clock_timestamp(),
-                "idleExpiresAt" = LEAST(clock_timestamp() + interval '30 minutes', "absoluteExpiresAt")
-            WHERE id = ${session.sessionId}::uuid
-              AND "revokedAt" IS NULL
-              AND "lastSeenAt" <= clock_timestamp() - interval '5 minutes'
-              AND "idleExpiresAt" > clock_timestamp()
-              AND "absoluteExpiresAt" > clock_timestamp()
+            SET "csrfCiphertext" = ${encrypted.ciphertext}, "csrfNonce" = ${encrypted.nonce},
+                "csrfAuthTag" = ${encrypted.authTag}, "csrfKeyVersion" = ${encrypted.keyVersion}
+            WHERE id = ${session.sessionId}::uuid AND "csrfKeyVersion" = ${session.csrfKeyVersion}
           `;
         }
-        return identityFor(session.sessionId, session);
+        const idleExpiresAt = input.extendIdle === false
+          ? session.idleExpiresAt
+          : await touchSession(transaction, session);
+        const memberships = await transaction.$queryRaw<MembershipRow[]>(Prisma.sql`
+          SELECT membership.id, membership."accountId", membership.role,
+                 membership."condominioId", membership."residentId"
+          FROM "HumanMembership" membership
+          LEFT JOIN "Condominio" condominium ON condominium.id = membership."condominioId"
+          LEFT JOIN "Morador" resident ON resident.id = membership."residentId"
+            AND resident."condominioId" = membership."condominioId"
+          WHERE membership."accountId" = ${session.accountId}::uuid
+            AND ${liveMembershipCondition('membership')}
+          ORDER BY membership."createdAt", membership.id
+        `);
+        const snapshot: BrowserSessionSnapshot = {
+          identity: identityFor(session.sessionId, session),
+          familyId: session.familyId,
+          account: { id: session.accountId, displayName: session.accountDisplayName },
+          memberships: memberships.map((membership) => ({
+            id: membership.id,
+            role: membership.role,
+            tenantId: membership.condominioId,
+            residentId: membership.residentId
+          })),
+          activeTenantId: session.condominioId,
+          csrfToken: csrf.toString('base64url'),
+          csrfDigest: Buffer.from(session.csrfDigest),
+          expiresAt: session.absoluteExpiresAt,
+          idleExpiresAt,
+          authenticatedAt: session.authenticatedAt
+        };
+        csrf.fill(0);
+        return snapshot;
       });
     },
 
@@ -721,6 +908,7 @@ export function createPrismaBrowserSessionStore(client: PrismaClient, config: Se
           membershipId: membership.id,
           authenticatedAt: session.authenticatedAt,
           absoluteExpiresAt: session.absoluteExpiresAt,
+          csrfKeyVersion: Math.max(config.currentCsrfKeyVersion, session.csrfKeyVersion),
           csrf,
           ipPrefix: input.ipPrefix ?? session.ipPrefix,
           userAgentHash: input.userAgent === undefined ? session.userAgentHash : userAgentDigest(input.userAgent)
@@ -749,21 +937,21 @@ export function createPrismaBrowserSessionStore(client: PrismaClient, config: Se
           await auditDenied(transaction, input, 'session_revocation_denied', 'invalid_session');
           return 'unavailable';
         }
-        if (session.revokedAt) return 'already-revoked';
         const reason = input.reason && /^[a-z][a-z0-9_]{0,99}$/.test(input.reason)
           ? input.reason
           : 'user_logout';
-        await transaction.$executeRaw`
+        const revoked = await transaction.$executeRaw`
           UPDATE "BrowserSession"
           SET "revokedAt" = clock_timestamp(), "revokeReason" = ${reason}
-          WHERE id = ${session.sessionId}::uuid AND "revokedAt" IS NULL
+          WHERE "familyId" = ${session.familyId}::uuid AND "revokedAt" IS NULL
         `;
+        if (revoked === 0) return 'already-revoked';
         await insertAudit(transaction, {
           eventType: 'session_revoked', outcome: 'success', reasonCode: reason,
           requestCorrelationId: input.requestCorrelationId, accountId: session.accountId,
           sessionId: session.sessionId, membershipId: session.id,
           condominioId: session.condominioId, ipPrefix: input.ipPrefix,
-          userAgentHash: userAgentDigest(input.userAgent)
+          userAgentHash: userAgentDigest(input.userAgent), metadata: { revokedSessions: revoked }
         });
         return 'revoked';
       });
@@ -771,32 +959,46 @@ export function createPrismaBrowserSessionStore(client: PrismaClient, config: Se
 
     async revokeAll(input) {
       return client.$transaction(async (transaction) => {
-        if (!UUID_PATTERN.test(input.accountId)) {
-          await auditDenied(transaction, input, 'session_revoke_all_denied', 'account_not_found');
-          return 0;
+        if (!validSessionToken(input.sessionToken)) return 'unavailable';
+        const tokenDigest = digest(input.sessionToken);
+        const candidate = await loadSession(transaction, tokenDigest, false);
+        if (candidate) {
+          await transaction.$queryRaw(Prisma.sql`
+            SELECT id FROM "HumanAccount" WHERE id = ${candidate.accountId}::uuid FOR UPDATE
+          `);
+        }
+        const session = await loadSession(transaction, tokenDigest, true);
+        const denialReason = session ? sessionDenialReason(session) : 'invalid_session';
+        if (!session || (denialReason && denialReason !== 'session_revoked')) {
+          await auditDenied(transaction, input, 'session_revoke_all_denied', 'invalid_session', session);
+          return 'unavailable';
+        }
+        if (session.authenticatedAt.getTime() < session.databaseNow.getTime() - 10 * 60 * 1000) {
+          await auditDenied(transaction, input, 'session_revoke_all_denied', 'reauthentication_required', session);
+          return 'reauthentication-required';
         }
         const accounts = await transaction.$queryRaw<Array<{ id: string }>>(Prisma.sql`
           UPDATE "HumanAccount"
           SET "sessionVersion" = "sessionVersion" + 1, "updatedAt" = clock_timestamp()
-          WHERE id = ${input.accountId}::uuid
+          WHERE id = ${session.accountId}::uuid
           RETURNING id
         `);
         if (!accounts[0]) {
           await auditDenied(transaction, input, 'session_revoke_all_denied', 'account_not_found');
-          return 0;
+          return 'unavailable';
         }
         const revoked = await transaction.$executeRaw`
           UPDATE "BrowserSession"
           SET "revokedAt" = clock_timestamp(), "revokeReason" = 'all_sessions_revoked'
-          WHERE "accountId" = ${input.accountId}::uuid AND "revokedAt" IS NULL
+          WHERE "accountId" = ${session.accountId}::uuid AND "revokedAt" IS NULL
         `;
         await insertAudit(transaction, {
           eventType: 'session_revoke_all', outcome: 'success', reasonCode: 'all_sessions_revoked',
-          requestCorrelationId: input.requestCorrelationId, accountId: input.accountId,
+          requestCorrelationId: input.requestCorrelationId, accountId: session.accountId,
           ipPrefix: input.ipPrefix, userAgentHash: userAgentDigest(input.userAgent),
           metadata: { revokedSessions: revoked }
         });
-        return revoked;
+        return 'revoked';
       });
     },
 
@@ -809,6 +1011,17 @@ export function createPrismaBrowserSessionStore(client: PrismaClient, config: Se
         ipPrefix: input.ipPrefix,
         userAgentHash: userAgentDigest(input.userAgent)
       }));
+    },
+
+    async recordCsrfFailure(input) {
+      await client.$transaction((transaction) => insertAudit(transaction, {
+        eventType: 'csrf_validation_failed',
+        outcome: 'denied',
+        reasonCode: 'invalid_request_evidence',
+        requestCorrelationId: input.requestCorrelationId,
+        ipPrefix: input.ipPrefix,
+        userAgentHash: userAgentDigest(input.userAgent)
+      }));
     }
   };
 }
@@ -816,6 +1029,8 @@ export function createPrismaBrowserSessionStore(client: PrismaClient, config: Se
 export function createBrowserSessionService(store: BrowserSessionStore): BrowserSessionService {
   return {
     issueFromHandoff: (input) => store.issueFromHandoff(input),
+    inspect: (input) => store.inspect(input),
+    isRevoked: (sessionToken) => store.isRevoked(sessionToken),
     rotate: (input) => store.rotate(input),
     revoke: (input) => store.revoke(input),
     revokeAll: (input) => store.revokeAll(input),
@@ -835,15 +1050,78 @@ export function createBrowserSessionAuthenticator(store: BrowserSessionStore): A
           'set-cookie': CLEARED_SESSION_COOKIE
         });
       }
+      if (!['GET', 'HEAD', 'OPTIONS'].includes(request.method)) {
+        const identity = await store.authenticate(token, request.id, false);
+        if (!identity) {
+          throw new AuthenticationError(401, 'authentication_required', {
+            'cache-control': 'no-store',
+            'set-cookie': CLEARED_SESSION_COOKIE
+          });
+        }
+        const origin = typeof request.headers.origin === 'string' ? request.headers.origin : null;
+        const referer = typeof request.headers.referer === 'string' ? request.headers.referer : null;
+        let refererOrigin: string | null = null;
+        try {
+          if (referer) {
+            const parsedReferer = new URL(referer);
+            refererOrigin = !parsedReferer.username && !parsedReferer.password ? parsedReferer.origin : null;
+          }
+        } catch {
+          refererOrigin = null;
+        }
+        const contentType = typeof request.headers['content-type'] === 'string'
+          ? request.headers['content-type']
+          : '';
+        const csrfHeader = request.headers['x-csrf-token'];
+        const decodedCsrf = typeof csrfHeader === 'string' && /^[A-Za-z0-9_-]{43}$/.test(csrfHeader)
+          ? Buffer.from(csrfHeader, 'base64url')
+          : null;
+        const suppliedCsrf = decodedCsrf?.length === 32 && decodedCsrf.toString('base64url') === csrfHeader
+          ? decodedCsrf
+          : null;
+        if (!suppliedCsrf) decodedCsrf?.fill(0);
+        const evidenceValid = (origin === store.publicApplicationOrigin
+            || (origin === null && refererOrigin === store.publicApplicationOrigin))
+          && /^application\/json(?:\s*;\s*charset=[A-Za-z0-9._-]+)?$/i.test(contentType)
+          && suppliedCsrf?.length === 32;
+        const snapshot = evidenceValid
+          ? await store.inspect({ sessionToken: token, requestCorrelationId: request.id, extendIdle: false })
+          : null;
+        if (evidenceValid && !snapshot) {
+          suppliedCsrf?.fill(0);
+          throw new AuthenticationError(401, 'authentication_required', {
+            'cache-control': 'no-store',
+            'set-cookie': CLEARED_SESSION_COOKIE
+          });
+        }
+        const suppliedDigest = suppliedCsrf ? digest(suppliedCsrf) : null;
+        const csrfValid = suppliedDigest && snapshot?.csrfDigest.length === suppliedDigest.length
+          && timingSafeEqual(suppliedDigest, snapshot.csrfDigest);
+        suppliedCsrf?.fill(0);
+        suppliedDigest?.fill(0);
+        if (!csrfValid) {
+          await store.recordCsrfFailure?.({
+            requestCorrelationId: request.id,
+            userAgent: typeof request.headers['user-agent'] === 'string' ? request.headers['user-agent'] : null
+          });
+          throw new AuthenticationError(403, 'csrf_required', { 'cache-control': 'no-store' });
+        }
+        const finalIdentity = await store.authenticate(token, request.id, true);
+        if (!finalIdentity) {
+          throw new AuthenticationError(401, 'authentication_required', {
+            'cache-control': 'no-store',
+            'set-cookie': CLEARED_SESSION_COOKIE
+          });
+        }
+        request.browserSessionSnapshot = snapshot;
+        return finalIdentity;
+      }
       const identity = await store.authenticate(token, request.id);
       if (!identity) {
         throw new AuthenticationError(401, 'authentication_required', {
           'cache-control': 'no-store',
           'set-cookie': CLEARED_SESSION_COOKIE
         });
-      }
-      if (!['GET', 'HEAD', 'OPTIONS'].includes(request.method)) {
-        throw new AuthenticationError(403, 'csrf_required', { 'cache-control': 'no-store' });
       }
       return identity;
     }

@@ -57,7 +57,8 @@ export async function startServer(environment: NodeJS.ProcessEnv = process.env) 
     secureValidationTransport: env.secureValidationTransport,
     trustProxy: env.trustProxy,
     oidcService,
-    browserSessionService
+    browserSessionService,
+    browserSessionStore
   });
 
   await app.listen({ host: env.host, port: env.port });

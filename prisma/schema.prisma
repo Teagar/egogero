@@ -286,6 +286,8 @@ model OidcLoginTransaction {
   redirectUri            String
   returnTo               String
   recoveryIntent         Boolean               @default(false)
+  reauthenticationIntent Boolean               @default(false)
+  reauthenticationFamilyId String?             @db.Uuid
   validatedHandoff       OidcValidatedHandoff?
 
   @@index([expiresAt, consumedAt])
@@ -301,6 +303,8 @@ model OidcValidatedHandoff {
   accountId          String               @db.Uuid
   externalIdentityId String               @db.Uuid
   authenticatedAt    DateTime             @db.Timestamptz(3)
+  reauthenticationIntent Boolean           @default(false)
+  reauthenticationFamilyId String?          @db.Uuid
   loginTransaction   OidcLoginTransaction @relation(fields: [loginTransactionId], references: [id], onDelete: Restrict)
   externalIdentity   ExternalIdentity     @relation(fields: [externalIdentityId, accountId], references: [id, accountId], onDelete: Restrict)
 

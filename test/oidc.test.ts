@@ -92,7 +92,8 @@ async function mockProvider(config: OidcRuntimeConfig) {
   let expectedChallenge = '';
   let tokenCalls = 0;
   let mode: 'valid' | 'audience' | 'azp' | 'expired' | 'future' | 'issuer' | 'missing_sub'
-    | 'multi_valid' | 'nbf' | 'nonce' | 'rotate_new' | 'rotate_same' | 'signature' | 'stale' = 'valid';
+    | 'missing_auth_time' | 'multi_valid' | 'nbf' | 'nonce' | 'rotate_new' | 'rotate_same'
+    | 'signature' | 'stale' | 'stale_auth_time' = 'valid';
   let metadataOverrides: Record<string, unknown> = {};
   let currentJwks = [publicJwk];
   let redirectToken = false;
@@ -145,6 +146,7 @@ async function mockProvider(config: OidcRuntimeConfig) {
           : config.clientId;
       const nonce = mode === 'nonce' ? 'wrong-nonce' : expectedNonce;
       const issuedAt = mode === 'future' ? now + 600 : mode === 'stale' ? now - 1_200 : now;
+      const authenticationTime = mode === 'stale_auth_time' ? now - 1_200 : issuedAt;
       const expiresAt = mode === 'expired' ? now - 300 : now + 300;
       const privateKey = mode === 'signature'
         ? attacker.privateKey
@@ -156,6 +158,7 @@ async function mockProvider(config: OidcRuntimeConfig) {
       if (mode === 'rotate_same') currentJwks = [{ ...rotatedJwk, kid: 'provider-key' }];
       let tokenBuilder = new SignJWT({
         nonce,
+        ...(mode === 'missing_auth_time' ? {} : { auth_time: authenticationTime }),
         email: 'person@example.test',
         email_verified: true,
         ...(mode === 'azp' ? { azp: 'wrong-client' } : {}),
@@ -249,6 +252,8 @@ test('OIDC login stores only digests and AEAD material, validates a callback onc
   assert.equal(authorization.searchParams.get('response_type'), 'code');
   assert.equal(authorization.searchParams.get('code_challenge_method'), 'S256');
   assert.equal(authorization.searchParams.get('scope'), 'openid profile email');
+  assert.equal(authorization.searchParams.get('max_age'), '0');
+  assert.equal(authorization.searchParams.get('prompt'), null);
   assert.ok(authorization.searchParams.get('state'));
   assert.ok(authorization.searchParams.get('nonce'));
 
@@ -289,6 +294,29 @@ test('OIDC login stores only digests and AEAD material, validates a callback onc
   );
   assert.equal(provider.tokenCalls, 1);
   await app.close();
+});
+
+test('OIDC reauthentication persists trusted intent and requests fresh provider authentication', async () => {
+  const config = configuration();
+  const database = memoryStore();
+  const provider = await mockProvider(config);
+  const service = await createOidcService(config, database.store, provider.fetchImplementation);
+  const familyId = randomUUID();
+  const authorization = await service.startLogin({
+    returnTo: '/settings', requestCorrelationId: 'reauthentication', reauthentication: true,
+    reauthenticationFamilyId: familyId
+  });
+  assert.equal(authorization.searchParams.get('prompt'), 'login');
+  assert.equal(authorization.searchParams.get('max_age'), '0');
+  const transaction = [...database.transactions.values()][0]!;
+  assert.equal(transaction.reauthenticationIntent, true);
+  assert.equal(transaction.reauthenticationFamilyId, familyId);
+  provider.prepare(authorization);
+  await service.completeCallback({
+    callbackUrl: callbackUrl(config, authorization), requestCorrelationId: 'reauthentication-callback'
+  });
+  assert.equal(database.handoff?.reauthenticationIntent, true);
+  assert.equal(database.handoff?.reauthenticationFamilyId, familyId);
 });
 
 test('OIDC rejects unsafe return targets, corrupted AEAD, duplicate callbacks, and invalid ID-token claims generically', async () => {
@@ -346,7 +374,10 @@ test('OIDC rejects unsafe return targets, corrupted AEAD, duplicate callbacks, a
   );
   assert.equal(provider.tokenCalls, 0);
 
-  for (const mode of ['nonce', 'audience', 'azp', 'issuer', 'expired', 'future', 'missing_sub', 'nbf', 'signature', 'stale'] as const) {
+  for (const mode of [
+    'nonce', 'audience', 'azp', 'issuer', 'expired', 'future', 'missing_sub', 'missing_auth_time',
+    'nbf', 'signature', 'stale', 'stale_auth_time'
+  ] as const) {
     const authorization = await service.startLogin({ returnTo: '/', requestCorrelationId: `login-${mode}` });
     provider.prepare(authorization);
     provider.mode = mode;
@@ -501,7 +532,9 @@ test('OIDC callback converts its one-time handoff into the final browser session
   const oldSessionToken = generateSessionToken();
   const sessionToken = generateSessionToken();
   let suppliedOldSession: string | undefined;
+  let ambiguousAudits = 0;
   const sessionStore = {
+    publicApplicationOrigin: 'https://app.example.test',
     async issueFromHandoff(input) {
       suppliedOldSession = input.oldSessionToken;
       assert.equal(input.handoffToken, handoffToken);
@@ -521,10 +554,12 @@ test('OIDC callback converts its one-time handoff into the final browser session
       };
     },
     async authenticate() { return null; },
+    async inspect() { return null; },
+    async isRevoked() { return false; },
     async rotate() { return { status: 'stale' as const }; },
     async revoke() { return 'unavailable' as const; },
-    async revokeAll() { return 0; },
-    async recordAmbiguousCredentials() {}
+    async revokeAll() { return 'unavailable' as const; },
+    async recordAmbiguousCredentials() { ambiguousAudits += 1; }
   } satisfies BrowserSessionStore;
   const oidcService = {
     failurePath: '/auth/error',
@@ -545,8 +580,19 @@ test('OIDC callback converts its one-time handoff into the final browser session
   };
   const app = createApp({
     oidcService,
-    browserSessionService: createBrowserSessionService(sessionStore)
+    browserSessionService: createBrowserSessionService(sessionStore),
+    browserSessionStore: sessionStore
   });
+  const ambiguous = await app.inject({
+    method: 'GET', url: '/auth/callback?code=code&state=state',
+    headers: {
+      cookie: `${SESSION_COOKIE_NAME}=${oldSessionToken}`,
+      authorization: `Bearer egdev_${generateSessionToken()}`
+    }
+  });
+  assert.equal(ambiguous.statusCode, 400);
+  assert.equal(ambiguous.headers['cache-control'], 'no-store');
+  assert.equal(ambiguousAudits, 1);
   const response = await app.inject({
     method: 'GET',
     url: '/auth/callback?code=code&state=state',

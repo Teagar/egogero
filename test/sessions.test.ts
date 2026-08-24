@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
-import { randomBytes, randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import test from 'node:test';
 
 import Fastify from 'fastify';
 
 import { authorize } from '../src/auth.js';
+import { createApp } from '../src/app.js';
 import {
   CLEARED_SESSION_COOKIE,
   createBrowserSessionAuthenticator,
@@ -34,10 +35,12 @@ test('session environment is opt-in and accepts only canonical versioned 32-byte
   const key = randomBytes(32).toString('base64url');
   const valid = sessionConfigFromEnvironment({
     HUMAN_AUTH_ENABLED: 'true',
+    PUBLIC_APPLICATION_ORIGIN: 'https://app.example.test',
     SESSION_CSRF_KEYS: JSON.stringify({ 1: key }),
     SESSION_CSRF_CURRENT_KEY_VERSION: '1'
   });
   assert.equal(valid?.currentCsrfKeyVersion, 1);
+  assert.equal(valid?.publicApplicationOrigin, 'https://app.example.test');
   assert.deepEqual(valid?.csrfKeys.get(1), Buffer.from(key, 'base64url'));
 
   for (const keys of [
@@ -51,15 +54,31 @@ test('session environment is opt-in and accepts only canonical versioned 32-byte
   ]) {
     assert.throws(() => sessionConfigFromEnvironment({
       HUMAN_AUTH_ENABLED: 'true',
+      PUBLIC_APPLICATION_ORIGIN: 'https://app.example.test',
       SESSION_CSRF_KEYS: keys,
       SESSION_CSRF_CURRENT_KEY_VERSION: '1'
     }));
   }
   assert.throws(() => sessionConfigFromEnvironment({
     HUMAN_AUTH_ENABLED: 'true',
+    PUBLIC_APPLICATION_ORIGIN: 'https://app.example.test',
     SESSION_CSRF_KEYS: JSON.stringify({ 1: key }),
     SESSION_CSRF_CURRENT_KEY_VERSION: '2'
   }), /must identify an active key/);
+  for (const origin of [
+    'http://app.example.test',
+    'https://user@app.example.test',
+    'https://app.example.test/path',
+    'https://app.example.test/',
+    'https://app.example.test?query=1'
+  ]) {
+    assert.throws(() => sessionConfigFromEnvironment({
+      HUMAN_AUTH_ENABLED: 'true',
+      PUBLIC_APPLICATION_ORIGIN: origin,
+      SESSION_CSRF_KEYS: JSON.stringify({ 1: key }),
+      SESSION_CSRF_CURRENT_KEY_VERSION: '1'
+    }), /exact HTTPS origin/);
+  }
 });
 
 test('session tokens and cookies have one exact opaque credential format', () => {
@@ -95,11 +114,13 @@ test('browser authenticator rejects malformed and duplicate cookies before stora
   };
   const calls: Array<{ token: string; requestId: string }> = [];
   const store = {
+    publicApplicationOrigin: 'https://app.example.test',
     async authenticate(value: string, requestId: string) {
       calls.push({ token: value, requestId });
       return identity;
-    }
-  } as BrowserSessionStore;
+    },
+    async inspect() { return null; }
+  } as unknown as BrowserSessionStore;
   const authenticator = createBrowserSessionAuthenticator(store);
 
   await assert.rejects(authenticator.authenticate({
@@ -124,18 +145,21 @@ test('browser authenticator rejects malformed and duplicate cookies before stora
 test('browser session service exposes issuer operations and secure cookie lifecycle', async () => {
   const token = generateSessionToken();
   const store = {
+    publicApplicationOrigin: 'https://app.example.test',
     async issueFromHandoff() { return null; },
     async authenticate() { return null; },
+    async inspect() { return null; },
+    async isRevoked() { return false; },
     async rotate() { return { status: 'stale' as const }; },
     async revoke() { return 'already-revoked' as const; },
-    async revokeAll() { return 3; },
+    async revokeAll() { return 'revoked' as const; },
     async recordAmbiguousCredentials() {}
   } satisfies BrowserSessionStore;
   const service = createBrowserSessionService(store);
   assert.equal(await service.issueFromHandoff({ handoffToken: token, requestCorrelationId: 'issue' }), null);
   assert.deepEqual(await service.rotate({ sessionToken: token, requestCorrelationId: 'rotate' }), { status: 'stale' });
   assert.equal(await service.revoke({ sessionToken: token, requestCorrelationId: 'revoke' }), 'already-revoked');
-  assert.equal(await service.revokeAll({ accountId: randomUUID(), requestCorrelationId: 'all' }), 3);
+  assert.equal(await service.revokeAll({ sessionToken: token, requestCorrelationId: 'all' }), 'revoked');
   assert.equal(service.sessionCookie(token), serializeBrowserSessionCookie(token));
   assert.equal(service.clearSessionCookie(), CLEARED_SESSION_COOKIE);
 });
@@ -146,6 +170,7 @@ test('credential router rejects browser and Bearer credentials together without 
   let deviceCalls = 0;
   let developmentCalls = 0;
   const store = {
+    publicApplicationOrigin: 'https://app.example.test',
     async issueFromHandoff() { return null; },
     async authenticate() {
       return {
@@ -158,9 +183,11 @@ test('credential router rejects browser and Bearer credentials together without 
         condominioIds: null
       };
     },
+    async inspect() { return null; },
+    async isRevoked() { return false; },
     async rotate() { return { status: 'stale' as const }; },
     async revoke() { return 'unavailable' as const; },
-    async revokeAll() { return 0; },
+    async revokeAll() { return 'unavailable' as const; },
     async recordAmbiguousCredentials() { ambiguousAudits += 1; }
   } satisfies BrowserSessionStore;
   const router = createCredentialRouter(
@@ -206,5 +233,194 @@ test('credential router rejects browser and Bearer credentials together without 
   const unsafe = await app.inject({ method: 'POST', url: '/', headers: { cookie: `${SESSION_COOKIE_NAME}=${token}` } });
   assert.equal(unsafe.statusCode, 403);
   assert.deepEqual(unsafe.json(), { error: 'csrf_required' });
+  await app.close();
+});
+
+test('cookie mutations require matching CSRF, exact origin or Referer, and JSON before handlers run', async () => {
+  const token = generateSessionToken();
+  const csrfToken = generateSessionToken();
+  const identity: HumanSessionIdentity = {
+    principalType: 'human', authMethod: 'oidc-session', accountId: randomUUID(), sessionId: randomUUID(),
+    role: 'provedor', id: randomUUID(), condominioIds: null
+  };
+  let handlerCalls = 0;
+  let authenticationLive = true;
+  let inspectionLive = true;
+  const store = {
+    publicApplicationOrigin: 'https://app.example.test',
+    async authenticate() { return authenticationLive ? identity : null; },
+    async inspect() {
+      if (!inspectionLive) return null;
+      return {
+        identity,
+        familyId: randomUUID(),
+        account: { id: identity.accountId, displayName: 'Person' },
+        memberships: [], activeTenantId: null, csrfToken,
+        csrfDigest: createHash('sha256').update(Buffer.from(csrfToken, 'base64url')).digest(),
+        expiresAt: new Date(Date.now() + 60_000), idleExpiresAt: new Date(Date.now() + 60_000),
+        authenticatedAt: new Date()
+      };
+    }
+  } as unknown as BrowserSessionStore;
+  const app = Fastify({ logger: false });
+  app.post('/', { preHandler: authorize(createBrowserSessionAuthenticator(store), 'condominios:manage') }, async () => {
+    handlerCalls += 1;
+    return { ok: true };
+  });
+  const cookie = `${SESSION_COOKIE_NAME}=${token}`;
+  const validHeaders = {
+    cookie,
+    origin: 'https://app.example.test',
+    'content-type': 'application/json; charset=utf-8',
+    'x-csrf-token': csrfToken
+  };
+  const missingCsrf: Record<string, string> = { ...validHeaders };
+  delete missingCsrf['x-csrf-token'];
+  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+  const lastIndex = alphabet.indexOf(csrfToken.at(-1)!);
+  const noncanonicalAlias = `${csrfToken.slice(0, -1)}${alphabet[lastIndex + 1]}`;
+  assert.deepEqual(Buffer.from(noncanonicalAlias, 'base64url'), Buffer.from(csrfToken, 'base64url'));
+  for (const headers of [
+    missingCsrf,
+    { ...validHeaders, 'x-csrf-token': generateSessionToken() },
+    { ...validHeaders, 'x-csrf-token': noncanonicalAlias },
+    { ...validHeaders, origin: 'https://hostile.example.test' },
+    { ...validHeaders, 'content-type': 'text/plain' }
+  ]) {
+    const response = await app.inject({ method: 'POST', url: '/', headers: headers as never, payload: {} });
+    assert.equal(response.statusCode, 403);
+    assert.equal(response.headers['cache-control'], 'no-store');
+  }
+  assert.equal(handlerCalls, 0);
+  const referer = await app.inject({
+    method: 'POST', url: '/', payload: {},
+    headers: {
+      cookie,
+      referer: 'https://app.example.test/page',
+      'content-type': 'application/json; charset=utf-8',
+      'x-csrf-token': csrfToken
+    }
+  });
+  assert.equal(referer.statusCode, 200);
+  const valid = await app.inject({ method: 'POST', url: '/', headers: validHeaders, payload: {} });
+  assert.equal(valid.statusCode, 200);
+  assert.equal(handlerCalls, 2);
+  authenticationLive = false;
+  const invalidSession = await app.inject({ method: 'POST', url: '/', headers: validHeaders, payload: {} });
+  assert.equal(invalidSession.statusCode, 401);
+  assert.equal(invalidSession.headers['set-cookie'], CLEARED_SESSION_COOKIE);
+  authenticationLive = true;
+  inspectionLive = false;
+  const failedInspection = await app.inject({ method: 'POST', url: '/', headers: validHeaders, payload: {} });
+  assert.equal(failedInspection.statusCode, 401);
+  assert.equal(failedInspection.headers['set-cookie'], CLEARED_SESSION_COOKIE);
+  await app.close();
+});
+
+test('browser auth endpoints are no-store and implement session, tenant, logout, and recent-auth contracts', async () => {
+  const token = generateSessionToken();
+  const replacement = generateSessionToken();
+  const csrfToken = generateSessionToken();
+  const accountId = randomUUID();
+  const membershipId = randomUUID();
+  const identity: HumanSessionIdentity = {
+    principalType: 'human', authMethod: 'oidc-session', accountId, sessionId: randomUUID(),
+    role: 'provedor', id: accountId, condominioIds: null
+  };
+  const snapshot = {
+    identity,
+    familyId: randomUUID(),
+    account: { id: accountId, displayName: 'Person' },
+    memberships: [{ id: membershipId, role: 'provedor' as const, tenantId: null, residentId: null }],
+    activeTenantId: null, csrfToken,
+    csrfDigest: createHash('sha256').update(Buffer.from(csrfToken, 'base64url')).digest(),
+    expiresAt: new Date('2030-01-01T00:00:00Z'), idleExpiresAt: new Date('2030-01-01T00:00:00Z'),
+    authenticatedAt: new Date()
+  };
+  let revoked = 0;
+  let revokedState = false;
+  let authenticationLive = true;
+  let ambiguousAudits = 0;
+  let reauthenticationFamilyId: string | undefined;
+  let staleRotation = false;
+  let revokeAllResult: 'revoked' | 'reauthentication-required' = 'reauthentication-required';
+  const store = {
+    publicApplicationOrigin: 'https://app.example.test',
+    async issueFromHandoff() { return null; },
+    async authenticate() { return authenticationLive ? identity : null; },
+    async inspect() { return snapshot; },
+    async isRevoked() { return revokedState; },
+    async rotate() {
+      if (staleRotation) return { status: 'stale' as const };
+      return { status: 'rotated' as const, sessionToken: replacement, csrfToken, identity, absoluteExpiresAt: snapshot.expiresAt };
+    },
+    async revoke() { revoked += 1; return 'revoked' as const; },
+    async revokeAll() { return revokeAllResult; },
+    async recordAmbiguousCredentials() { ambiguousAudits += 1; }
+  } satisfies BrowserSessionStore;
+  const oidcService = {
+    failurePath: '/auth/error',
+    async startLogin(input: { reauthenticationFamilyId?: string }) {
+      reauthenticationFamilyId = input.reauthenticationFamilyId;
+      return new URL('https://identity.example.test/authorize?max_age=0&prompt=login');
+    },
+    async completeCallback() { throw new Error('not used'); }
+  };
+  const app = createApp({
+    browserSessionStore: store,
+    browserSessionService: createBrowserSessionService(store),
+    oidcService
+  });
+  const cookie = `${SESSION_COOKIE_NAME}=${token}`;
+  const headers = {
+    cookie, origin: 'https://app.example.test', 'content-type': 'application/json', 'x-csrf-token': csrfToken
+  };
+  const session = await app.inject({ method: 'GET', url: '/auth/session', headers: { cookie } });
+  assert.equal(session.statusCode, 200);
+  assert.equal(session.headers['cache-control'], 'no-store');
+  assert.equal(session.json().csrfToken, csrfToken);
+  const ambiguous = await app.inject({
+    method: 'GET', url: '/auth/session',
+    headers: { cookie, authorization: `Bearer egdev_${generateSessionToken()}` }
+  });
+  assert.equal(ambiguous.statusCode, 400);
+  assert.equal(ambiguous.headers['cache-control'], 'no-store');
+  assert.equal(ambiguousAudits, 1);
+  const reauthenticate = await app.inject({ method: 'POST', url: '/auth/reauthenticate', headers, payload: {} });
+  assert.equal(reauthenticate.statusCode, 303);
+  assert.equal(reauthenticationFamilyId, snapshot.familyId);
+  const tenant = await app.inject({ method: 'POST', url: '/auth/tenant', headers, payload: { membershipId } });
+  assert.equal(tenant.statusCode, 204);
+  assert.equal(tenant.headers['set-cookie'], serializeBrowserSessionCookie(replacement));
+  staleRotation = true;
+  const stale = await app.inject({ method: 'POST', url: '/auth/tenant', headers, payload: { membershipId } });
+  assert.equal(stale.statusCode, 409);
+  assert.equal(stale.headers['set-cookie'], undefined, 'a losing tab must not clear a winner cookie');
+  assert.equal((await app.inject({ method: 'GET', url: '/auth/tenant', headers: { cookie } })).statusCode, 404);
+  const recent = await app.inject({ method: 'POST', url: '/auth/logout-all', headers, payload: {} });
+  assert.equal(recent.statusCode, 403);
+  assert.deepEqual(recent.json(), { error: 'reauthentication_required' });
+  revokeAllResult = 'revoked';
+  const all = await app.inject({ method: 'POST', url: '/auth/logout-all', headers, payload: {} });
+  assert.equal(all.statusCode, 204);
+  assert.equal(all.headers['set-cookie'], CLEARED_SESSION_COOKIE);
+  const logout = await app.inject({ method: 'POST', url: '/auth/logout', headers, payload: {} });
+  assert.equal(logout.statusCode, 204);
+  assert.equal(revoked, 1);
+  authenticationLive = false;
+  revokedState = true;
+  const repeatedRevoked = await app.inject({
+    method: 'POST', url: '/auth/logout', payload: {},
+    headers: { cookie, origin: 'https://app.example.test', 'content-type': 'application/json' }
+  });
+  assert.equal(repeatedRevoked.statusCode, 204);
+  assert.equal(repeatedRevoked.headers['set-cookie'], CLEARED_SESSION_COOKIE);
+  assert.equal(revoked, 1);
+  const repeated = await app.inject({
+    method: 'POST', url: '/auth/logout', payload: {},
+    headers: { origin: 'https://app.example.test', 'content-type': 'application/json' }
+  });
+  assert.equal(repeated.statusCode, 204);
+  assert.equal(repeated.headers['cache-control'], 'no-store');
   await app.close();
 });

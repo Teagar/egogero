@@ -355,6 +355,13 @@ The composite authenticator uses unambiguous credential routing:
   audited; and
 - no human OIDC token is accepted as an API Bearer token.
 
+The legacy `POST /portaria/convites/validar` route remains device-only even
+though `portaria` is also a human role. `AuditoriaAcesso.dispositivoId` cannot
+represent a human actor without corrupting immutable audit semantics, so an
+OIDC-session `portaria` receives `403` before device rate limiting or access
+audit insertion. A future human-operated validation flow requires an additive
+actor-aware audit schema and a separate route contract.
+
 ## Session Lifecycle
 
 ### Issuance and Rotation

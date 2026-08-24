@@ -9,7 +9,7 @@ import {
 
 import { Prisma } from '@prisma/client';
 import type { PrismaClient } from '@prisma/client';
-import type { FastifyInstance } from 'fastify';
+import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import {
   createRemoteJWKSet,
   customFetch as joseCustomFetch,
@@ -17,8 +17,8 @@ import {
 } from 'jose';
 import * as oidc from 'openid-client';
 
-import { parseBrowserSessionCookie } from './sessions.js';
-import type { BrowserSessionService } from './sessions.js';
+import { hasBrowserSessionCookie, parseBrowserSessionCookie } from './sessions.js';
+import type { BrowserSessionService, BrowserSessionStore } from './sessions.js';
 
 const LOGIN_TRANSACTION_TTL_MS = 10 * 60 * 1000;
 const OIDC_CLOCK_TOLERANCE_SECONDS = 60;
@@ -69,6 +69,8 @@ type LoginTransactionInput = {
   redirectUri: string;
   returnTo: string;
   recoveryIntent: boolean;
+  reauthenticationIntent?: boolean;
+  reauthenticationFamilyId?: string;
   audit: AuditInput;
 };
 
@@ -95,6 +97,8 @@ export interface OidcLoginStore {
     email: string | null;
     emailVerified: boolean;
     authenticatedAt: Date;
+    reauthenticationIntent?: boolean;
+    reauthenticationFamilyId?: string;
     handoffId: string;
     handoffDigest: Buffer;
     handoffExpiresAt: Date;
@@ -109,6 +113,8 @@ export interface OidcService {
   startLogin(input: {
     returnTo?: string;
     requestCorrelationId: string;
+    reauthentication?: boolean;
+    reauthenticationFamilyId?: string;
   }): Promise<URL>;
   completeCallback(input: {
     callbackUrl: URL;
@@ -360,12 +366,14 @@ export function createPrismaOidcLoginStore(client: PrismaClient): OidcLoginStore
           INSERT INTO "OidcLoginTransaction" (
             id, "expiresAt", "stateDigest", "nonceDigest", "pkceVerifierCiphertext",
             "pkceVerifierNonce", "pkceVerifierAuthTag", "pkceKeyVersion", issuer,
-            "clientId", "redirectUri", "returnTo", "recoveryIntent"
+             "clientId", "redirectUri", "returnTo", "recoveryIntent", "reauthenticationIntent",
+             "reauthenticationFamilyId"
           ) VALUES (
             ${input.id}::uuid, ${input.expiresAt}, ${input.stateDigest}, ${input.nonceDigest},
             ${input.pkceVerifierCiphertext}, ${input.pkceVerifierNonce}, ${input.pkceVerifierAuthTag},
             ${input.pkceKeyVersion}, ${input.issuer}, ${input.clientId}, ${input.redirectUri},
-            ${input.returnTo}, ${input.recoveryIntent}
+             ${input.returnTo}, ${input.recoveryIntent}, ${input.reauthenticationIntent === true},
+             ${input.reauthenticationFamilyId ?? null}::uuid
           )
         `;
         await insertAudit(transaction, input.audit);
@@ -381,7 +389,8 @@ export function createPrismaOidcLoginStore(client: PrismaClient): OidcLoginStore
           AND "expiresAt" > clock_timestamp()
         RETURNING id, "createdAt", "stateDigest", "nonceDigest", "pkceVerifierCiphertext",
                   "pkceVerifierNonce", "pkceVerifierAuthTag", "pkceKeyVersion",
-                  issuer, "clientId", "redirectUri", "returnTo"
+                   issuer, "clientId", "redirectUri", "returnTo", "reauthenticationIntent",
+                   "reauthenticationFamilyId"
       `);
       return rows[0] ?? null;
     },
@@ -420,11 +429,12 @@ export function createPrismaOidcLoginStore(client: PrismaClient): OidcLoginStore
         await transaction.$executeRaw`
           INSERT INTO "OidcValidatedHandoff" (
             id, "expiresAt", "handleDigest", "loginTransactionId", "accountId",
-            "externalIdentityId", "authenticatedAt"
+             "externalIdentityId", "authenticatedAt", "reauthenticationIntent", "reauthenticationFamilyId"
           ) VALUES (
             ${input.handoffId}::uuid, ${input.handoffExpiresAt}, ${input.handoffDigest},
             ${input.loginTransactionId}::uuid, ${identity.accountId}::uuid,
-            ${identity.id}::uuid, ${input.authenticatedAt}
+             ${identity.id}::uuid, ${input.authenticatedAt}, ${input.reauthenticationIntent === true},
+             ${input.reauthenticationFamilyId ?? null}::uuid
           )
         `;
         await insertAudit(transaction, {
@@ -726,7 +736,11 @@ export async function createOidcService(
   return {
     failurePath: config.failurePath,
 
-    async startLogin({ returnTo, requestCorrelationId }) {
+    async startLogin({ returnTo, requestCorrelationId, reauthentication = false, reauthenticationFamilyId }) {
+      if (reauthentication !== (typeof reauthenticationFamilyId === 'string'
+        && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(reauthenticationFamilyId))) {
+        throw new Error('OIDC reauthentication requires a trusted session family');
+      }
       const normalizedReturnTo = normalizeSafeRelativePath(returnTo, '/', config.returnToPrefixes);
       const id = randomUUID();
       const state = oidc.randomState();
@@ -749,11 +763,13 @@ export async function createOidcService(
         redirectUri: config.redirectUri,
         returnTo: normalizedReturnTo,
         recoveryIntent: false,
+        reauthenticationIntent: reauthentication,
+        reauthenticationFamilyId,
         audit: {
           eventType: 'oidc_login_started',
           outcome: 'success',
           requestCorrelationId,
-          metadata: { recoveryIntent: false }
+          metadata: { recoveryIntent: false, reauthenticationIntent: reauthentication }
         }
       });
 
@@ -765,7 +781,9 @@ export async function createOidcService(
         code_challenge: challenge,
         code_challenge_method: 'S256',
         state,
-        nonce
+        nonce,
+        max_age: '0',
+        ...(reauthentication ? { prompt: 'login' } : {})
       });
     },
 
@@ -826,6 +844,13 @@ export async function createOidcService(
           || claims.iat * 1000 < transaction.createdAt.getTime() - OIDC_CLOCK_TOLERANCE_SECONDS * 1000) {
           throw new OidcCallbackError();
         }
+        const authenticationTime = claims.auth_time;
+        if (typeof authenticationTime !== 'number' || !Number.isSafeInteger(authenticationTime)
+          || authenticationTime > Math.floor(Date.now() / 1000) + OIDC_CLOCK_TOLERANCE_SECONDS
+          || authenticationTime > claims.iat + OIDC_CLOCK_TOLERANCE_SECONDS
+          || authenticationTime * 1000 < transaction.createdAt.getTime() - OIDC_CLOCK_TOLERANCE_SECONDS * 1000) {
+          throw new OidcCallbackError();
+        }
 
         const handoffToken = randomBytes(32).toString('base64url');
         const identity = await store.completeIdentity({
@@ -834,7 +859,9 @@ export async function createOidcService(
           subject: claims.sub,
           email: typeof claims.email === 'string' ? claims.email : null,
           emailVerified: claims.email_verified === true,
-          authenticatedAt: new Date(claims.iat * 1000),
+          authenticatedAt: new Date(authenticationTime * 1000),
+          reauthenticationIntent: transaction.reauthenticationIntent,
+          reauthenticationFamilyId: transaction.reauthenticationFamilyId,
           handoffId: randomUUID(),
           handoffDigest: digest(handoffToken),
           handoffExpiresAt: new Date(Date.now() + HANDOFF_TTL_MS),
@@ -862,11 +889,26 @@ function oneQueryValue(value: unknown) {
 export function registerOidcRoutes(
   app: FastifyInstance,
   service?: OidcService,
-  browserSessionService?: BrowserSessionService
+  browserSessionService?: BrowserSessionService,
+  browserSessionStore?: BrowserSessionStore
 ) {
   if (!service) return;
 
-  app.get('/auth/login', async (request, reply) => {
+  const unambiguous = browserSessionStore ? {
+    onRequest: async (request: FastifyRequest, reply: FastifyReply) => {
+      if (hasBrowserSessionCookie(request.headers.cookie)
+        && typeof request.headers.authorization === 'string'
+        && /^Bearer egdev_/.test(request.headers.authorization)) {
+        await browserSessionStore.recordAmbiguousCredentials({
+          requestCorrelationId: request.id,
+          userAgent: typeof request.headers['user-agent'] === 'string' ? request.headers['user-agent'] : null
+        });
+        return reply.header('Cache-Control', 'no-store').status(400).send({ error: 'ambiguous_credentials' });
+      }
+    }
+  } : {};
+
+  app.get('/auth/login', unambiguous, async (request, reply) => {
     reply
       .header('Cache-Control', 'no-store')
       .header('Pragma', 'no-cache')
@@ -886,7 +928,7 @@ export function registerOidcRoutes(
     }
   });
 
-  app.get('/auth/callback', async (request, reply) => {
+  app.get('/auth/callback', unambiguous, async (request, reply) => {
     reply.header('Cache-Control', 'no-store').header('Pragma', 'no-cache').header('Referrer-Policy', 'no-referrer');
     try {
       const callbackUrl = new URL(request.url, 'https://egogero.invalid');
