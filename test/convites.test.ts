@@ -12,9 +12,10 @@ import {
   createInvitation,
   createInvitations,
   generateSixDigitToken,
+  invitationMessage,
   registerConviteRoutes
 } from '../src/convites.js';
-import type { InvitationAllocation, InvitationRecord, InvitationStore } from '../src/convites.js';
+import type { InvitationAllocation, InvitationRecord, InvitationStore, NotificationSender } from '../src/convites.js';
 
 const authenticator = createDevelopmentHeaderAuthenticator(true);
 const uuid = (n: number) => `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
@@ -89,7 +90,7 @@ function uniqueMemoryStore(initialTokens: string[] = []): InvitationStore & {
   return store;
 }
 
-function batchStore({ condominiumDeleted = false, residentDeleted = false } = {}): AppStore {
+function batchStore({ condominiumDeleted = false, residentDeleted = false, email = null, telefone = null }: { condominiumDeleted?: boolean; residentDeleted?: boolean; email?: string | null; telefone?: string | null } = {}): AppStore {
   const condominios = new Map([
     [CONDOMINIO_ID, condominiumDeleted ? new Date() : null],
     [OTHER_CONDOMINIO_ID, null]
@@ -109,6 +110,8 @@ function batchStore({ condominiumDeleted = false, residentDeleted = false } = {}
     createdAt: NOW,
     deletedAt,
     nome: 'Guest',
+    email,
+    telefone,
     condominioId: condo,
     moradorId: owner,
     ultimoUsoEm: null
@@ -236,6 +239,51 @@ test('single creation exposes plaintext once with no-store and enforces scope be
   assert.equal(wrongOwner.statusCode, 403);
   assert.equal(wrongTenant.statusCode, 403);
   assert.equal(store.batchCalls, calls);
+  await app.close();
+});
+
+test('invitation template replaces every documented placeholder deterministically', () => {
+  const message = invitationMessage({ guestName: 'Ana', type: 'prestador', expiresAt: EXPIRES_AT, token: '123456' });
+  assert.equal(message.subject, 'Convite de acesso - prestador');
+  assert.equal(message.body, 'Olá, Ana! Você recebeu um convite de acesso (prestador). Seu código é 123456. Ele expira em 2026-08-25T05:00:00.000Z.');
+  assert.doesNotMatch(`${message.subject} ${message.body}`, /\{[^}]+\}/);
+});
+
+test('single invitation sends exactly one message per supplied channel and none without contacts', async () => {
+  for (const contacts of [
+    { email: 'ana@example.com', telefone: null, expectedEmail: 1, expectedSms: 0 },
+    { email: null, telefone: '+5511999999999', expectedEmail: 0, expectedSms: 1 },
+    { email: 'ana@example.com', telefone: '+5511999999999', expectedEmail: 1, expectedSms: 1 },
+    { email: null, telefone: null, expectedEmail: 0, expectedSms: 0 }
+  ]) {
+    const convite = uniqueMemoryStore();
+    const sent: { emails: unknown[]; sms: unknown[] } = { emails: [], sms: [] };
+    const notifications: NotificationSender = {
+      email: { async send(to, message) { sent.emails.push({ to, message }); } },
+      sms: { async send(to, body) { sent.sms.push({ to, body }); } }
+    };
+    const app = Fastify({ logger: false });
+    registerConviteRoutes(app, batchStore(contacts), convite, authenticator, notifications);
+    const response = await app.inject({ method: 'POST', url: `/condominios/${CONDOMINIO_ID}/moradores/${MORADOR_ID}/convidados/${CONVIDADO_ID}/convites`, headers: residentHeaders, payload: { tipo: 'visitante', expiresAt: EXPIRES_AT.toISOString() } });
+    assert.equal(response.statusCode, 201);
+    assert.equal(sent.emails.length, contacts.expectedEmail);
+    assert.equal(sent.sms.length, contacts.expectedSms);
+    await app.close();
+  }
+});
+
+test('sender failure is explicit after issuance and does not expose the token', async () => {
+  const convite = uniqueMemoryStore();
+  const notifications: NotificationSender = {
+    email: { async send() { throw new Error('provider unavailable'); } },
+    sms: { async send() {} }
+  };
+  const app = Fastify({ logger: false });
+  registerConviteRoutes(app, batchStore({ email: 'ana@example.com' }), convite, authenticator, notifications);
+  const response = await app.inject({ method: 'POST', url: `/condominios/${CONDOMINIO_ID}/moradores/${MORADOR_ID}/convidados/${CONVIDADO_ID}/convites`, headers: residentHeaders, payload: { tipo: 'visitante', expiresAt: EXPIRES_AT.toISOString() } });
+  assert.equal(response.statusCode, 502);
+  assert.equal(response.json().token, undefined);
+  assert.equal(convite.activeTokens.size, 1);
   await app.close();
 });
 

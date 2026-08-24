@@ -4,7 +4,7 @@ import type { AppStore } from './app.js';
 import { authorize, isUuid } from './auth.js';
 import type { Authenticator } from './auth.js';
 
-type ConvidadoBody = Partial<Record<'nome', unknown>>;
+type ConvidadoBody = Partial<Record<'nome' | 'email' | 'telefone', unknown>>;
 type ConvidadoRecord = NonNullable<Awaited<ReturnType<AppStore['convidado']['findFirst']>>>;
 type GuestRouteStore = Pick<AppStore, 'morador' | 'convidado'>;
 
@@ -33,13 +33,20 @@ function parseConvidadoBody(body: unknown) {
     return null;
   }
 
-  const value = (body as ConvidadoBody).nome;
+  const payload = body as ConvidadoBody;
+  const value = payload.nome;
   if (typeof value !== 'string') {
     return null;
   }
 
   const nome = value.trim();
-  return nome ? { nome } : null;
+  if (!nome) return null;
+  if ((payload.email !== undefined && payload.email !== null && typeof payload.email !== 'string')
+    || (payload.telefone !== undefined && payload.telefone !== null && typeof payload.telefone !== 'string')) return null;
+  const email = payload.email === undefined || payload.email === null ? null : payload.email.trim();
+  const telefone = payload.telefone === undefined || payload.telefone === null ? null : payload.telefone.trim();
+  if ((email && !/^\S+@\S+\.\S+$/.test(email)) || (telefone && !/^\+?[0-9 ()-]{8,20}$/.test(telefone))) return null;
+  return { nome, email: email || null, telefone: telefone || null };
 }
 
 function parseLimit(query: unknown) {
@@ -64,6 +71,8 @@ function toConvidadoResponse(convidado: ConvidadoRecord) {
     condominioId: convidado.condominioId,
     moradorId: convidado.moradorId,
     nome: convidado.nome,
+    email: convidado.email,
+    telefone: convidado.telefone,
     ultimoUsoEm: convidado.ultimoUsoEm?.toISOString() ?? null
   };
 }

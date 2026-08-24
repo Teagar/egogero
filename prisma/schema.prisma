@@ -42,6 +42,8 @@ model Convidado {
   createdAt     DateTime  @default(now())
   deletedAt     DateTime?
   nome          String
+  email         String?
+  telefone      String?
   condominioId  String
   moradorId     String?
   // PC-7 records this when it generates a Convite; guest CRUD never simulates invitation use.

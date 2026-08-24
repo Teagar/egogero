@@ -3,8 +3,8 @@ import Fastify from 'fastify';
 import { authorize, isUuid, unauthenticatedAuthenticator } from './auth.js';
 import type { Authenticator } from './auth.js';
 import { registerConvidadoRoutes } from './convidados.js';
-import { createPrismaInvitationStore, registerConviteRoutes } from './convites.js';
-import type { InvitationStore } from './convites.js';
+import { createDevelopmentNotificationSender, createPrismaInvitationStore, registerConviteRoutes } from './convites.js';
+import type { InvitationStore, NotificationSender } from './convites.js';
 import { prisma as defaultPrisma } from './lib/prisma.js';
 
 type CondominioRecord = {
@@ -60,13 +60,15 @@ type ConvidadoRecord = {
   createdAt: Date;
   deletedAt: Date | null;
   nome: string;
+  email?: string | null;
+  telefone?: string | null;
   condominioId: string;
   moradorId: string | null;
   ultimoUsoEm: Date | null;
 };
 
-type ConvidadoCreateData = { nome: string; condominioId: string; moradorId: string };
-type ConvidadoUpdateData = { nome?: string; ultimoUsoEm?: Date | null; deletedAt?: Date };
+type ConvidadoCreateData = { nome: string; email: string | null; telefone: string | null; condominioId: string; moradorId: string };
+type ConvidadoUpdateData = { nome?: string; email?: string | null; telefone?: string | null; ultimoUsoEm?: Date | null; deletedAt?: Date };
 type ConvidadoOrderBy = { ultimoUsoEm: { sort: 'desc'; nulls: 'last' } } | { createdAt: 'desc' } | { id: 'desc' };
 type ConvidadoWhere = {
   id?: string;
@@ -113,7 +115,7 @@ export type AppStore = {
   };
 };
 
-export type AppDependencies = AppStore & { convite?: InvitationStore };
+export type AppDependencies = AppStore & { convite?: InvitationStore; notificationSender?: NotificationSender };
 
 export type CondominioStore = AppStore;
 
@@ -363,14 +365,16 @@ export function createApp(
   {
     db: suppliedDb,
     authenticator = unauthenticatedAuthenticator,
-    invitationTokenSecret = process.env.INVITATION_TOKEN_SECRET
-  }: { db?: AppDependencies; authenticator?: Authenticator; invitationTokenSecret?: string } = {}
+    invitationTokenSecret = process.env.INVITATION_TOKEN_SECRET,
+    notificationSender = createDevelopmentNotificationSender()
+  }: { db?: AppDependencies; authenticator?: Authenticator; invitationTokenSecret?: string; notificationSender?: NotificationSender } = {}
 ) {
   const db: AppDependencies = suppliedDb ?? {
     ...defaultStore,
     convite: invitationTokenSecret
       ? createPrismaInvitationStore(defaultPrisma, invitationTokenSecret)
-      : undefined
+      : undefined,
+    notificationSender
   };
   const app = Fastify({ logger: false });
   const condominioManagement = { preHandler: authorize(authenticator, 'condominios:manage') };
@@ -592,7 +596,7 @@ export function createApp(
   });
 
   registerConvidadoRoutes(app, db, authenticator);
-  registerConviteRoutes(app, db, db.convite, authenticator);
+  registerConviteRoutes(app, db, db.convite, authenticator, db.notificationSender);
 
   return app;
 }
