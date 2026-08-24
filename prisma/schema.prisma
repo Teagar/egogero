@@ -56,17 +56,33 @@ model Convidado {
 }
 
 model Convite {
-  id           String     @id @default(uuid())
-  createdAt    DateTime   @default(now())
+  id           String       @id @default(uuid())
+  createdAt    DateTime     @default(now())
   deletedAt    DateTime?
   condominioId String
   moradorId    String?
   convidadoId  String?
-  condominio   Condominio @relation(fields: [condominioId], references: [id], onDelete: Restrict)
-  morador      Morador?   @relation("ConviteMorador", fields: [moradorId, condominioId], references: [id, condominioId], onDelete: Restrict)
-  convidado    Convidado? @relation("ConviteConvidado", fields: [convidadoId, condominioId], references: [id, condominioId], onDelete: Restrict)
+  tipo         TipoConvite?
+  expiresAt    DateTime?
+  usedAt       DateTime?
+  tokenDigest  String?      @unique @db.Char(64)
+  condominio   Condominio   @relation(fields: [condominioId], references: [id], onDelete: Restrict)
+  morador      Morador?     @relation("ConviteMorador", fields: [moradorId, condominioId], references: [id, condominioId], onDelete: Restrict)
+  convidado    Convidado?   @relation("ConviteConvidado", fields: [convidadoId, condominioId], references: [id, condominioId], onDelete: Restrict)
 
   @@index([condominioId])
   @@index([moradorId])
   @@index([convidadoId])
+  @@index([condominioId, expiresAt])
+}
+
+enum TipoConvite {
+  visitante
+  prestador
+  entregador
+}
+
+model SecurityKey {
+  name        String @id
+  fingerprint String @db.Char(64)
 }

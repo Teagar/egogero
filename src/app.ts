@@ -3,6 +3,8 @@ import Fastify from 'fastify';
 import { authorize, isUuid, unauthenticatedAuthenticator } from './auth.js';
 import type { Authenticator } from './auth.js';
 import { registerConvidadoRoutes } from './convidados.js';
+import { createPrismaInvitationStore, registerConviteRoutes } from './convites.js';
+import type { InvitationStore } from './convites.js';
 import { prisma as defaultPrisma } from './lib/prisma.js';
 
 type CondominioRecord = {
@@ -110,6 +112,8 @@ export type AppStore = {
     }): Promise<{ count: number }>;
   };
 };
+
+export type AppDependencies = AppStore & { convite?: InvitationStore };
 
 export type CondominioStore = AppStore;
 
@@ -357,10 +361,17 @@ const defaultStore: AppStore = {
 
 export function createApp(
   {
-    db = defaultStore,
-    authenticator = unauthenticatedAuthenticator
-  }: { db?: AppStore; authenticator?: Authenticator } = {}
+    db: suppliedDb,
+    authenticator = unauthenticatedAuthenticator,
+    invitationTokenSecret = process.env.INVITATION_TOKEN_SECRET
+  }: { db?: AppDependencies; authenticator?: Authenticator; invitationTokenSecret?: string } = {}
 ) {
+  const db: AppDependencies = suppliedDb ?? {
+    ...defaultStore,
+    convite: invitationTokenSecret
+      ? createPrismaInvitationStore(defaultPrisma, invitationTokenSecret)
+      : undefined
+  };
   const app = Fastify({ logger: false });
   const condominioManagement = { preHandler: authorize(authenticator, 'condominios:manage') };
   const createMoradorManagement = {
@@ -581,6 +592,7 @@ export function createApp(
   });
 
   registerConvidadoRoutes(app, db, authenticator);
+  registerConviteRoutes(app, db.convite, authenticator);
 
   return app;
 }
