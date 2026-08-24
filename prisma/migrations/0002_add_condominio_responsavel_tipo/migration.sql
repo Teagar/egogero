@@ -1,0 +1,5 @@
+ALTER TABLE "Condominio" ADD COLUMN "responsavel" TEXT NOT NULL DEFAULT '';
+ALTER TABLE "Condominio" ADD COLUMN "tipo" TEXT NOT NULL DEFAULT '';
+
+ALTER TABLE "Condominio" ALTER COLUMN "responsavel" DROP DEFAULT;
+ALTER TABLE "Condominio" ALTER COLUMN "tipo" DROP DEFAULT;

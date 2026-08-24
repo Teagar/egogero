@@ -8,13 +8,15 @@ datasource db {
 }
 
 model Condominio {
-  id         String     @id @default(uuid())
-  createdAt  DateTime   @default(now())
-  deletedAt  DateTime?
-  nome       String
-  moradores  Morador[]
-  convidados Convidado[]
-  convites   Convite[]
+  id          String      @id @default(uuid())
+  createdAt   DateTime    @default(now())
+  deletedAt   DateTime?
+  nome        String
+  responsavel String
+  tipo        String
+  moradores   Morador[]
+  convidados  Convidado[]
+  convites    Convite[]
 }
 
 model Morador {
