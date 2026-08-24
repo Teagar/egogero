@@ -817,7 +817,6 @@ export async function createOidcService(
   async function appendFailureAudit(
     reasonCode: string,
     requestCorrelationId: string,
-    ipPrefix = 'unknown',
     reservationId?: string
   ) {
     try {
@@ -833,12 +832,7 @@ export async function createOidcService(
     metrics.increment('auth_oidc_callback_total', { outcome: 'failure', reason: reasonClass(reasonCode) });
     if (reasonCode === 'invalid_state') alerts.emit('oidc_replay_or_state_miss', { reason: 'state_miss' });
     if (reasonCode === 'issuer_mixup') alerts.emit('oidc_issuer_mixup', { reason: 'issuer_mismatch' });
-    if (reservationId) {
-      await dependencies.rateLimiter?.finalizeCallback(reservationId, 'failure');
-    } else {
-      const decision = await dependencies.rateLimiter?.check('callback_failure_ip', ipPrefix);
-      if (decision && !decision.allowed) throw new AuthRateLimitError(decision.retryAfterSeconds);
-    }
+    if (reservationId) await dependencies.rateLimiter?.finalizeFailure(reservationId, 'failure');
   }
 
   function reasonClass(reason: string) {
@@ -911,21 +905,20 @@ export async function createOidcService(
     },
 
     async completeCallback({ callbackUrl, requestCorrelationId, ipPrefix = 'unknown' }) {
+      const reservation = await dependencies.rateLimiter?.reserveFailure('callback_failure_ip', ipPrefix);
+      if (reservation && !reservation.allowed) throw new AuthRateLimitError(reservation.retryAfterSeconds);
+      const reservationId = reservation?.reservationId;
       const states = callbackUrl.searchParams.getAll('state');
       if (states.length !== 1 || !states[0] || states[0].length > 512) {
-        await appendFailureAudit('invalid_state', requestCorrelationId, ipPrefix);
+        await appendFailureAudit('invalid_state', requestCorrelationId, reservationId);
         throw new OidcCallbackError();
       }
 
       const transaction = await store.consumeTransaction(digest(states[0]));
       if (!transaction) {
-        await appendFailureAudit('invalid_state', requestCorrelationId, ipPrefix);
+        await appendFailureAudit('invalid_state', requestCorrelationId, reservationId);
         throw new OidcCallbackError();
       }
-
-      const reservation = await dependencies.rateLimiter?.reserveCallback(ipPrefix);
-      if (reservation && !reservation.allowed) throw new AuthRateLimitError(reservation.retryAfterSeconds);
-      const reservationId = reservation?.reservationId;
 
       const codes = callbackUrl.searchParams.getAll('code');
       const issuers = callbackUrl.searchParams.getAll('iss');
@@ -946,7 +939,7 @@ export async function createOidcService(
       ) {
         const issuerMismatch = issuers.length === 1 && issuers[0] !== config.issuer;
         await appendFailureAudit(
-          issuerMismatch ? 'issuer_mixup' : 'invalid_callback', requestCorrelationId, ipPrefix, reservationId
+          issuerMismatch ? 'issuer_mixup' : 'invalid_callback', requestCorrelationId, reservationId
         );
         throw new OidcCallbackError();
       }
@@ -958,7 +951,7 @@ export async function createOidcService(
         alerts.emit(config.pkceKeys.has(transaction.pkceKeyVersion)
           ? 'crypto_integrity_failure'
           : 'crypto_key_failure', { operation: 'oidc_pkce' });
-        await appendFailureAudit('pkce_decryption_failed', requestCorrelationId, ipPrefix, reservationId);
+        await appendFailureAudit('pkce_decryption_failed', requestCorrelationId, reservationId);
         throw new OidcCallbackError();
       }
 
@@ -1014,16 +1007,16 @@ export async function createOidcService(
           }
         });
         if (!identity) throw new AuditedOidcCallbackError();
-        if (reservationId) await dependencies.rateLimiter?.finalizeCallback(reservationId, 'success');
+        if (reservationId) await dependencies.rateLimiter?.finalizeFailure(reservationId, 'success');
         metrics.increment('auth_oidc_callback_total', { outcome: 'success', reason: 'none' });
         return { returnTo: transaction.returnTo, identity, handoffToken };
       } catch (error) {
         if (error instanceof AuditedOidcCallbackError) {
-          await appendFailureAudit('access_not_provisioned', requestCorrelationId, ipPrefix, reservationId);
+          await appendFailureAudit('access_not_provisioned', requestCorrelationId, reservationId);
           throw new OidcCallbackError();
         }
         if (error instanceof AuthRateLimitError) throw error;
-        await appendFailureAudit('oidc_validation_failed', requestCorrelationId, ipPrefix, reservationId);
+        await appendFailureAudit('oidc_validation_failed', requestCorrelationId, reservationId);
         throw new OidcCallbackError();
       }
     }

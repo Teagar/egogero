@@ -32,8 +32,8 @@ test(
     };
     const permissiveRateLimiter = {
       async check() { return { allowed: true, retryAfterSeconds: 0, repeatedExcess: false }; },
-      async reserveCallback() { return { allowed: true, retryAfterSeconds: 0, repeatedExcess: false, reservationId: randomUUID() }; },
-      async finalizeCallback() {}
+      async reserveFailure() { return { allowed: true, retryAfterSeconds: 0, repeatedExcess: false, reservationId: randomUUID() }; },
+      async finalizeFailure() {}
     } satisfies AuthRateLimiter;
     const store = createPrismaBrowserSessionStore(prisma, config, { rateLimiter: permissiveRateLimiter });
     const accountId = randomUUID();
@@ -573,7 +573,10 @@ test(
 );
 
 test('recovery always revokes old sessions before an exhausted replacement-session limit', { skip: !runDatabaseTests }, async () => {
-  const prisma = new PrismaClient();
+  const databaseUrl = process.env.DATABASE_URL!;
+  const prisma = new PrismaClient({
+    datasourceUrl: `${databaseUrl}${databaseUrl.includes('?') ? '&' : '?'}connection_limit=1&pool_timeout=2`
+  });
   const accountId = randomUUID();
   const identityId = randomUUID();
   const membershipId = randomUUID();

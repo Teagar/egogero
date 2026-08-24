@@ -3,6 +3,7 @@ import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import test from 'node:test';
 
 import { exportJWK, generateKeyPair, SignJWT } from 'jose';
+import { PrismaClient } from '@prisma/client';
 
 import { createApp } from '../src/app.js';
 import {
@@ -15,8 +16,17 @@ import { createBrowserSessionService, generateSessionToken, SESSION_COOKIE_NAME 
 import type { BrowserSessionStore } from '../src/sessions.js';
 import { createAuthTestCollectors } from '../src/auth-observability.js';
 import { AuthRateLimitError } from '../src/oidc.js';
+import type { AuthRateLimiter } from '../src/auth-rate-limits.js';
+import { createPrismaAuthRateLimiter } from '../src/auth-rate-limits.js';
 
 type StoredTransaction = Parameters<OidcLoginStore['createTransaction']>[0] & { createdAt: Date; consumed: boolean };
+const runDatabaseTests = process.env.RUN_DATABASE_TESTS === 'true' && Boolean(process.env.DATABASE_URL);
+
+const permissiveAuthRateLimiter = {
+  async check() { return { allowed: true, retryAfterSeconds: 0, repeatedExcess: false }; },
+  async reserveFailure() { return { allowed: true, retryAfterSeconds: 0, repeatedExcess: false, reservationId: randomUUID() }; },
+  async finalizeFailure() {}
+} satisfies AuthRateLimiter;
 
 function configuration(overrides: Partial<OidcRuntimeConfig> = {}): OidcRuntimeConfig {
   const keyOne = Buffer.alloc(32, 1);
@@ -273,7 +283,7 @@ test('OIDC login stores only digests and AEAD material, validates a callback onc
   assert.equal('nonce' in stored, false);
   assert.equal('pkceVerifier' in stored, false);
 
-  const app = createApp({ oidcService: service });
+  const app = createApp({ oidcService: service, authRateLimiter: permissiveAuthRateLimiter });
   const successful = await app.inject({
     method: 'GET',
     url: `/auth/callback?code=authorization-code-canary&state=${encodeURIComponent(authorization.searchParams.get('state')!)}`
@@ -306,7 +316,7 @@ test('OIDC login stores only digests and AEAD material, validates a callback onc
   await app.close();
 });
 
-test('OIDC callback consumes state but performs no provider exchange after distributed denial', async () => {
+test('OIDC callback preserves state and performs no provider exchange after distributed denial', async () => {
   const config = configuration();
   const database = memoryStore();
   const provider = await mockProvider(config);
@@ -317,10 +327,10 @@ test('OIDC callback consumes state but performs no provider exchange after distr
           ? { allowed: true, retryAfterSeconds: 0, repeatedExcess: false }
           : { allowed: false, retryAfterSeconds: 30, repeatedExcess: true };
       },
-      async reserveCallback() {
+      async reserveFailure() {
         return { allowed: false, retryAfterSeconds: 30, repeatedExcess: true };
       },
-      async finalizeCallback() {}
+      async finalizeFailure() {}
     }
   });
   const authorization = await service.startLogin({ requestCorrelationId: 'limited-login' });
@@ -335,7 +345,45 @@ test('OIDC callback consumes state but performs no provider exchange after distr
   );
   assert.equal(provider.tokenCalls, 0);
   const state = authorization.searchParams.get('state')!;
-  assert.equal(database.transactions.get(createHash('sha256').update(state).digest('hex'))!.consumed, true);
+  assert.equal(database.transactions.get(createHash('sha256').update(state).digest('hex'))!.consumed, false);
+});
+
+test('OIDC callback denial stops immutable failure-audit growth at the distributed threshold', { skip: !runDatabaseTests }, async () => {
+  const prisma = new PrismaClient();
+  const config = configuration();
+  const database = memoryStore();
+  const provider = await mockProvider(config);
+  const ipPrefix = `192.0.2.0/24-${randomUUID()}`;
+  const correlationPrefix = `limited-invalid-state-${randomUUID()}`;
+  database.store.appendAudit = async (input) => {
+    await prisma.authenticationAuditEvent.create({
+      data: {
+        eventType: input.eventType,
+        outcome: input.outcome,
+        actorType: 'anonymous',
+        requestCorrelationId: input.requestCorrelationId,
+        reasonCode: input.reasonCode
+      }
+    });
+  };
+  try {
+    const service = await createOidcService(config, database.store, provider.fetchImplementation, {
+      rateLimiter: createPrismaAuthRateLimiter(prisma)
+    });
+    for (let index = 0; index < 15; index += 1) {
+      await assert.rejects(service.completeCallback({
+        callbackUrl: new URL(config.redirectUri),
+        requestCorrelationId: `${correlationPrefix}-${index}`,
+        ipPrefix
+      }), index < 10 ? OidcCallbackError : AuthRateLimitError);
+    }
+    assert.equal(await prisma.authenticationAuditEvent.count({
+      where: { requestCorrelationId: { startsWith: correlationPrefix } }
+    }), 10);
+  } finally {
+    await prisma.authenticationRateLimit.deleteMany({ where: { subject: ipPrefix } });
+    await prisma.$disconnect();
+  }
 });
 
 test('OIDC callback finalizes exact exchange reservations as success or failure', async () => {
@@ -347,11 +395,11 @@ test('OIDC callback finalizes exact exchange reservations as success or failure'
   const service = await createOidcService(config, database.store, provider.fetchImplementation, {
     rateLimiter: {
       async check() { return { allowed: true, retryAfterSeconds: 0, repeatedExcess: false }; },
-      async reserveCallback() {
+      async reserveFailure() {
         sequence += 1;
         return { allowed: true, retryAfterSeconds: 0, repeatedExcess: false, reservationId: `reservation-${sequence}` };
       },
-      async finalizeCallback(reservationId, outcome) { finalized.push({ reservationId, outcome }); }
+      async finalizeFailure(reservationId, outcome) { finalized.push({ reservationId, outcome }); }
     }
   });
 
@@ -658,7 +706,8 @@ test('OIDC callback converts its one-time handoff into the final browser session
   const app = createApp({
     oidcService,
     browserSessionService: createBrowserSessionService(sessionStore),
-    browserSessionStore: sessionStore
+    browserSessionStore: sessionStore,
+    authRateLimiter: permissiveAuthRateLimiter
   });
   const ambiguous = await app.inject({
     method: 'GET', url: '/auth/callback?code=code&state=state',

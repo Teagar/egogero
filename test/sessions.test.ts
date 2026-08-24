@@ -369,7 +369,12 @@ test('browser auth endpoints are no-store and implement session, tenant, logout,
   const app = createApp({
     browserSessionStore: store,
     browserSessionService: createBrowserSessionService(store),
-    oidcService
+    oidcService,
+    authRateLimiter: {
+      async check() { return { allowed: true, retryAfterSeconds: 0, repeatedExcess: false }; },
+      async reserveFailure() { return { allowed: true, retryAfterSeconds: 0, repeatedExcess: false, reservationId: randomUUID() }; },
+      async finalizeFailure() {}
+    }
   });
   const cookie = `${SESSION_COOKIE_NAME}=${token}`;
   const headers = {

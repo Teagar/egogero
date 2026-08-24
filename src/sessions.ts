@@ -736,7 +736,7 @@ export function createPrismaBrowserSessionStore(
             await auditDenied(transaction, input, 'mfa_policy_denied', 'insufficient_authentication_assurance', oldSession);
             return null;
           }
-          const creationLimit = await rateLimiter.check('session_creation_account', account.id);
+          const creationLimit = await rateLimiter.check('session_creation_account', account.id, true, transaction);
           if (!creationLimit.allowed) {
             csrf.fill(0);
             await auditDenied(transaction, input, 'session_reauthentication_denied', 'session_creation_rate_limited', oldSession);
@@ -806,7 +806,7 @@ export function createPrismaBrowserSessionStore(
           });
           metrics.increment('auth_database_writes_total', { operation: 'recovery', outcome: 'success' });
         }
-        const creationLimit = await rateLimiter.check('session_creation_account', account.id);
+        const creationLimit = await rateLimiter.check('session_creation_account', account.id, true, transaction);
         if (!creationLimit.allowed) {
           await insertAudit(transaction, {
             eventType: 'session_issue_denied', outcome: 'denied', reasonCode: 'session_creation_rate_limited',
@@ -1060,7 +1060,7 @@ export function createPrismaBrowserSessionStore(
           await auditDenied(transaction, input, 'mfa_policy_denied', 'insufficient_authentication_assurance', session);
           return { status: 'denied' };
         }
-        const creationLimit = await rateLimiter.check('session_creation_account', session.accountId);
+        const creationLimit = await rateLimiter.check('session_creation_account', session.accountId, true, transaction);
         if (!creationLimit.allowed) {
           await auditDenied(transaction, input, 'session_rotation_denied', 'session_creation_rate_limited', session);
           return { status: 'denied' };
@@ -1237,28 +1237,39 @@ export function createBrowserSessionAuthenticator(store: BrowserSessionStore, ra
   return {
     async authenticate(request: FastifyRequest) {
       const ipPrefix = requestIpPrefix(request);
+      const hasSession = hasBrowserSessionCookie(request.headers.cookie);
+      if (!hasSession) return null;
+      const reservation = await rateLimiter?.reserveFailure('authentication_failure_ip', ipPrefix);
+      if (reservation && !reservation.allowed) {
+        throw new AuthenticationError(429, 'authentication_temporarily_unavailable', {
+          'cache-control': 'no-store', 'retry-after': String(reservation.retryAfterSeconds)
+        });
+      }
+      const reservationId = reservation?.reservationId;
+      let reservationFinalized = false;
+      const finalize = async (outcome: 'success' | 'failure') => {
+        if (reservationId && !reservationFinalized) {
+          reservationFinalized = true;
+          await rateLimiter?.finalizeFailure(reservationId, outcome);
+        }
+      };
       const rejectAuthenticationFailure = async (
         statusCode: 401 | 403,
         code: 'authentication_required' | 'csrf_required',
         headers: Record<string, string>
       ): Promise<never> => {
-        const limited = await rateLimiter?.check('authentication_failure_ip', ipPrefix);
-        if (limited && !limited.allowed) {
-          throw new AuthenticationError(429, 'authentication_temporarily_unavailable', {
-            'cache-control': 'no-store', 'retry-after': String(limited.retryAfterSeconds)
-          });
-        }
+        await finalize('failure');
         throw new AuthenticationError(statusCode, code, headers);
       };
-      const token = parseBrowserSessionCookie(request.headers.cookie);
-      if (!token) {
-        if (!hasBrowserSessionCookie(request.headers.cookie)) return null;
-        return rejectAuthenticationFailure(401, 'authentication_required', {
-          'cache-control': 'no-store',
-          'set-cookie': CLEARED_SESSION_COOKIE
-        });
-      }
-      if (!['GET', 'HEAD', 'OPTIONS'].includes(request.method)) {
+      try {
+        const token = parseBrowserSessionCookie(request.headers.cookie);
+        if (!token) {
+          return rejectAuthenticationFailure(401, 'authentication_required', {
+            'cache-control': 'no-store',
+            'set-cookie': CLEARED_SESSION_COOKIE
+          });
+        }
+        if (!['GET', 'HEAD', 'OPTIONS'].includes(request.method)) {
         const identity = await store.authenticate(token, request.id, false);
         if (!identity) {
           return rejectAuthenticationFailure(401, 'authentication_required', {
@@ -1322,17 +1333,23 @@ export function createBrowserSessionAuthenticator(store: BrowserSessionStore, ra
             'set-cookie': CLEARED_SESSION_COOKIE
           });
         }
-        request.browserSessionSnapshot = snapshot;
-        return finalIdentity;
+          request.browserSessionSnapshot = snapshot;
+          await finalize('success');
+          return finalIdentity;
+        }
+        const identity = await store.authenticate(token, request.id);
+        if (!identity) {
+          return rejectAuthenticationFailure(401, 'authentication_required', {
+            'cache-control': 'no-store',
+            'set-cookie': CLEARED_SESSION_COOKIE
+          });
+        }
+        await finalize('success');
+        return identity;
+      } catch (error) {
+        await finalize('success');
+        throw error;
       }
-      const identity = await store.authenticate(token, request.id);
-      if (!identity) {
-        return rejectAuthenticationFailure(401, 'authentication_required', {
-          'cache-control': 'no-store',
-          'set-cookie': CLEARED_SESSION_COOKIE
-        });
-      }
-      return identity;
     }
   };
 }

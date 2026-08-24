@@ -4,10 +4,13 @@ import { randomUUID } from 'node:crypto';
 
 import {
   createAuthTestCollectors,
+  createStructuredAuthTelemetry,
   evaluateAuthAggregates,
   redactAuthData,
+  registerAuthTelemetryLifecycle,
   safeAuthAlerts,
-  safeAuthMetrics
+  safeAuthMetrics,
+  type StructuredAuthTelemetryRecord
 } from '../src/auth-observability.js';
 import { normalizeIpPrefix, trustedProxyFromEnvironment } from '../src/client-ip.js';
 import { createApp } from '../src/app.js';
@@ -45,8 +48,8 @@ test('Fastify only derives minimized forwarded IP through an explicitly trusted 
         subject = value;
         return { allowed: false, retryAfterSeconds: 1, repeatedExcess: false };
       },
-      async reserveCallback() { return { allowed: true, retryAfterSeconds: 0, repeatedExcess: false, reservationId: randomUUID() }; },
-      async finalizeCallback() {}
+      async reserveFailure() { return { allowed: true, retryAfterSeconds: 0, repeatedExcess: false, reservationId: randomUUID() }; },
+      async finalizeFailure() {}
     };
     const app = createApp({
       trustProxy,
@@ -77,8 +80,8 @@ test('recovery initiation is generic, marks recovery intent, and returns Retry-A
         attempts += 1;
         return { allowed: attempts <= 3, retryAfterSeconds: 60, repeatedExcess: attempts > 5 };
       },
-      async reserveCallback() { return { allowed: true, retryAfterSeconds: 0, repeatedExcess: false, reservationId: randomUUID() }; },
-      async finalizeCallback() {}
+      async reserveFailure() { return { allowed: true, retryAfterSeconds: 0, repeatedExcess: false, reservationId: randomUUID() }; },
+      async finalizeFailure() {}
     },
     oidcService: {
       failurePath: '/auth/error',
@@ -146,12 +149,46 @@ test('aggregate observer emits callback and session SLO alerts with bounded deta
   assert.ok(collectors.alerts.every((alert) => !JSON.stringify(alert.details).match(/account|sessionId|ip|token/i)));
 });
 
+test('structured telemetry periodically evaluates bounded aggregates and stops with Fastify', async () => {
+  const records: StructuredAuthTelemetryRecord[] = [];
+  const telemetry = createStructuredAuthTelemetry((record) => records.push(record));
+  const app = createApp();
+  const timer = registerAuthTelemetryLifecycle(app, telemetry, 10);
+  assert.equal(timer.hasRef(), false);
+  for (let index = 0; index < 100; index += 1) {
+    telemetry.metrics.increment('auth_oidc_callback_total', { outcome: 'failure', reason: 'validation' });
+    telemetry.metrics.observe('auth_session_lookup_seconds', 0.025, { operation: 'inspect', outcome: 'miss' });
+  }
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  assert.ok(records.some((record) => record.event === 'auth_metrics'
+    && record.counters.auth_oidc_callback_total === 100));
+  assert.deepEqual(records.filter((record) => record.event === 'auth_alert').map((record) => record.type).sort(), [
+    'oidc_callback_success_slo',
+    'session_lookup_latency_slo'
+  ]);
+  await app.close();
+  const afterClose = records.length;
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  assert.equal(records.length, afterClose);
+});
+
+test('human authentication routes fail construction without the distributed limiter', async () => {
+  const oidcService = {
+    failurePath: '/auth/error',
+    async startLogin() { return new URL('https://identity.example.test/authorize'); },
+    async completeCallback() { throw new Error('unused'); }
+  };
+  assert.throws(() => createApp({ oidcService }), /require an AuthRateLimiter/);
+  const deviceOnlyApp = createApp();
+  await deviceOnlyApp.close();
+});
+
 test('session lookup metrics distinguish database failure from a credential miss', async () => {
   const collectors = createAuthTestCollectors();
   const rateLimiter: AuthRateLimiter = {
     async check() { return { allowed: true, retryAfterSeconds: 0, repeatedExcess: false }; },
-    async reserveCallback() { return { allowed: true, retryAfterSeconds: 0, repeatedExcess: false, reservationId: randomUUID() }; },
-    async finalizeCallback() {}
+    async reserveFailure() { return { allowed: true, retryAfterSeconds: 0, repeatedExcess: false, reservationId: randomUUID() }; },
+    async finalizeFailure() {}
   };
   const failingClient = {
     async $transaction() { throw new Error('database unavailable'); }

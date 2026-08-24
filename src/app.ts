@@ -461,6 +461,9 @@ export function createApp(
     authRateLimiter?: AuthRateLimiter;
   } = {}
 ) {
+  if (!authRateLimiter && (oidcService || browserSessionService || browserSessionStore || humanAdministrationService)) {
+    throw new Error('Human authentication routes require an AuthRateLimiter');
+  }
   const db: AppDependencies = suppliedDb ?? {
     ...defaultStore,
     convite: invitationStore ?? (invitationTokenSecret

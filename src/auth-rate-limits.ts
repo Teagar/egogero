@@ -15,15 +15,21 @@ export const AUTH_RATE_LIMIT_POLICIES = {
 } as const;
 
 export type AuthRateLimitAction = keyof typeof AUTH_RATE_LIMIT_POLICIES;
+export type AuthFailureRateLimitAction = Extract<AuthRateLimitAction, 'callback_failure_ip' | 'authentication_failure_ip'>;
 export type AuthRateLimitDecision = { allowed: boolean; retryAfterSeconds: number; repeatedExcess: boolean };
-export type CallbackRateLimitReservation =
+export type AuthRateLimitReservation =
   | { allowed: true; retryAfterSeconds: 0; repeatedExcess: false; reservationId: string }
   | { allowed: false; retryAfterSeconds: number; repeatedExcess: boolean; reservationId?: never };
 
 export interface AuthRateLimiter {
-  check(action: AuthRateLimitAction, subject: string, consume?: boolean): Promise<AuthRateLimitDecision>;
-  reserveCallback(subject: string): Promise<CallbackRateLimitReservation>;
-  finalizeCallback(reservationId: string, outcome: 'success' | 'failure'): Promise<void>;
+  check(
+    action: AuthRateLimitAction,
+    subject: string,
+    consume?: boolean,
+    transaction?: Prisma.TransactionClient
+  ): Promise<AuthRateLimitDecision>;
+  reserveFailure(action: AuthFailureRateLimitAction, subject: string): Promise<AuthRateLimitReservation>;
+  finalizeFailure(reservationId: string, outcome: 'success' | 'failure'): Promise<void>;
   cleanup?(): Promise<number>;
 }
 
@@ -45,11 +51,12 @@ export function createPrismaAuthRateLimiter(
     }
   }
   return {
-    async check(action, rawSubject, consume = true) {
+    async check(action, rawSubject, consume = true, transaction) {
       const policy = AUTH_RATE_LIMIT_POLICIES[action];
       const subject = boundedSubject(rawSubject);
+      const database = transaction ?? client;
       const rows = consume
-        ? await client.$queryRaw<Array<{ allowed: boolean; retryAfterSeconds: number; deniedCount: number }>>(Prisma.sql`
+        ? await database.$queryRaw<Array<{ allowed: boolean; retryAfterSeconds: number; deniedCount: number }>>(Prisma.sql`
             WITH db_clock AS MATERIALIZED (SELECT clock_timestamp() AS now), upserted AS (
               INSERT INTO "AuthenticationRateLimit" (
                 action, subject, "windowStartedAt", count, "deniedCount", "blockedUntil", "updatedAt"
@@ -85,7 +92,7 @@ export function createPrismaAuthRateLimiter(
               ) - clock_timestamp())))::integer) AS "retryAfterSeconds",
               "deniedCount" FROM upserted
           `)
-        : await client.$queryRaw<Array<{ allowed: boolean; retryAfterSeconds: number; deniedCount: number }>>(Prisma.sql`
+        : await database.$queryRaw<Array<{ allowed: boolean; retryAfterSeconds: number; deniedCount: number }>>(Prisma.sql`
             SELECT count < ${policy.limit}
                 AND COALESCE("blockedUntil", clock_timestamp()) <= clock_timestamp() AS allowed,
               GREATEST(1, CEIL(EXTRACT(EPOCH FROM (GREATEST(
@@ -103,12 +110,11 @@ export function createPrismaAuthRateLimiter(
       observeDecision(action, decision);
       return decision;
     },
-    async reserveCallback(rawSubject) {
-      const action: AuthRateLimitAction = 'callback_failure_ip';
+    async reserveFailure(action, rawSubject) {
       const policy = AUTH_RATE_LIMIT_POLICIES[action];
       const subject = boundedSubject(rawSubject);
       const reservationId = randomUUID();
-      const result = await client.$transaction(async (transaction): Promise<CallbackRateLimitReservation> => {
+      const result = await client.$transaction(async (transaction): Promise<AuthRateLimitReservation> => {
         await transaction.$executeRaw`
           INSERT INTO "AuthenticationRateLimit" (action, subject, "windowStartedAt", count, "deniedCount", "reservedCount", "updatedAt")
           VALUES (${action}, ${subject}, clock_timestamp(), 0, 0, 0, clock_timestamp())
@@ -180,7 +186,7 @@ export function createPrismaAuthRateLimiter(
       observeDecision(action, result);
       return result;
     },
-    async finalizeCallback(reservationId, outcome) {
+    async finalizeFailure(reservationId, outcome) {
       await client.$transaction(async (transaction) => {
         const reservations = await transaction.$queryRaw<Array<{
           action: string;
@@ -207,9 +213,10 @@ export function createPrismaAuthRateLimiter(
           RETURNING id
         `);
         if (!deleted[0]) return;
-        const failureInCurrentWindow = outcome === 'failure'
+        const policy = AUTH_RATE_LIMIT_POLICIES[reservation.action as AuthFailureRateLimitAction];
+        const failureInCurrentWindow = policy !== undefined && outcome === 'failure'
           && reservation.expiresAt > bucket.databaseNow
-          && bucket.windowStartedAt.getTime() + AUTH_RATE_LIMIT_POLICIES.callback_failure_ip.windowMs > bucket.databaseNow.getTime();
+          && bucket.windowStartedAt.getTime() + policy.windowMs > bucket.databaseNow.getTime();
         await transaction.$executeRaw`
           UPDATE "AuthenticationRateLimit"
           SET "reservedCount" = GREATEST(0, "reservedCount" - 1),

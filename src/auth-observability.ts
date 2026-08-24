@@ -96,6 +96,84 @@ export function evaluateAuthAggregates(snapshot: AuthAggregateSnapshot, sink: Au
   }
 }
 
+export type StructuredAuthTelemetryRecord =
+  | { event: 'auth_metrics'; counters: Partial<Record<AuthMetricName, number>>; observations: Partial<Record<AuthMetricName, number>> }
+  | { event: 'auth_alert'; type: AuthAlertType; details: unknown };
+
+export type StructuredAuthTelemetry = {
+  metrics: AuthMetrics;
+  alerts: AuthAlertSink;
+  flush(): void;
+};
+
+export function createStructuredAuthTelemetry(
+  write: (record: StructuredAuthTelemetryRecord) => void = (record) => console.info(JSON.stringify(record))
+): StructuredAuthTelemetry {
+  const counters: Partial<Record<AuthMetricName, number>> = {};
+  const observations: Partial<Record<AuthMetricName, number>> = {};
+  let callbackSuccess = 0;
+  let callbackFailure = 0;
+  let sessionLookupSeconds: number[] = [];
+
+  const alerts: AuthAlertSink = {
+    emit(type, details) {
+      write({ event: 'auth_alert', type, details: redactAuthData(details) });
+    }
+  };
+  const metrics: AuthMetrics = {
+    increment(name, labels, value = 1) {
+      if (!Number.isFinite(value)) return;
+      counters[name] = Math.min(Number.MAX_SAFE_INTEGER, (counters[name] ?? 0) + value);
+      if (name === 'auth_oidc_callback_total') {
+        if (labels.outcome === 'success') callbackSuccess += value;
+        if (labels.outcome === 'failure') callbackFailure += value;
+      }
+    },
+    observe(name, value) {
+      if (!Number.isFinite(value) || value < 0) return;
+      observations[name] = (observations[name] ?? 0) + 1;
+      if (name === 'auth_session_lookup_seconds' && sessionLookupSeconds.length < 1_024) {
+        sessionLookupSeconds.push(value);
+      }
+    }
+  };
+
+  return {
+    metrics,
+    alerts,
+    flush() {
+      const snapshot = { callbackSuccess, callbackFailure, sessionLookupSeconds };
+      const counterSnapshot = { ...counters };
+      const observationSnapshot = { ...observations };
+      callbackSuccess = 0;
+      callbackFailure = 0;
+      sessionLookupSeconds = [];
+      for (const name of Object.keys(counters) as AuthMetricName[]) delete counters[name];
+      for (const name of Object.keys(observations) as AuthMetricName[]) delete observations[name];
+      evaluateAuthAggregates(snapshot, alerts);
+      if (Object.keys(counterSnapshot).length > 0 || Object.keys(observationSnapshot).length > 0) {
+        try {
+          write({ event: 'auth_metrics', counters: counterSnapshot, observations: observationSnapshot });
+        } catch { /* telemetry output cannot affect authentication */ }
+      }
+    }
+  };
+}
+
+export function registerAuthTelemetryLifecycle(
+  app: FastifyInstance,
+  telemetry: StructuredAuthTelemetry,
+  intervalMs = 60_000
+) {
+  const timer = setInterval(() => telemetry.flush(), intervalMs);
+  timer.unref();
+  app.addHook('onClose', async () => {
+    clearInterval(timer);
+    telemetry.flush();
+  });
+  return timer;
+}
+
 export function createAuthTestCollectors() {
   const metrics: Array<{ name: AuthMetricName; value: number; labels: AuthMetricLabels; kind: 'counter' | 'histogram' }> = [];
   const alerts: Array<{ type: AuthAlertType; details: Readonly<Record<string, unknown>> }> = [];
@@ -111,3 +189,4 @@ export function createAuthTestCollectors() {
     } satisfies AuthAlertSink
   };
 }
+import type { FastifyInstance } from 'fastify';

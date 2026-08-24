@@ -18,6 +18,7 @@ import {
 } from './sessions.js';
 import { createHumanAdministrationService } from './human-administration.js';
 import { createPrismaAuthRateLimiter } from './auth-rate-limits.js';
+import { createStructuredAuthTelemetry, registerAuthTelemetryLifecycle } from './auth-observability.js';
 
 export async function startServer(environment: NodeJS.ProcessEnv = process.env) {
   const env = getEnv(environment);
@@ -35,9 +36,14 @@ export async function startServer(environment: NodeJS.ProcessEnv = process.env) 
   const notificationSender = environment.NODE_ENV === 'development'
     ? createDevelopmentNotificationSender()
     : createUnavailableNotificationSender();
-  const authRateLimiter = createPrismaAuthRateLimiter(prisma);
+  const authTelemetry = createStructuredAuthTelemetry();
+  const authRateLimiter = createPrismaAuthRateLimiter(prisma, authTelemetry.metrics, authTelemetry.alerts);
   const oidcService = env.oidc
-    ? await createOidcService(env.oidc, createPrismaOidcLoginStore(prisma), fetch, { rateLimiter: authRateLimiter })
+    ? await createOidcService(env.oidc, createPrismaOidcLoginStore(prisma), fetch, {
+        rateLimiter: authRateLimiter,
+        metrics: authTelemetry.metrics,
+        alerts: authTelemetry.alerts
+      })
     : undefined;
   const humanAdministrationService = env.humanAdministration
     ? createHumanAdministrationService(prisma, env.humanAdministration)
@@ -46,7 +52,7 @@ export async function startServer(environment: NodeJS.ProcessEnv = process.env) 
     ? createPrismaBrowserSessionStore(prisma, {
         ...env.sessions,
         mfaPolicy: env.humanAdministration?.mfaPolicy
-      }, { rateLimiter: authRateLimiter })
+      }, { rateLimiter: authRateLimiter, metrics: authTelemetry.metrics, alerts: authTelemetry.alerts })
     : undefined;
   const browserSessionService = browserSessionStore
     ? createBrowserSessionService(browserSessionStore)
@@ -71,6 +77,7 @@ export async function startServer(environment: NodeJS.ProcessEnv = process.env) 
     humanAdministrationService,
     authRateLimiter
   });
+  registerAuthTelemetryLifecycle(app, authTelemetry);
 
   await app.listen({ host: env.host, port: env.port });
   return app;

@@ -11,6 +11,24 @@ import type { BrowserSessionStore } from '../src/sessions.js';
 
 const runDatabaseTests = process.env.RUN_DATABASE_TESTS === 'true' && Boolean(process.env.DATABASE_URL);
 
+test('limiter checks use the supplied interactive transaction client', async () => {
+  let transactionQueries = 0;
+  const root = {
+    async $queryRaw() { throw new Error('root client must not be used'); }
+  } as unknown as PrismaClient;
+  const transaction = {
+    async $queryRaw() {
+      transactionQueries += 1;
+      return [{ allowed: true, retryAfterSeconds: 0, deniedCount: 0 }];
+    }
+  } as unknown as Parameters<Parameters<PrismaClient['$transaction']>[0]>[0];
+  const decision = await createPrismaAuthRateLimiter(root).check(
+    'session_creation_account', randomUUID(), true, transaction
+  );
+  assert.equal(decision.allowed, true);
+  assert.equal(transactionQueries, 1);
+});
+
 test('PostgreSQL auth limits hold exact thresholds across independent stores and apply backoff', { skip: !runDatabaseTests }, async () => {
   const firstClient = new PrismaClient();
   const secondClient = new PrismaClient();
@@ -79,11 +97,11 @@ test('callback exchange reservations are exact across stores and successful call
   const failureSubject = `203.0.113.0/24-${randomUUID()}`;
   try {
     const concurrent = await Promise.all(Array.from({ length: 16 }, (_, index) =>
-      (index % 2 ? first : second).reserveCallback(concurrentSubject)
+      (index % 2 ? first : second).reserveFailure('callback_failure_ip', concurrentSubject)
     ));
     assert.equal(concurrent.filter((decision) => decision.allowed).length, 10);
     await Promise.all(concurrent.flatMap((decision, index) => decision.reservationId
-      ? [(index % 2 ? first : second).finalizeCallback(decision.reservationId, 'success')]
+      ? [(index % 2 ? first : second).finalizeFailure(decision.reservationId, 'success')]
       : []));
     assert.deepEqual(await firstClient.authenticationRateLimit.findUniqueOrThrow({
       where: { action_subject: { action: 'callback_failure_ip', subject: concurrentSubject } },
@@ -91,9 +109,9 @@ test('callback exchange reservations are exact across stores and successful call
     }), { count: 0, reservedCount: 0 });
 
     for (let index = 0; index < 25; index += 1) {
-      const reservation = await (index % 2 ? first : second).reserveCallback(successSubject);
+      const reservation = await (index % 2 ? first : second).reserveFailure('callback_failure_ip', successSubject);
       assert.equal(reservation.allowed, true, 'successful callbacks must not consume the failure budget');
-      await (index % 2 ? second : first).finalizeCallback(reservation.reservationId!, 'success');
+      await (index % 2 ? second : first).finalizeFailure(reservation.reservationId!, 'success');
     }
     assert.deepEqual(await firstClient.authenticationRateLimit.findUniqueOrThrow({
       where: { action_subject: { action: 'callback_failure_ip', subject: successSubject } },
@@ -101,11 +119,11 @@ test('callback exchange reservations are exact across stores and successful call
     }), { count: 0, reservedCount: 0 });
 
     for (let index = 0; index < 10; index += 1) {
-      const reservation = await (index % 2 ? first : second).reserveCallback(failureSubject);
+      const reservation = await (index % 2 ? first : second).reserveFailure('callback_failure_ip', failureSubject);
       assert.equal(reservation.allowed, true);
-      await (index % 2 ? second : first).finalizeCallback(reservation.reservationId!, 'failure');
+      await (index % 2 ? second : first).finalizeFailure(reservation.reservationId!, 'failure');
     }
-    assert.equal((await first.reserveCallback(failureSubject)).allowed, false);
+    assert.equal((await first.reserveFailure('callback_failure_ip', failureSubject)).allowed, false);
     assert.deepEqual(await firstClient.authenticationRateLimit.findUniqueOrThrow({
       where: { action_subject: { action: 'callback_failure_ip', subject: failureSubject } },
       select: { count: true, reservedCount: true }
@@ -122,11 +140,24 @@ test('GET /auth/session shares its exact failure threshold across application in
   const firstClient = new PrismaClient();
   const secondClient = new PrismaClient();
   const subject = '127.0.0.0/24';
+  const auditCorrelationPrefix = `test-invalid-session-${randomUUID()}`;
+  let auditSequence = 0;
   const store = {
     publicApplicationOrigin: 'https://app.example.test',
     async issueFromHandoff() { return null; },
     async authenticate() { return null; },
-    async inspect() { return null; },
+    async inspect() {
+      await firstClient.authenticationAuditEvent.create({
+        data: {
+          eventType: 'session_authentication_denied',
+          outcome: 'denied',
+          actorType: 'anonymous',
+          requestCorrelationId: `${auditCorrelationPrefix}-${auditSequence += 1}`,
+          reasonCode: 'invalid_session'
+        }
+      });
+      return null;
+    },
     async isRevoked() { return false; },
     async rotate() { return { status: 'denied' as const }; },
     async revoke() { return 'unavailable' as const; },
@@ -147,23 +178,24 @@ test('GET /auth/session shares its exact failure threshold across application in
     await firstClient.authenticationRateLimit.deleteMany({
       where: { action: 'authentication_failure_ip', subject }
     });
-    const duplicateToken = generateSessionToken();
+    const nonexistentToken = generateSessionToken();
     const responses = await Promise.all(Array.from({ length: 70 }, (_, index) => {
-      const cookie = index % 3 === 1
-        ? `${SESSION_COOKIE_NAME}=malformed`
-        : index % 3 === 2
-          ? `${SESSION_COOKIE_NAME}=${duplicateToken}; ${SESSION_COOKIE_NAME}=${duplicateToken}`
-          : undefined;
       return (index % 2 ? firstApp : secondApp).inject({
-        method: 'GET', url: '/auth/session', headers: cookie ? { cookie } : undefined
+        method: 'GET', url: '/auth/session', headers: { cookie: `${SESSION_COOKIE_NAME}=${nonexistentToken}` }
       });
     }));
+    assert.ok(responses.every((response) => [401, 429].includes(response.statusCode)),
+      JSON.stringify(responses.map((response) => ({ status: response.statusCode, body: response.body }))));
     assert.equal(responses.filter((response) => response.statusCode === 401).length, 60);
     assert.equal(responses.filter((response) => response.statusCode === 429).length, 10);
     assert.ok(responses.every((response) => ['authentication_required', 'authentication_temporarily_unavailable']
       .includes(response.json().error)));
     assert.ok(responses.filter((response) => response.statusCode === 429)
       .every((response) => Number(response.headers['retry-after']) > 0));
+    assert.equal(await firstClient.authenticationAuditEvent.count({
+      where: { requestCorrelationId: { startsWith: auditCorrelationPrefix } }
+    }), 60,
+      'requests denied by the reservation must not reach audit-producing session lookup');
   } finally {
     await Promise.all([firstApp.close(), secondApp.close()]);
     await firstClient.authenticationRateLimit.deleteMany({

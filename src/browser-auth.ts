@@ -58,28 +58,39 @@ export function registerBrowserAuthRoutes(
     return authenticator.authenticate(request);
   }
 
-  async function rejectSessionLookup(request: FastifyRequest, reply: FastifyReply) {
+  async function rejectSessionLookup(
+    request: FastifyRequest,
+    reply: FastifyReply,
+    reservationId?: string
+  ) {
     reply.header('Set-Cookie', CLEARED_SESSION_COOKIE);
-    const limited = await rateLimiter?.check('authentication_failure_ip', requestIpPrefix(request));
-    if (limited && !limited.allowed) {
-      return reply
-        .header('Retry-After', limited.retryAfterSeconds)
-        .status(429)
-        .send({ error: 'authentication_temporarily_unavailable' });
-    }
+    if (reservationId) await rateLimiter?.finalizeFailure(reservationId, 'failure');
     return reply.status(401).send({ error: 'authentication_required' });
   }
 
   app.get('/auth/session', unambiguous, async (request, reply) => {
     noStore(reply);
+    const reservation = await rateLimiter?.reserveFailure('authentication_failure_ip', requestIpPrefix(request));
+    if (reservation && !reservation.allowed) {
+      return reply.header('Retry-After', reservation.retryAfterSeconds).status(429)
+        .send({ error: 'authentication_temporarily_unavailable' });
+    }
+    const reservationId = reservation?.reservationId;
     const token = parseBrowserSessionCookie(request.headers.cookie);
     if (!token) {
-      return rejectSessionLookup(request, reply);
+      return rejectSessionLookup(request, reply, reservationId);
     }
-    const snapshot = await store.inspect({ sessionToken: token, requestCorrelationId: request.id, ipPrefix: requestIpPrefix(request) });
+    let snapshot;
+    try {
+      snapshot = await store.inspect({ sessionToken: token, requestCorrelationId: request.id, ipPrefix: requestIpPrefix(request) });
+    } catch (error) {
+      if (reservationId) await rateLimiter?.finalizeFailure(reservationId, 'success');
+      throw error;
+    }
     if (!snapshot) {
-      return rejectSessionLookup(request, reply);
+      return rejectSessionLookup(request, reply, reservationId);
     }
+    if (reservationId) await rateLimiter?.finalizeFailure(reservationId, 'success');
     return {
       account: snapshot.account,
       memberships: snapshot.memberships,
