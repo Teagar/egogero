@@ -1,13 +1,13 @@
 const DEFAULT_PORT = 3000;
 
-export function getEnv() {
-  const port = Number(process.env.PORT ?? DEFAULT_PORT);
+export function getEnv(environment: NodeJS.ProcessEnv = process.env) {
+  const port = Number(environment.PORT ?? DEFAULT_PORT);
 
   if (!Number.isInteger(port) || port <= 0) {
     throw new Error('PORT must be a positive integer');
   }
 
-  const databaseUrl = process.env.DATABASE_URL;
+  const databaseUrl = environment.DATABASE_URL;
 
   if (!databaseUrl) {
     throw new Error('DATABASE_URL is required');
@@ -15,6 +15,8 @@ export function getEnv() {
 
   return {
     port,
-    databaseUrl
+    databaseUrl,
+    host: environment.HOST ?? (environment.LOCAL_DEVELOPMENT_AUTH === 'true' ? '127.0.0.1' : '0.0.0.0'),
+    localDevelopmentAuth: environment.LOCAL_DEVELOPMENT_AUTH === 'true'
   };
 }

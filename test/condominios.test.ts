@@ -5,9 +5,17 @@ import { createApp } from '../src/app.js';
 import type { AppStore } from '../src/app.js';
 import { createDevelopmentHeaderAuthenticator } from '../src/auth.js';
 
-const authenticator = createDevelopmentHeaderAuthenticator('test');
-const providerHeaders = { 'x-development-user-id': 'provider-1', 'x-development-user-role': 'provedor' };
-const moradorHeaders = { 'x-development-user-id': 'resident-1', 'x-development-user-role': 'morador' };
+const authenticator = createDevelopmentHeaderAuthenticator(true);
+const providerHeaders = {
+  'x-development-user-id': 'provider-1',
+  'x-development-user-role': 'provedor',
+  'x-development-condominio-id': '*'
+};
+const moradorHeaders = {
+  'x-development-user-id': 'resident-1',
+  'x-development-user-role': 'morador',
+  'x-development-condominio-id': '00000000-0000-4000-8000-000000000001'
+};
 
 type StoredCondominio = Awaited<ReturnType<AppStore['condominio']['create']>>;
 
