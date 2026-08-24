@@ -283,6 +283,7 @@ export function createPrismaInvitationStore(client: PrismaClient, tokenSecret: s
         AND convidado."moradorId" = ${first.moradorId}
         AND convidado."condominioId" = ${first.condominioId}
         AND convidado."deletedAt" IS NULL
+        AND convidado."anonymizedAt" IS NULL
         AND morador."deletedAt" IS NULL
         AND condominio."deletedAt" IS NULL
         AND ${earliestExpiration} > clock_timestamp()
@@ -862,6 +863,10 @@ export function registerConviteRoutes(
     try {
       const result = await createInvitation(store, { condominioId, moradorId, convidadoId, ...body });
       if (!result) return reply.status(404).send({ error: 'Guest not found' });
+      // Issuance now prevents anonymization; re-read contacts after its row lock commits.
+      const currentGuest = await db.convidado.findFirst({
+        where: { id: convidadoId, condominioId, moradorId, deletedAt: null, ...activeGuestParents }
+      });
       const message = invitationMessage({
         condominiumName: condominio.nome,
         residentName: morador.nome,
@@ -870,8 +875,8 @@ export function registerConviteRoutes(
         token: result.token
       });
       try {
-        if (convidado.email) await notifications.email.send(convidado.email, message);
-        if (convidado.telefone) await notifications.sms.send(convidado.telefone, message.body);
+        if (currentGuest?.email) await notifications.email.send(currentGuest.email, message);
+        if (currentGuest?.telefone) await notifications.sms.send(currentGuest.telefone, message.body);
       } catch {
         return reply.header('cache-control', 'no-store').status(502).send({ error: 'Invitation created but notification delivery failed', invitationId: result.convite.id });
       }

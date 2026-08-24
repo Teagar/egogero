@@ -178,7 +178,8 @@ export function registerConvidadoRoutes(app: FastifyInstance, db: GuestRouteStor
       return reply.status(400).send({ error: 'Invalid guest payload' });
     }
 
-    const where = { id, condominioId, moradorId, deletedAt: null, ...activeGuestParents } as const;
+    // Re-identification uses a new guest ID so immutable historical audits stay unlinkable.
+    const where = { id, condominioId, moradorId, deletedAt: null, anonymizedAt: null, ...activeGuestParents } as const;
     const result = await db.convidado.updateMany({ where, data });
     if (!result.count) {
       return reply.status(404).send({ error: 'Guest not found' });

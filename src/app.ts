@@ -71,6 +71,7 @@ type ConvidadoRecord = {
   condominioId: string;
   moradorId: string | null;
   ultimoUsoEm: Date | null;
+  anonymizedAt?: Date | null;
 };
 
 type ConvidadoCreateData = { nome: string; email: string | null; telefone: string | null; condominioId: string; moradorId: string };
@@ -78,6 +79,7 @@ type ConvidadoUpdateData = { nome?: string; email?: string | null; telefone?: st
 type ConvidadoOrderBy = { ultimoUsoEm: { sort: 'desc'; nulls: 'last' } } | { createdAt: 'desc' } | { id: 'desc' };
 type ConvidadoWhere = {
   id?: string;
+  anonymizedAt?: null;
   condominioId: string;
   moradorId: string;
   deletedAt: null;

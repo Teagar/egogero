@@ -8,9 +8,10 @@
     "start": "node dist/src/server.js",
     "lint": "eslint .",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "node --test --import tsx test/*.test.ts",
+    "test": "node --test --test-concurrency=1 --import tsx test/*.test.ts",
     "db:migrate:deploy": "prisma migrate deploy",
-    "db:generate": "prisma generate"
+    "db:generate": "prisma generate",
+    "privacy:anonymize": "node dist/src/jobs/anonymize-old-guests.js"
   },
   "dependencies": {
     "@prisma/client": "6.12.0",

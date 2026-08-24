@@ -506,6 +506,34 @@ test('single invitation sends exactly one message per supplied channel and none 
   }
 });
 
+test('single invitation sends only to contacts re-read after issuance', async () => {
+  const db = batchStore({ email: 'stale@example.com' });
+  const findGuest = db.convidado.findFirst.bind(db.convidado);
+  let reads = 0;
+  db.convidado.findFirst = async (args) => {
+    const guest = await findGuest(args);
+    if (!guest) return null;
+    reads += 1;
+    return { ...guest, email: reads === 1 ? 'stale@example.com' : 'current@example.com' };
+  };
+  const recipients: string[] = [];
+  const notifications: NotificationSender = {
+    email: { async send(to) { recipients.push(to); } },
+    sms: { async send() {} }
+  };
+  const app = Fastify({ logger: false });
+  registerConviteRoutes(app, db, uniqueMemoryStore(), authenticator, notifications);
+  const response = await app.inject({
+    method: 'POST',
+    url: `/condominios/${CONDOMINIO_ID}/moradores/${MORADOR_ID}/convidados/${CONVIDADO_ID}/convites`,
+    headers: residentHeaders,
+    payload: { tipo: 'visitante', expiresAt: EXPIRES_AT.toISOString() }
+  });
+  assert.equal(response.statusCode, 201);
+  assert.deepEqual(recipients, ['current@example.com']);
+  await app.close();
+});
+
 test('createApp honors an explicit notification sender when a database is supplied', async () => {
   const convite = uniqueMemoryStore();
   const sent: string[] = [];

@@ -31,5 +31,18 @@ services:
       db:
         condition: service_healthy
 
+  anonymize:
+    profiles: ["jobs"]
+    build: .
+    command: ["sh", "-c", "npm run db:migrate:deploy && sh scripts/run-anonymization-job.sh"]
+    environment:
+      DATABASE_URL: postgresql://office:office@db:5432/office?schema=public
+      ANONYMIZATION_RETENTION_MONTHS: "12"
+      ANONYMIZATION_BATCH_SIZE: "500"
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+
 volumes:
   postgres_data:

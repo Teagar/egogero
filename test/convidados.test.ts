@@ -29,6 +29,7 @@ type ConvidadoRow = BaseRow & {
   condominioId: string;
   moradorId: string;
   ultimoUsoEm: Date | null;
+  anonymizedAt: Date | null;
 };
 
 function fakeStore() {
@@ -53,7 +54,7 @@ function fakeStore() {
       async updateMany({ where, data }) { const row = moradores.get(where.id); if (!row || row.condominioId !== where.condominioId || !active(row) || condominios.get(row.condominioId)?.deletedAt !== null) return { count: 0 }; Object.assign(row, data); return { count: 1 }; }
     },
     convidado: {
-      async create({ data }) { const morador = moradores.get(data.moradorId); if (!morador || !active(morador) || morador.condominioId !== data.condominioId || condominios.get(data.condominioId)?.deletedAt !== null) return null; const id = next++; const row = { id: uuid(id), createdAt: new Date(Date.UTC(2026, 0, id)), deletedAt: null, ultimoUsoEm: null, ...data }; convidados.set(row.id, row); return row; },
+      async create({ data }) { const morador = moradores.get(data.moradorId); if (!morador || !active(morador) || morador.condominioId !== data.condominioId || condominios.get(data.condominioId)?.deletedAt !== null) return null; const id = next++; const row = { id: uuid(id), createdAt: new Date(Date.UTC(2026, 0, id)), deletedAt: null, ultimoUsoEm: null, anonymizedAt: null, ...data }; convidados.set(row.id, row); return row; },
       async findMany({ where, orderBy, take }) {
         assert.deepEqual(orderBy, [
           { ultimoUsoEm: { sort: 'desc', nulls: 'last' } },
@@ -69,7 +70,7 @@ function fakeStore() {
         return take ? rows.slice(0, take) : rows;
       },
       async findFirst({ where }) { const row = convidados.get(where.id); return row && row.condominioId === where.condominioId && row.moradorId === where.moradorId && active(row) && hasActiveParents(row) ? row : null; },
-      async updateMany({ where, data }) { const row = convidados.get(where.id); if (!row || row.condominioId !== where.condominioId || row.moradorId !== where.moradorId || !active(row) || !hasActiveParents(row)) return { count: 0 }; Object.assign(row, data); return { count: 1 }; }
+      async updateMany({ where, data }) { const row = convidados.get(where.id); if (!row || row.condominioId !== where.condominioId || row.moradorId !== where.moradorId || (where.anonymizedAt === null && row.anonymizedAt !== null) || !active(row) || !hasActiveParents(row)) return { count: 0 }; Object.assign(row, data); return { count: 1 }; }
     }
   };
 
@@ -159,6 +160,15 @@ test('guest contacts are nullable, trimmed, and validated', async () => {
   assert.equal(nullable.statusCode, 200);
   assert.equal(nullable.json().email, null);
   assert.equal(nullable.json().telefone, null);
+
+  store.convidados.get(valid.json().id)!.anonymizedAt = new Date();
+  const reidentified = await app.inject({
+    method: 'PATCH',
+    url: `${path}/${valid.json().id}`,
+    headers: providerHeaders,
+    payload: { nome: 'Ana restored', email: 'restored@example.com' }
+  });
+  assert.equal(reidentified.statusCode, 404);
   await app.close();
 });
 

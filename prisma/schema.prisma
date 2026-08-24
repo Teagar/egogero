@@ -52,6 +52,7 @@ model Convidado {
   moradorId     String?
   // PC-7 records this when it generates a Convite; guest CRUD never simulates invitation use.
   ultimoUsoEm   DateTime?
+  anonymizedAt  DateTime?
   condominio    Condominio @relation(fields: [condominioId], references: [id], onDelete: Restrict)
   morador       Morador?  @relation("ConvidadoMorador", fields: [moradorId, condominioId], references: [id, condominioId], onDelete: Restrict)
   convites      Convite[] @relation("ConviteConvidado")
