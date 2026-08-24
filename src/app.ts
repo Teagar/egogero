@@ -592,7 +592,7 @@ export function createApp(
   });
 
   registerConvidadoRoutes(app, db, authenticator);
-  registerConviteRoutes(app, db.convite, authenticator);
+  registerConviteRoutes(app, db, db.convite, authenticator);
 
   return app;
 }

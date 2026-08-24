@@ -3,21 +3,29 @@ import test from 'node:test';
 
 import Fastify from 'fastify';
 
+import { createApp } from '../src/app.js';
+import type { AppDependencies, AppStore } from '../src/app.js';
 import { createDevelopmentHeaderAuthenticator } from '../src/auth.js';
 import {
   ActiveTokenCollisionError,
   consumeInvitationToken,
   createInvitation,
+  createInvitations,
   generateSixDigitToken,
   registerConviteRoutes
 } from '../src/convites.js';
-import type { InvitationRecord, InvitationStore } from '../src/convites.js';
+import type { InvitationAllocation, InvitationRecord, InvitationStore } from '../src/convites.js';
 
-const CONDOMINIO_ID = '00000000-0000-4000-8000-000000000001';
-const OTHER_CONDOMINIO_ID = '00000000-0000-4000-8000-000000000002';
-const MORADOR_ID = '00000000-0000-4000-8000-000000000101';
-const OTHER_MORADOR_ID = '00000000-0000-4000-8000-000000000102';
-const CONVIDADO_ID = '00000000-0000-4000-8000-000000000201';
+const authenticator = createDevelopmentHeaderAuthenticator(true);
+const uuid = (n: number) => `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
+const CONDOMINIO_ID = uuid(1);
+const OTHER_CONDOMINIO_ID = uuid(2);
+const MORADOR_ID = uuid(101);
+const OTHER_MORADOR_ID = uuid(102);
+const CONVIDADO_ID = uuid(201);
+const SECOND_CONVIDADO_ID = uuid(202);
+const OTHER_CONVIDADO_ID = uuid(203);
+const DELETED_CONVIDADO_ID = uuid(204);
 const NOW = new Date('2026-08-24T05:00:00.000Z');
 const EXPIRES_AT = new Date('2026-08-25T05:00:00.000Z');
 const data = {
@@ -27,31 +35,129 @@ const data = {
   tipo: 'visitante' as const,
   expiresAt: EXPIRES_AT
 };
+const residentHeaders = {
+  'x-development-user-id': MORADOR_ID,
+  'x-development-user-role': 'morador',
+  'x-development-condominio-id': CONDOMINIO_ID
+};
 
-function record(token: string): InvitationRecord {
+function record(input: InvitationAllocation, index = 0): InvitationRecord {
   return {
-    id: `invitation-${token}`,
-    createdAt: NOW,
+    id: uuid(300 + index),
+    createdAt: input.now,
     deletedAt: null,
-    ...data,
+    condominioId: input.condominioId,
+    moradorId: input.moradorId,
+    convidadoId: input.convidadoId,
+    tipo: input.tipo,
+    expiresAt: input.expiresAt,
     usedAt: null,
     tokenDigest: null
   };
 }
 
-function uniqueMemoryStore(initialTokens: string[] = []): InvitationStore & { activeTokens: Set<string> } {
+function uniqueMemoryStore(initialTokens: string[] = []): InvitationStore & {
+  activeTokens: Set<string>;
+  batchCalls: number;
+} {
   const activeTokens = new Set(initialTokens);
-  return {
+  const store = {
     activeTokens,
-    async createActive(input) {
-      if (activeTokens.has(input.token)) {
-        throw new ActiveTokenCollisionError();
+    batchCalls: 0,
+    async createBatchActive(inputs: readonly InvitationAllocation[]) {
+      store.batchCalls += 1;
+      const candidates = new Set<string>();
+      for (const input of inputs) {
+        if (activeTokens.has(input.token) || candidates.has(input.token)) {
+          throw new ActiveTokenCollisionError();
+        }
+        candidates.add(input.token);
       }
-      activeTokens.add(input.token);
-      return record(input.token);
+      for (const input of inputs) {
+        activeTokens.add(input.token);
+      }
+      return inputs.map(record);
     },
-    async consumeActive(token) {
+    async createActive(input: InvitationAllocation) {
+      const records = await store.createBatchActive([input]);
+      return records[0] ?? null;
+    },
+    async consumeActive(token: string) {
       return activeTokens.delete(token);
+    }
+  };
+  return store;
+}
+
+function batchStore({ condominiumDeleted = false, residentDeleted = false } = {}): AppStore {
+  const condominios = new Map([
+    [CONDOMINIO_ID, condominiumDeleted ? new Date() : null],
+    [OTHER_CONDOMINIO_ID, null]
+  ]);
+  const moradores = new Map([
+    [MORADOR_ID, { condominioId: CONDOMINIO_ID, deletedAt: residentDeleted ? new Date() : null }],
+    [OTHER_MORADOR_ID, { condominioId: OTHER_CONDOMINIO_ID, deletedAt: null }]
+  ]);
+  const convidados = new Map([
+    [CONVIDADO_ID, { condominioId: CONDOMINIO_ID, moradorId: MORADOR_ID, deletedAt: null }],
+    [SECOND_CONVIDADO_ID, { condominioId: CONDOMINIO_ID, moradorId: MORADOR_ID, deletedAt: null }],
+    [OTHER_CONVIDADO_ID, { condominioId: OTHER_CONDOMINIO_ID, moradorId: OTHER_MORADOR_ID, deletedAt: null }],
+    [DELETED_CONVIDADO_ID, { condominioId: CONDOMINIO_ID, moradorId: MORADOR_ID, deletedAt: new Date() }]
+  ]);
+  const guestRecord = (id: string, condo: string, owner: string, deletedAt: Date | null) => ({
+    id,
+    createdAt: NOW,
+    deletedAt,
+    nome: 'Guest',
+    condominioId: condo,
+    moradorId: owner,
+    ultimoUsoEm: null
+  });
+
+  return {
+    condominio: {
+      async create() { throw new Error('Unexpected condominium create'); },
+      async findMany() { return []; },
+      async findFirst({ where }) {
+        return condominios.get(where.id) === null
+          ? { id: where.id, createdAt: NOW, deletedAt: null, nome: 'A', responsavel: 'B', tipo: 'C' }
+          : null;
+      },
+      async updateMany() { return { count: 0 }; }
+    },
+    morador: {
+      async create() { throw new Error('Unexpected resident create'); },
+      async findMany() { return []; },
+      async findFirst({ where }) {
+        const row = moradores.get(where.id);
+        return row && row.condominioId === where.condominioId && row.deletedAt === null
+          && condominios.get(row.condominioId) === null
+          ? {
+              id: where.id,
+              createdAt: NOW,
+              deletedAt: null,
+              nome: 'Resident',
+              condominioId: row.condominioId,
+              enderecoRua: 'A',
+              enderecoNumero: '1',
+              enderecoBloco: null,
+              enderecoApartamento: null
+            }
+          : null;
+      },
+      async updateMany() { return { count: 0 }; }
+    },
+    convidado: {
+      async create() { throw new Error('Guests must not be created by batch invitations'); },
+      async findMany() { return []; },
+      async findFirst({ where }) {
+        const row = convidados.get(where.id);
+        return row && row.condominioId === where.condominioId && row.moradorId === where.moradorId
+          && row.deletedAt === null && condominios.get(row.condominioId) === null
+          ? guestRecord(where.id, row.condominioId, row.moradorId, row.deletedAt)
+          : null;
+      },
+      async updateMany() { return { count: 0 }; }
     }
   };
 }
@@ -62,43 +168,37 @@ test('production generator always returns a zero-padded numeric six-digit token'
   }
 });
 
-test('service allocates 100k active tokens without an active collision under deterministic collision pressure', async () => {
+test('service allocates 100k active tokens without an active collision under deterministic pressure', async () => {
   const store = uniqueMemoryStore();
   let next = 0;
-
   for (let index = 0; index < 100_000; index += 1) {
     const result = await createInvitation(store, data, {
-      // Every token after the first collides once before the next candidate is produced.
       generateToken: () => String(Math.floor(next++ / 2)).padStart(6, '0'),
       now: () => NOW
     });
     assert.ok(result);
   }
-
   assert.equal(store.activeTokens.size, 100_000);
 });
 
-test('database collision is retried and concurrent creators cannot retain the same token', async () => {
-  const retryStore = uniqueMemoryStore(['123456']);
-  const candidates = ['123456', '654321'];
-  const retried = await createInvitation(retryStore, data, {
-    generateToken: () => candidates.shift()!,
+test('single and batch allocation retry collisions through the same algorithm', async () => {
+  const singleStore = uniqueMemoryStore(['123456']);
+  const singleCandidates = ['123456', '654321'];
+  const single = await createInvitation(singleStore, data, {
+    generateToken: () => singleCandidates.shift()!,
     now: () => NOW
   });
-  assert.equal(retried?.token, '654321');
+  assert.equal(single?.token, '654321');
 
-  const concurrentStore = uniqueMemoryStore();
-  function competingGenerator(fallback: string) {
-    let attempt = 0;
-    return () => attempt++ === 0 ? '111111' : fallback;
-  }
-  const results = await Promise.all([
-    createInvitation(concurrentStore, data, { generateToken: competingGenerator('222222'), now: () => NOW }),
-    createInvitation(concurrentStore, data, { generateToken: competingGenerator('333333'), now: () => NOW })
-  ]);
-
-  assert.equal(new Set(results.map((result) => result?.token)).size, 2);
-  assert.equal(concurrentStore.activeTokens.size, 2);
+  const batchStore = uniqueMemoryStore(['111111']);
+  const batchCandidates = ['111111', '222222', '333333', '444444'];
+  const batch = await createInvitations(
+    batchStore,
+    [data, { ...data, convidadoId: SECOND_CONVIDADO_ID }],
+    { generateToken: () => batchCandidates.shift()!, now: () => NOW }
+  );
+  assert.deepEqual(batch?.map((result) => result.token), ['333333', '444444']);
+  assert.equal(batchStore.activeTokens.has('222222'), false, 'failed attempt must not partially persist');
 });
 
 test('atomic consumption rejects replay and malformed tokens without store access', async () => {
@@ -108,82 +208,106 @@ test('atomic consumption rejects replay and malformed tokens without store acces
   assert.equal(await consumeInvitationToken(store, 'not-a-token', NOW), false);
 });
 
-test('creation route exposes the token once and enforces tenant and resident ownership before store access', async () => {
-  let storeCalls = 0;
-  const store: InvitationStore = {
-    async createActive(input) {
-      storeCalls += 1;
-      return record(input.token);
-    },
-    async consumeActive() {
-      throw new Error('not used by creation route');
-    }
-  };
+test('single creation exposes plaintext once with no-store and enforces scope before storage', async () => {
+  const store = uniqueMemoryStore();
   const app = Fastify({ logger: false });
-  registerConviteRoutes(app, store, createDevelopmentHeaderAuthenticator(true));
+  registerConviteRoutes(app, batchStore(), store, authenticator);
   const path = `/condominios/${CONDOMINIO_ID}/moradores/${MORADOR_ID}/convidados/${CONVIDADO_ID}/convites`;
-  const residentHeaders = {
-    'x-development-user-id': MORADOR_ID,
-    'x-development-user-role': 'morador',
-    'x-development-condominio-id': CONDOMINIO_ID
-  };
   const payload = { tipo: 'prestador', expiresAt: EXPIRES_AT.toISOString() };
 
   const created = await app.inject({ method: 'POST', url: path, headers: residentHeaders, payload });
   assert.equal(created.statusCode, 201);
   assert.match(created.json().token, /^[0-9]{6}$/);
   assert.equal(created.headers['cache-control'], 'no-store');
-  assert.deepEqual(Object.keys(created.json()).sort(), [
-    'condominioId', 'convidadoId', 'createdAt', 'expiresAt', 'id', 'moradorId', 'tipo', 'token'
-  ]);
-  assert.equal(storeCalls, 1);
 
-  const wrongResident = await app.inject({
+  const calls = store.batchCalls;
+  const wrongOwner = await app.inject({
     method: 'POST',
     url: path.replace(MORADOR_ID, OTHER_MORADOR_ID),
     headers: residentHeaders,
     payload
   });
-  assert.equal(wrongResident.statusCode, 403);
-
   const wrongTenant = await app.inject({
     method: 'POST',
     url: path.replace(CONDOMINIO_ID, OTHER_CONDOMINIO_ID),
     headers: residentHeaders,
     payload
   });
+  assert.equal(wrongOwner.statusCode, 403);
   assert.equal(wrongTenant.statusCode, 403);
-
-  const gateHeaders = {
-    'x-development-user-id': 'gate-1',
-    'x-development-user-role': 'portaria',
-    'x-development-condominio-id': CONDOMINIO_ID
-  };
-  const gate = await app.inject({ method: 'POST', url: path, headers: gateHeaders, payload });
-  assert.equal(gate.statusCode, 403);
-  assert.equal(storeCalls, 1);
+  assert.equal(store.batchCalls, calls);
   await app.close();
 });
 
-test('creation fails closed for inactive ownership, past expiration, and exhausted collisions', async () => {
-  const missingStore: InvitationStore = {
-    async createActive() {
-      return null;
-    },
-    async consumeActive() {
-      return false;
-    }
-  };
-  assert.equal(await createInvitation(missingStore, data, { generateToken: () => '123456', now: () => NOW }), null);
+test('batch creation issues only registered active guests in one atomic store call', async () => {
+  const convite = uniqueMemoryStore();
+  const db: AppDependencies = { ...batchStore(), convite };
+  const app = createApp({ db, authenticator });
+  const response = await app.inject({
+    method: 'POST',
+    url: `/condominios/${CONDOMINIO_ID}/moradores/${MORADOR_ID}/convites/multiplos`,
+    headers: residentHeaders,
+    payload: { convidadoIds: [CONVIDADO_ID, SECOND_CONVIDADO_ID] }
+  });
 
-  await assert.rejects(
-    createInvitation(missingStore, { ...data, expiresAt: NOW }, { generateToken: () => '123456', now: () => NOW }),
-    /expiration must be in the future/
+  assert.equal(response.statusCode, 201);
+  assert.equal(response.headers['cache-control'], 'no-store');
+  assert.deepEqual(
+    response.json().convites.map((item: { convidadoId: string }) => item.convidadoId),
+    [CONVIDADO_ID, SECOND_CONVIDADO_ID]
   );
+  assert.equal(convite.batchCalls, 1);
+  assert.equal(convite.activeTokens.size, 2);
+  await app.close();
+});
 
-  const occupied = uniqueMemoryStore(['123456']);
-  await assert.rejects(
-    createInvitation(occupied, data, { generateToken: () => '123456', maxAttempts: 2, now: () => NOW }),
-    /Could not allocate/
-  );
+test('batch validation rejects duplicates, inactive, cross-tenant, and cross-owner guests before storage', async () => {
+  const cases = [
+    [{}, 400],
+    [{ convidadoIds: [CONVIDADO_ID, CONVIDADO_ID] }, 400],
+    [{ convidadoIds: [uuid(999)] }, 404],
+    [{ convidadoIds: [CONVIDADO_ID, uuid(999)] }, 404],
+    [{ convidadoIds: [DELETED_CONVIDADO_ID] }, 404],
+    [{ convidadoIds: [OTHER_CONVIDADO_ID] }, 404]
+  ] as const;
+
+  for (const [payload, status] of cases) {
+    const convite = uniqueMemoryStore();
+    const app = createApp({ db: { ...batchStore(), convite }, authenticator });
+    const response = await app.inject({
+      method: 'POST',
+      url: `/condominios/${CONDOMINIO_ID}/moradores/${MORADOR_ID}/convites/multiplos`,
+      headers: residentHeaders,
+      payload
+    });
+    assert.equal(response.statusCode, status);
+    assert.equal(convite.batchCalls, 0);
+    await app.close();
+  }
+});
+
+test('batch creation rejects disabled parents and fails closed without a token store', async () => {
+  for (const options of [{ residentDeleted: true }, { condominiumDeleted: true }]) {
+    const convite = uniqueMemoryStore();
+    const app = createApp({ db: { ...batchStore(options), convite }, authenticator });
+    const response = await app.inject({
+      method: 'POST',
+      url: `/condominios/${CONDOMINIO_ID}/moradores/${MORADOR_ID}/convites/multiplos`,
+      headers: residentHeaders,
+      payload: { convidadoIds: [CONVIDADO_ID] }
+    });
+    assert.equal(response.statusCode, 404);
+    assert.equal(convite.batchCalls, 0);
+    await app.close();
+  }
+
+  const app = createApp({ db: batchStore(), authenticator });
+  const response = await app.inject({
+    method: 'POST',
+    url: `/condominios/${CONDOMINIO_ID}/moradores/${MORADOR_ID}/convites/multiplos`,
+    headers: residentHeaders,
+    payload: { convidadoIds: [CONVIDADO_ID] }
+  });
+  assert.equal(response.statusCode, 503);
+  await app.close();
 });

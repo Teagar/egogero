@@ -128,6 +128,9 @@ function createAuthorizationStore(): AppDependencies {
       async createActive(data) {
         return { ...convite, ...data };
       },
+      async createBatchActive(data) {
+        return data.map((item, index) => ({ ...convite, ...item, id: `convite-${index}` }));
+      },
       async consumeActive() {
         return true;
       }
@@ -273,6 +276,16 @@ const endpoints: Endpoint[] = [
     },
     roles: ['provedor', 'sindico', 'morador'],
     successStatus: 201
+  },
+  {
+    name: 'create batch invitations',
+    request: {
+      method: 'POST',
+      url: `/condominios/${CONDOMINIO_ID}/moradores/${MORADOR_ID}/convites/multiplos`,
+      payload: { convidadoIds: [CONVIDADO_ID] }
+    },
+    roles: ['provedor', 'sindico', 'morador'],
+    successStatus: 201
   }
 ];
 
@@ -341,7 +354,13 @@ test('tenant matrix prevents a sindico from reaching another condominium before 
         .replaceAll(MORADOR_ID, otherMorador.id)
         .replaceAll(CONVIDADO_ID, otherConvidado.id),
       payload: endpoint.request.payload
-        ? { ...endpoint.request.payload, condominioId: OTHER_CONDOMINIO_ID }
+        ? {
+            ...endpoint.request.payload,
+            condominioId: OTHER_CONDOMINIO_ID,
+            convidadoIds: Array.isArray(endpoint.request.payload.convidadoIds)
+              ? endpoint.request.payload.convidadoIds.map((id) => id === CONVIDADO_ID ? otherConvidado.id : id)
+              : undefined
+          }
         : undefined
     }
   }));
@@ -415,6 +434,10 @@ test('tenant matrix prevents a sindico from reaching another condominium before 
             storeCalls += 1;
             return store.convite!.createActive(args);
           },
+          createBatchActive: async (args) => {
+            storeCalls += 1;
+            return store.convite!.createBatchActive(args);
+          },
           consumeActive: async (token, now) => {
             storeCalls += 1;
             return store.convite!.consumeActive(token, now);
@@ -448,7 +471,7 @@ test('resident guest ownership is enforced before any store access', async () =>
     condominio: { create: inaccessible, findMany: inaccessible, findFirst: inaccessible, updateMany: inaccessible },
     morador: { create: inaccessible, findMany: inaccessible, findFirst: inaccessible, updateMany: inaccessible },
     convidado: { create: inaccessible, findMany: inaccessible, findFirst: inaccessible, updateMany: inaccessible },
-    convite: { createActive: inaccessible, consumeActive: inaccessible }
+    convite: { createActive: inaccessible, createBatchActive: inaccessible, consumeActive: inaccessible }
   };
 
   for (const endpoint of endpoints.slice(10)) {
@@ -477,15 +500,16 @@ test('route inventory keeps every business route in the RBAC matrix', async () =
       '│   └── /:id|:condominioId (GET, HEAD, PATCH, DELETE)',
       '│       └── /moradores (GET, HEAD)',
       '│           └── /:id|:moradorId (GET, HEAD, PATCH, DELETE)',
-      '│               └── /convidados (POST, GET, HEAD)',
-      '│                   ├── /recentes (GET, HEAD)',
-      '│                   └── /:id|:convidadoId (GET, HEAD, PATCH, DELETE)',
-      '│                       └── /convites (POST)',
+      '│               ├── /convidados (POST, GET, HEAD)',
+      '│               │   ├── /recentes (GET, HEAD)',
+      '│               │   └── /:id|:convidadoId (GET, HEAD, PATCH, DELETE)',
+      '│               │       └── /convites (POST)',
+      '│               └── /convites/multiplos (POST)',
       '└── /moradores (POST)',
       ''
     ].join('\n')
   );
-  assert.equal(endpoints.length, 17);
+  assert.equal(endpoints.length, 18);
 
   await app.close();
 });
