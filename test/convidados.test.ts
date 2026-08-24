@@ -13,7 +13,7 @@ const providerHeaders = {
 };
 const uuid = (n: number) => `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
 type BaseRow = { id: string; createdAt: Date; deletedAt: Date | null };
-type CondominioRow = BaseRow & { nome: string; responsavel: string; tipo: string };
+type CondominioRow = BaseRow & { nome: string; responsavel: string; tipo: string; timezone: string };
 type MoradorRow = BaseRow & {
   nome: string;
   condominioId: string;
@@ -78,7 +78,7 @@ function fakeStore() {
 }
 
 async function setup(app: ReturnType<typeof createApp>) {
-  const condominium = await app.inject({ method: 'POST', url: '/condominios', headers: providerHeaders, payload: { nome: 'A', responsavel: 'R', tipo: 'residencial' } });
+  const condominium = await app.inject({ method: 'POST', url: '/condominios', headers: providerHeaders, payload: { nome: 'A', responsavel: 'R', tipo: 'residencial', timezone: 'America/Sao_Paulo' } });
   const condominioId = condominium.json().id;
   const resident = await app.inject({ method: 'POST', url: '/moradores', headers: providerHeaders, payload: { condominioId, nome: 'Morador', endereco: { rua: 'A', numero: '1' } } });
   return { condominioId, moradorId: resident.json().id };

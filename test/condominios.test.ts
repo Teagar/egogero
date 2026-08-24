@@ -117,7 +117,8 @@ test('provedor creates, edits and soft-deletes a condominium', async () => {
     payload: {
       nome: 'Residencial Aurora',
       responsavel: 'Ana Silva',
-      tipo: 'residencial'
+      tipo: 'residencial',
+      timezone: 'America/Sao_Paulo'
     }
   });
 
@@ -128,6 +129,7 @@ test('provedor creates, edits and soft-deletes a condominium', async () => {
   assert.equal(created.nome, 'Residencial Aurora');
   assert.equal(created.responsavel, 'Ana Silva');
   assert.equal(created.tipo, 'residencial');
+  assert.equal(created.timezone, 'America/Sao_Paulo');
 
   const updateResponse = await app.inject({
     method: 'PATCH',
@@ -136,7 +138,8 @@ test('provedor creates, edits and soft-deletes a condominium', async () => {
     payload: {
       nome: 'Residencial Aurora Norte',
       responsavel: 'Bruno Costa',
-      tipo: 'misto'
+      tipo: 'misto',
+      timezone: 'America/Manaus'
     }
   });
 
@@ -146,7 +149,8 @@ test('provedor creates, edits and soft-deletes a condominium', async () => {
     createdAt: '2026-01-01T00:00:00.000Z',
     nome: 'Residencial Aurora Norte',
     responsavel: 'Bruno Costa',
-    tipo: 'misto'
+    tipo: 'misto',
+    timezone: 'America/Manaus'
   });
 
   const deleteResponse = await app.inject({
@@ -201,12 +205,51 @@ test('condominium creation validates required string fields', async () => {
     payload: {
       nome: 'Residencial Aurora',
       responsavel: '',
-      tipo: 'residencial'
+      tipo: 'residencial',
+      timezone: 'America/Sao_Paulo'
     }
   });
 
   assert.equal(response.statusCode, 400);
   assert.deepEqual(response.json(), { error: 'Invalid condominium payload' });
 
+  await app.close();
+});
+
+test('condominium timezone is required and invalid values never mutate storage', async () => {
+  const db = createFakeStore();
+  const app = createApp({ db, authenticator });
+  for (const timezone of ['Mars/Olympus', '+01:00']) {
+    const invalid = await app.inject({
+      method: 'POST',
+      url: '/condominios',
+      headers: providerHeaders,
+      payload: { nome: 'A', responsavel: 'B', tipo: 'C', timezone }
+    });
+    assert.equal(invalid.statusCode, 400);
+    assert.deepEqual(invalid.json(), { error: 'Invalid condominium timezone' });
+  }
+  const missing = await app.inject({
+    method: 'POST', url: '/condominios', headers: providerHeaders,
+    payload: { nome: 'A', responsavel: 'B', tipo: 'C' }
+  });
+  assert.equal(missing.statusCode, 400);
+  const list = await app.inject({ method: 'GET', url: '/condominios', headers: providerHeaders });
+  assert.deepEqual(list.json(), []);
+
+  const valid = await app.inject({
+    method: 'POST', url: '/condominios', headers: providerHeaders,
+    payload: { nome: 'A', responsavel: 'B', tipo: 'C', timezone: 'America/Recife' }
+  });
+  const rejectedUpdate = await app.inject({
+    method: 'PATCH', url: `/condominios/${valid.json().id}`, headers: providerHeaders,
+    payload: { timezone: 'Not/A_Zone' }
+  });
+  assert.equal(rejectedUpdate.statusCode, 400);
+  assert.deepEqual(rejectedUpdate.json(), { error: 'Invalid condominium timezone' });
+  const unchanged = await app.inject({
+    method: 'GET', url: `/condominios/${valid.json().id}`, headers: providerHeaders
+  });
+  assert.equal(unchanged.json().timezone, 'America/Recife');
   await app.close();
 });

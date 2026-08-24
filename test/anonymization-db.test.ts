@@ -36,7 +36,7 @@ test('PostgreSQL anonymization removes old PII without changing immutable audits
 
   try {
     await prisma.condominio.create({
-      data: { id: condominiumId, nome: 'Retention Test', responsavel: 'Owner', tipo: 'residencial' }
+      data: { id: condominiumId, nome: 'Retention Test', responsavel: 'Owner', tipo: 'residencial', timezone: 'America/Sao_Paulo' }
     });
     await prisma.morador.create({ data: { id: residentId, nome: 'Resident', condominioId: condominiumId } });
     await prisma.convidado.createMany({
@@ -173,7 +173,7 @@ test('job fails for locked eligible rows so the scheduler retries them', { skip:
   const locked = new Promise<void>((resolve) => { reportLocked = resolve; });
 
   try {
-    await prisma.condominio.create({ data: { id: condominiumId, nome: 'Lock Test', responsavel: 'Owner', tipo: 'residencial' } });
+    await prisma.condominio.create({ data: { id: condominiumId, nome: 'Lock Test', responsavel: 'Owner', tipo: 'residencial', timezone: 'America/Sao_Paulo' } });
     await prisma.morador.create({ data: { id: residentId, nome: 'Resident', condominioId: condominiumId } });
     await prisma.convidado.create({ data: { id: guestId, nome: 'Locked PII', email: 'locked@example.test', condominioId: condominiumId, moradorId: residentId } });
     await prisma.convite.create({ data: { condominioId: condominiumId, moradorId: residentId, convidadoId: guestId, tipo: 'visitante', expiresAt: subtractUtcMonths(now, 13) } });

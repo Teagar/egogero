@@ -184,7 +184,7 @@ async function createCondominio(app: ReturnType<typeof createApp>, nome = 'Resid
     method: 'POST',
     url: '/condominios',
     headers: providerHeaders,
-    payload: { nome, responsavel: 'Ana Silva', tipo: 'residencial' }
+    payload: { nome, responsavel: 'Ana Silva', tipo: 'residencial', timezone: 'America/Sao_Paulo' }
   });
 
   assert.equal(response.statusCode, 201);

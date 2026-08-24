@@ -31,16 +31,16 @@ export function createUnavailableNotificationSender(): NotificationSender {
   const unavailable = async () => { throw new Error('Notification delivery is unavailable'); };
   return { email: { send: unavailable }, sms: { send: unavailable } };
 }
-function formatDate(date: Date) {
-  return new Intl.DateTimeFormat('pt-BR', { dateStyle: 'short', timeZone: 'UTC' }).format(date);
+function formatDate(date: Date, timeZone: string) {
+  return new Intl.DateTimeFormat('pt-BR', { dateStyle: 'short', timeZone }).format(date);
 }
 
-function formatTime(date: Date) {
+function formatTime(date: Date, timeZone: string) {
   return new Intl.DateTimeFormat('pt-BR', {
     hour: '2-digit',
     hour12: false,
     minute: '2-digit',
-    timeZone: 'UTC'
+    timeZone
   }).format(date);
 }
 
@@ -50,10 +50,11 @@ export function invitationMessage(input: {
   generatedAt: Date;
   expiresAt: Date;
   token: string;
+  timeZone: string;
 }): InvitationMessage {
   return {
     subject: `Convite de acesso ao condomínio ${input.condominiumName}`,
-    body: `Seu código para a entrada no condomínio ${input.condominiumName} foi gerado por ${input.residentName} às ${formatTime(input.generatedAt)} do dia ${formatDate(input.generatedAt)} e será expirado em ${formatDate(input.expiresAt)} às ${formatTime(input.expiresAt)}.\nSeu código é: ${input.token}`
+    body: `Seu código para a entrada no condomínio ${input.condominiumName} foi gerado por ${input.residentName} às ${formatTime(input.generatedAt, input.timeZone)} do dia ${formatDate(input.generatedAt, input.timeZone)} e será expirado em ${formatDate(input.expiresAt, input.timeZone)} às ${formatTime(input.expiresAt, input.timeZone)}.\nSeu código é: ${input.token}`
   };
 }
 
@@ -273,10 +274,12 @@ export function createPrismaInvitationStore(client: PrismaClient, tokenSecret: s
       id: string;
       residentLimit: number | null;
       condominiumLimit: number | null;
+      timezone: string;
     }>>(Prisma.sql`
       SELECT convidado.id,
              morador."dailyInvitationLimit" AS "residentLimit",
-             condominio."dailyInvitationLimit" AS "condominiumLimit"
+             condominio."dailyInvitationLimit" AS "condominiumLimit",
+             condominio.timezone
       FROM "Convidado" AS convidado
       JOIN "Morador" AS morador
         ON morador.id = convidado."moradorId"
@@ -299,7 +302,7 @@ export function createPrismaInvitationStore(client: PrismaClient, tokenSecret: s
     }
 
     // The resident and condominium locks above serialize all issuance for this resident.
-    // A UTC calendar day counts every non-deleted issuance, including used invitations.
+    // Local civil-day boundaries are converted to absolute instants; PostgreSQL resolves DST gaps/overlaps deterministically.
     const limit = activeGuests[0]!.residentLimit ?? activeGuests[0]!.condominiumLimit;
     if (limit !== null) {
       const [{ count }] = await transaction.$queryRaw<Array<{ count: bigint }>>`
@@ -308,7 +311,8 @@ export function createPrismaInvitationStore(client: PrismaClient, tokenSecret: s
         WHERE "condominioId" = ${first.condominioId}
           AND "moradorId" = ${first.moradorId}
           AND "deletedAt" IS NULL
-          AND "createdAt" >= date_trunc('day', clock_timestamp() AT TIME ZONE 'UTC')
+          AND "createdAt" >= (((clock_timestamp() AT TIME ZONE ${activeGuests[0]!.timezone})::date)::timestamp AT TIME ZONE ${activeGuests[0]!.timezone})
+          AND "createdAt" < ((((clock_timestamp() AT TIME ZONE ${activeGuests[0]!.timezone})::date + 1)::timestamp) AT TIME ZONE ${activeGuests[0]!.timezone})
       `;
       if (count + BigInt(allocations.length) > BigInt(limit)) {
         throw new DailyInvitationLimitError();
@@ -914,7 +918,8 @@ export function registerConviteRoutes(
         residentName: morador.nome,
         generatedAt: result.convite.createdAt,
         expiresAt: result.convite.expiresAt ?? body.expiresAt,
-        token: result.token
+        token: result.token,
+        timeZone: condominio.timezone
       });
       try {
         if (currentGuest?.email) await notifications.email.send(currentGuest.email, message);

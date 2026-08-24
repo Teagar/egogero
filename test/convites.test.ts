@@ -154,7 +154,7 @@ function batchStore({ condominiumDeleted = false, residentDeleted = false, email
       async findMany() { return []; },
       async findFirst({ where }) {
         return condominios.get(where.id) === null
-          ? { id: where.id, createdAt: NOW, deletedAt: null, nome: 'A', responsavel: 'B', tipo: 'C' }
+          ? { id: where.id, createdAt: NOW, deletedAt: null, nome: 'A', responsavel: 'B', tipo: 'C', timezone: 'America/Sao_Paulo' }
           : null;
       },
       async updateMany() { return { count: 0 }; }
@@ -474,13 +474,24 @@ test('invitation template replaces every documented placeholder deterministicall
     residentName: 'Maria',
     generatedAt: NOW,
     expiresAt: EXPIRES_AT,
-    token: '123456'
+    token: '123456',
+    timeZone: 'America/Sao_Paulo'
   });
   assert.equal(message.subject, 'Convite de acesso ao condomínio Residencial A');
   assert.equal(
     message.body,
-    'Seu código para a entrada no condomínio Residencial A foi gerado por Maria às 05:00 do dia 24/08/2026 e será expirado em 25/08/2026 às 05:00.\nSeu código é: 123456'
+    'Seu código para a entrada no condomínio Residencial A foi gerado por Maria às 02:00 do dia 24/08/2026 e será expirado em 25/08/2026 às 02:00.\nSeu código é: 123456'
   );
+});
+
+test('invitation template presents the same instant in each condominium timezone across DST', () => {
+  const instant = new Date('2026-11-01T05:30:00.000Z');
+  const common = {
+    condominiumName: 'Residencial A', residentName: 'Maria', generatedAt: instant,
+    expiresAt: new Date('2026-11-01T07:30:00.000Z'), token: '123456'
+  };
+  assert.match(invitationMessage({ ...common, timeZone: 'America/Sao_Paulo' }).body, /às 02:30 do dia 01\/11\/2026/);
+  assert.match(invitationMessage({ ...common, timeZone: 'America/New_York' }).body, /às 01:30 do dia 01\/11\/2026/);
 });
 
 test('single invitation sends exactly one message per supplied channel and none without contacts', async () => {

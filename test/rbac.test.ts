@@ -21,7 +21,8 @@ const condominio = {
   deletedAt: null,
   nome: 'Residencial Aurora',
   responsavel: 'Ana Silva',
-  tipo: 'residencial'
+  tipo: 'residencial',
+  timezone: 'America/Sao_Paulo'
 };
 
 const morador = {
@@ -209,7 +210,7 @@ const endpoints: Endpoint[] = [
     request: {
       method: 'POST',
       url: '/condominios',
-      payload: { nome: 'Residencial Aurora', responsavel: 'Ana Silva', tipo: 'residencial' }
+      payload: { nome: 'Residencial Aurora', responsavel: 'Ana Silva', tipo: 'residencial', timezone: 'America/Sao_Paulo' }
     },
     roles: ['provedor'],
     successStatus: 201

@@ -15,6 +15,7 @@ import type { DeviceRateLimiter, DeviceStore } from './dispositivos.js';
 import { createPrismaNotificationStore, registerNotificationRoutes } from './notificacoes.js';
 import type { NotificationStore } from './notificacoes.js';
 import { prisma as defaultPrisma } from './lib/prisma.js';
+import { isValidTimeZone } from './timezones.js';
 
 type CondominioRecord = {
   id: string;
@@ -23,6 +24,7 @@ type CondominioRecord = {
   nome: string;
   responsavel: string;
   tipo: string;
+  timezone: string;
   dailyInvitationLimit?: number | null;
 };
 
@@ -30,6 +32,7 @@ type CondominioCreateData = {
   nome: string;
   responsavel: string;
   tipo: string;
+  timezone: string;
 };
 
 type CondominioUpdateData = Partial<CondominioCreateData> & {
@@ -163,12 +166,13 @@ function parseCreateBody(body: unknown) {
   const nome = readRequiredString(payload, 'nome');
   const responsavel = readRequiredString(payload, 'responsavel');
   const tipo = readRequiredString(payload, 'tipo');
+  const timezone = readRequiredString(payload, 'timezone');
 
-  if (!nome || !responsavel || !tipo) {
+  if (!nome || !responsavel || !tipo || !timezone || !isValidTimeZone(timezone)) {
     return null;
   }
 
-  return { nome, responsavel, tipo };
+  return { nome, responsavel, tipo, timezone };
 }
 
 function parseUpdateBody(body: unknown) {
@@ -189,6 +193,12 @@ function parseUpdateBody(body: unknown) {
 
       data[field] = value;
     }
+  }
+
+  if (Object.hasOwn(payload, 'timezone')) {
+    const timezone = readRequiredString(payload, 'timezone');
+    if (!timezone || !isValidTimeZone(timezone)) return null;
+    data.timezone = timezone;
   }
 
   return Object.keys(data).length > 0 ? data : null;
@@ -323,7 +333,8 @@ function toCondominioResponse(condominio: CondominioRecord) {
     createdAt: condominio.createdAt.toISOString(),
     nome: condominio.nome,
     responsavel: condominio.responsavel,
-    tipo: condominio.tipo
+    tipo: condominio.tipo,
+    timezone: condominio.timezone
   };
 }
 
@@ -464,6 +475,14 @@ export function createApp(
   app.get('/health', async () => ({ status: 'ok' }));
 
   app.post('/condominios', condominioManagement, async (request, reply) => {
+    const payload = request.body && typeof request.body === 'object' && !Array.isArray(request.body)
+      ? request.body as Record<string, unknown>
+      : null;
+    const timezone = payload?.timezone;
+    if (payload && Object.hasOwn(payload, 'timezone')
+      && (typeof timezone !== 'string' || !isValidTimeZone(timezone.trim()))) {
+      return reply.status(400).send({ error: 'Invalid condominium timezone' });
+    }
     const data = parseCreateBody(request.body);
 
     if (!data) {
@@ -506,6 +525,14 @@ export function createApp(
       return reply.status(400).send({ error: 'Invalid condominium id' });
     }
 
+    const payload = request.body && typeof request.body === 'object' && !Array.isArray(request.body)
+      ? request.body as Record<string, unknown>
+      : null;
+    const timezone = payload?.timezone;
+    if (payload && Object.hasOwn(payload, 'timezone')
+      && (typeof timezone !== 'string' || !isValidTimeZone(timezone.trim()))) {
+      return reply.status(400).send({ error: 'Invalid condominium timezone' });
+    }
     const data = parseUpdateBody(request.body);
 
     if (!data) {
