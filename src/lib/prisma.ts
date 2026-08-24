@@ -51,10 +51,9 @@ export function createPrismaRepositories(client: RepositoryClient) {
   };
 }
 
-const client = new PrismaClient();
-
-export const prisma = createPrismaRepositories(client);
+export const prisma = new PrismaClient();
+export const softDeleteRepositories = createPrismaRepositories(prisma);
 
 export function disconnectPrisma() {
-  return client.$disconnect();
+  return prisma.$disconnect();
 }
