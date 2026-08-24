@@ -20,6 +20,8 @@ export async function startServer(environment: NodeJS.ProcessEnv = process.env) 
   const app = createApp({
     authenticator,
     invitationTokenSecret: env.invitationTokenSecret,
+    idempotencyCacheSecret: env.idempotencyCacheSecret,
+    idempotencyTtlMs: env.idempotencyTtlMs,
     deviceApiKeySecret: env.deviceApiKeySecret,
     deviceRateLimiter: createPrismaDeviceRateLimiter(prisma),
     notificationSender,

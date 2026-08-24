@@ -11,7 +11,8 @@
     "test": "node --test --test-concurrency=1 --import tsx test/*.test.ts",
     "db:migrate:deploy": "prisma migrate deploy",
     "db:generate": "prisma generate",
-    "privacy:anonymize": "node dist/src/jobs/anonymize-old-guests.js"
+    "privacy:anonymize": "node dist/src/jobs/anonymize-old-guests.js",
+    "idempotency:cleanup": "node dist/src/jobs/cleanup-idempotency.js"
   },
   "dependencies": {
     "@prisma/client": "6.12.0",

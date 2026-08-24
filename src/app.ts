@@ -3,7 +3,12 @@ import Fastify from 'fastify';
 import { authorize, isUuid, unauthenticatedAuthenticator } from './auth.js';
 import type { Authenticator } from './auth.js';
 import { registerConvidadoRoutes } from './convidados.js';
-import { createPrismaInvitationStore, createUnavailableNotificationSender, registerConviteRoutes } from './convites.js';
+import {
+  createPrismaInvitationStore,
+  createUnavailableNotificationSender,
+  IdempotencySecretMismatchError,
+  registerConviteRoutes
+} from './convites.js';
 import type { InvitationStore, NotificationSender } from './convites.js';
 import {
   createMemoryDeviceRateLimiter,
@@ -410,6 +415,8 @@ export function createApp(
     db: suppliedDb,
     authenticator = unauthenticatedAuthenticator,
     invitationTokenSecret = process.env.INVITATION_TOKEN_SECRET,
+    idempotencyCacheSecret = process.env.IDEMPOTENCY_CACHE_SECRET,
+    idempotencyTtlMs = 24 * 60 * 60 * 1000,
     deviceApiKeySecret = process.env.DEVICE_API_KEY_SECRET,
     deviceRateLimiter = createMemoryDeviceRateLimiter(),
     developmentRateLimiter = createMemoryDeviceRateLimiter(),
@@ -421,6 +428,8 @@ export function createApp(
     db?: AppDependencies;
     authenticator?: Authenticator;
     invitationTokenSecret?: string;
+    idempotencyCacheSecret?: string;
+    idempotencyTtlMs?: number;
     deviceApiKeySecret?: string;
     deviceRateLimiter?: DeviceRateLimiter;
     developmentRateLimiter?: DeviceRateLimiter;
@@ -433,7 +442,7 @@ export function createApp(
   const db: AppDependencies = suppliedDb ?? {
     ...defaultStore,
     convite: invitationTokenSecret
-      ? createPrismaInvitationStore(defaultPrisma, invitationTokenSecret)
+      ? createPrismaInvitationStore(defaultPrisma, invitationTokenSecret, idempotencyCacheSecret, idempotencyTtlMs)
       : undefined,
     dispositivo: deviceApiKeySecret
       ? createPrismaDeviceStore(defaultPrisma, deviceApiKeySecret)
@@ -447,6 +456,9 @@ export function createApp(
   app.setErrorHandler((error, _request, reply) => {
     if (error instanceof DeviceSecretMismatchError) {
       return reply.status(503).send({ error: 'Device service unavailable' });
+    }
+    if (error instanceof IdempotencySecretMismatchError) {
+      return reply.status(503).send({ error: 'Invitation service unavailable' });
     }
     return reply.send(error);
   });

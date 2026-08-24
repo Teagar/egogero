@@ -19,6 +19,7 @@ model Condominio {
   moradores   Morador[]
   convidados  Convidado[]
   convites    Convite[]
+  idempotencias IdempotencyRecord[]
   notificacoes Notificacao[]
   dispositivos Dispositivo[]
 }
@@ -81,12 +82,14 @@ model Convite {
   morador      Morador?     @relation("ConviteMorador", fields: [moradorId, condominioId], references: [id, condominioId], onDelete: Restrict)
   convidado    Convidado?   @relation("ConviteConvidado", fields: [convidadoId, condominioId], references: [id, condominioId], onDelete: Restrict)
   notificacao  Notificacao?
+  entregas     DeliveryIntent[]
 
   @@index([condominioId])
   @@index([moradorId])
   @@index([condominioId, moradorId, createdAt])
   @@index([convidadoId])
   @@index([condominioId, expiresAt])
+  @@unique([id, condominioId])
   @@unique([id, condominioId, moradorId, convidadoId])
 }
 
@@ -153,6 +156,51 @@ enum StatusDispositivo {
 model SecurityKey {
   name        String @id
   fingerprint String @db.Char(64)
+}
+
+model IdempotencyRecord {
+  id                 String    @id @default(uuid())
+  createdAt          DateTime  @default(now()) @db.Timestamptz(3)
+  confirmedAt        DateTime? @db.Timestamptz(3)
+  expiresAt          DateTime? @db.Timestamptz(3)
+  actorId            String
+  condominioId       String
+  method             String
+  route               String
+  keyDigest           String   @db.Char(64)
+  requestHash         String   @db.Char(64)
+  responseStatus      Int?
+  responseCiphertext  Bytes?
+  responseIv          Bytes?
+  responseAuthTag     Bytes?
+  keyVersion          Int
+  condominio          Condominio @relation(fields: [condominioId], references: [id], onDelete: Restrict)
+
+  @@unique([actorId, condominioId, method, route, keyDigest])
+  @@index([expiresAt, id])
+}
+
+model DeliveryIntent {
+  id                String    @id @default(uuid())
+  createdAt         DateTime  @default(now()) @db.Timestamptz(3)
+  deliveredAt       DateTime? @db.Timestamptz(3)
+  conviteId         String
+  condominioId      String
+  channel           DeliveryChannel
+  payloadCiphertext Bytes
+  payloadIv         Bytes
+  payloadAuthTag    Bytes
+  keyVersion        Int
+  convite           Convite   @relation(fields: [conviteId, condominioId], references: [id, condominioId], onDelete: Restrict)
+
+  @@unique([conviteId, channel])
+  @@index([deliveredAt, createdAt, id])
+  @@index([condominioId, deliveredAt, createdAt])
+}
+
+enum DeliveryChannel {
+  email
+  sms
 }
 
 model Notificacao {

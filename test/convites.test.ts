@@ -8,6 +8,7 @@ import type { AppDependencies, AppStore } from '../src/app.js';
 import { createDevelopmentHeaderAuthenticator } from '../src/auth.js';
 import {
   ActiveTokenCollisionError,
+  IdempotencyConflictError,
   createInvitation,
   createInvitations,
   generateSixDigitToken,
@@ -39,7 +40,8 @@ const data = {
 const residentHeaders = {
   'x-development-user-id': MORADOR_ID,
   'x-development-user-role': 'morador',
-  'x-development-condominio-id': CONDOMINIO_ID
+  'x-development-condominio-id': CONDOMINIO_ID,
+  'idempotency-key': 'unit-test-invitation-key-0001'
 };
 
 function record(input: InvitationAllocation, index = 0): InvitationRecord {
@@ -58,12 +60,13 @@ function record(input: InvitationAllocation, index = 0): InvitationRecord {
   };
 }
 
-function uniqueMemoryStore(initialTokens: string[] = []): InvitationStore & {
+function uniqueMemoryStore(initialTokens: string[] = [], available = true): InvitationStore & {
   activeTokens: Set<string>;
   audits: Array<{ result: 'permitido' | 'negado'; accessType: 'pedestre' | 'veiculo'; deviceId: string }>;
   batchCalls: number;
 } {
   const activeTokens = new Set(initialTokens);
+  const replays = new Map<string, { requestHash: string; responseText: string }>();
   const store = {
     activeTokens,
     audits: [] as Array<{ result: 'permitido' | 'negado'; accessType: 'pedestre' | 'veiculo'; deviceId: string }>,
@@ -85,6 +88,24 @@ function uniqueMemoryStore(initialTokens: string[] = []): InvitationStore & {
     async createActive(input: InvitationAllocation) {
       const records = await store.createBatchActive([input]);
       return records[0] ?? null;
+    },
+    async issueIdempotent(args: import('../src/convites.js').IdempotentInvitationIssue) {
+      const scope = `${args.actorId}:${args.condominioId}:${args.route}:${args.key}`;
+      const replay = replays.get(scope);
+      if (replay) {
+        if (replay.requestHash !== args.requestHash) throw new IdempotencyConflictError();
+        return { statusCode: 201, responseText: replay.responseText, replayed: true };
+      }
+      if (!available || args.invitations.some((invitation) => invitation.condominioId !== CONDOMINIO_ID
+        || invitation.moradorId !== MORADOR_ID
+        || ![CONVIDADO_ID, SECOND_CONVIDADO_ID].includes(invitation.convidadoId))) {
+        return null;
+      }
+      const results = await createInvitations(store, args.invitations, { now: () => NOW });
+      if (!results) return null;
+      const responseText = JSON.stringify(await args.buildResponse(results));
+      replays.set(scope, { requestHash: args.requestHash, responseText });
+      return { statusCode: 201, responseText, replayed: false };
     },
     async validateActive({ token, condominiumId, deviceId, accessType }: {
       token: string | null;
@@ -314,6 +335,43 @@ test('single creation exposes plaintext once with no-store and enforces scope be
   await app.close();
 });
 
+test('invitation creation requires a bounded idempotency key and replays canonical requests exactly', async () => {
+  const store = uniqueMemoryStore();
+  const app = Fastify({ logger: false });
+  registerConviteRoutes(app, batchStore(), store, authenticator);
+  const url = `/condominios/${CONDOMINIO_ID}/moradores/${MORADOR_ID}/convidados/${CONVIDADO_ID}/convites`;
+  const payload = { tipo: 'visitante', expiresAt: EXPIRES_AT.toISOString() };
+  for (const key of [undefined, 'short', 'invalid key with spaces', 'x'.repeat(129)]) {
+    const headers = key === undefined
+      ? Object.fromEntries(Object.entries(residentHeaders).filter(([name]) => name !== 'idempotency-key'))
+      : { ...residentHeaders, 'idempotency-key': key };
+    const response = await app.inject({
+      method: 'POST', url, headers, payload
+    });
+    assert.equal(response.statusCode, 400);
+  }
+  assert.equal(store.batchCalls, 0);
+
+  const first = await app.inject({ method: 'POST', url, headers: residentHeaders, payload });
+  const replay = await app.inject({
+    method: 'POST', url, headers: residentHeaders,
+    payload: { expiresAt: EXPIRES_AT.toISOString(), tipo: 'visitante' }
+  });
+  assert.equal(first.statusCode, 201);
+  assert.equal(replay.statusCode, 201);
+  assert.equal(replay.body, first.body);
+  assert.equal(replay.headers['idempotency-replayed'], 'true');
+  assert.equal(store.batchCalls, 1);
+
+  const conflict = await app.inject({
+    method: 'POST', url, headers: residentHeaders,
+    payload: { tipo: 'prestador', expiresAt: EXPIRES_AT.toISOString() }
+  });
+  assert.equal(conflict.statusCode, 409);
+  assert.equal(store.batchCalls, 1);
+  await app.close();
+});
+
 test('link and QR output are opt-in, fragment-only, and fail closed without configuration', async () => {
   const path = `/condominios/${CONDOMINIO_ID}/moradores/${MORADOR_ID}/convidados/${CONVIDADO_ID}/convites`;
   const payload = { tipo: 'visitante', expiresAt: EXPIRES_AT.toISOString() };
@@ -494,7 +552,7 @@ test('invitation template presents the same instant in each condominium timezone
   assert.match(invitationMessage({ ...common, timeZone: 'America/New_York' }).body, /às 01:30 do dia 01\/11\/2026/);
 });
 
-test('single invitation sends exactly one message per supplied channel and none without contacts', async () => {
+test('single invitation never calls delivery providers in the request path', async () => {
   for (const contacts of [
     { email: 'ana@example.com', telefone: null, expectedEmail: 1, expectedSms: 0 },
     { email: null, telefone: '+5511999999999', expectedEmail: 0, expectedSms: 1 },
@@ -511,13 +569,13 @@ test('single invitation sends exactly one message per supplied channel and none 
     registerConviteRoutes(app, batchStore(contacts), convite, authenticator, notifications);
     const response = await app.inject({ method: 'POST', url: `/condominios/${CONDOMINIO_ID}/moradores/${MORADOR_ID}/convidados/${CONVIDADO_ID}/convites`, headers: residentHeaders, payload: { tipo: 'visitante', expiresAt: EXPIRES_AT.toISOString() } });
     assert.equal(response.statusCode, 201);
-    assert.equal(sent.emails.length, contacts.expectedEmail);
-    assert.equal(sent.sms.length, contacts.expectedSms);
+    assert.equal(sent.emails.length, 0);
+    assert.equal(sent.sms.length, 0);
     await app.close();
   }
 });
 
-test('single invitation sends only to contacts re-read after issuance', async () => {
+test('single invitation does not read contacts after transactional issuance', async () => {
   const db = batchStore({ email: 'stale@example.com' });
   const findGuest = db.convidado.findFirst.bind(db.convidado);
   let reads = 0;
@@ -541,11 +599,12 @@ test('single invitation sends only to contacts re-read after issuance', async ()
     payload: { tipo: 'visitante', expiresAt: EXPIRES_AT.toISOString() }
   });
   assert.equal(response.statusCode, 201);
-  assert.deepEqual(recipients, ['current@example.com']);
+  assert.deepEqual(recipients, []);
+  assert.equal(reads, 0);
   await app.close();
 });
 
-test('createApp honors an explicit notification sender when a database is supplied', async () => {
+test('createApp never invokes an explicit notification sender during issuance', async () => {
   const convite = uniqueMemoryStore();
   const sent: string[] = [];
   const notificationSender: NotificationSender = {
@@ -565,11 +624,11 @@ test('createApp honors an explicit notification sender when a database is suppli
   });
 
   assert.equal(response.statusCode, 201);
-  assert.deepEqual(sent, ['ana@example.com']);
+  assert.deepEqual(sent, []);
   await app.close();
 });
 
-test('production default reports unavailable delivery after issuing without exposing the token', async () => {
+test('production default confirms durable issuance without a synchronous provider', async () => {
   const convite = uniqueMemoryStore();
   const app = createApp({
     db: { ...batchStore({ email: 'ana@example.com' }), convite },
@@ -582,13 +641,13 @@ test('production default reports unavailable delivery after issuing without expo
     payload: { tipo: 'visitante', expiresAt: EXPIRES_AT.toISOString() }
   });
 
-  assert.equal(response.statusCode, 502);
-  assert.equal(response.json().token, undefined);
+  assert.equal(response.statusCode, 201);
+  assert.match(response.json().token, /^[0-9]{6}$/);
   assert.equal(convite.activeTokens.size, 1);
   await app.close();
 });
 
-test('sender failure is explicit after issuance and does not expose the token', async () => {
+test('provider failure cannot affect request issuance because providers are not called', async () => {
   const convite = uniqueMemoryStore();
   const notifications: NotificationSender = {
     email: { async send() { throw new Error('provider unavailable'); } },
@@ -597,8 +656,8 @@ test('sender failure is explicit after issuance and does not expose the token', 
   const app = Fastify({ logger: false });
   registerConviteRoutes(app, batchStore({ email: 'ana@example.com' }), convite, authenticator, notifications);
   const response = await app.inject({ method: 'POST', url: `/condominios/${CONDOMINIO_ID}/moradores/${MORADOR_ID}/convidados/${CONVIDADO_ID}/convites`, headers: residentHeaders, payload: { tipo: 'visitante', expiresAt: EXPIRES_AT.toISOString() } });
-  assert.equal(response.statusCode, 502);
-  assert.equal(response.json().token, undefined);
+  assert.equal(response.statusCode, 201);
+  assert.match(response.json().token, /^[0-9]{6}$/);
   assert.equal(convite.activeTokens.size, 1);
   await app.close();
 });
@@ -652,7 +711,7 @@ test('batch validation rejects duplicates, inactive, cross-tenant, and cross-own
 
 test('batch creation rejects disabled parents and fails closed without a token store', async () => {
   for (const options of [{ residentDeleted: true }, { condominiumDeleted: true }]) {
-    const convite = uniqueMemoryStore();
+    const convite = uniqueMemoryStore([], false);
     const app = createApp({ db: { ...batchStore(options), convite }, authenticator });
     const response = await app.inject({
       method: 'POST',

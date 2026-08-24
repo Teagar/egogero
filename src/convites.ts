@@ -1,4 +1,12 @@
-import { createHash, createHmac, randomInt, randomUUID } from 'node:crypto';
+import {
+  createCipheriv,
+  createDecipheriv,
+  createHash,
+  createHmac,
+  randomBytes,
+  randomInt,
+  randomUUID
+} from 'node:crypto';
 
 import { Prisma, type PrismaClient, type TipoConvite } from '@prisma/client';
 import type { FastifyInstance } from 'fastify';
@@ -19,6 +27,8 @@ const TOKEN_LIMIT = 1_000_000;
 const MAX_TOKEN_ATTEMPTS = 32;
 const BATCH_EXPIRATION_MS = 24 * 60 * 60 * 1000;
 const MAX_BATCH_SIZE = 100;
+const IDEMPOTENCY_KEY_PATTERN = /^[A-Za-z0-9._:-]{16,128}$/;
+const IDEMPOTENCY_KEY_VERSION = 1;
 
 export type InvitationMessage = { subject: string; body: string };
 export interface EmailSender { send(to: string, message: InvitationMessage): Promise<void>; }
@@ -129,7 +139,26 @@ export interface InvitationStore {
     limit: number;
   }): Promise<readonly AccessAuditRecord[]>;
   revokeActive(args: { id: string; condominioId: string; moradorId: string }, now: Date): Promise<'revoked' | 'already-revoked' | 'unavailable'>;
+  issueIdempotent?(args: IdempotentInvitationIssue): Promise<IdempotentInvitationResult | null>;
+  verifyIdempotencyConfiguration?(): Promise<void>;
 }
+
+export type IdempotentInvitationIssue = {
+  key: string;
+  actorId: string;
+  condominioId: string;
+  method: 'POST';
+  route: string;
+  requestHash: string;
+  invitations: readonly InvitationCreateData[];
+  buildResponse(results: readonly { convite: InvitationRecord; token: string }[]): Promise<unknown>;
+};
+
+export type IdempotentInvitationResult = {
+  statusCode: number;
+  responseText: string;
+  replayed: boolean;
+};
 
 export class InvitationSecretMismatchError extends Error {
   constructor() {
@@ -153,6 +182,38 @@ export class DailyInvitationLimitError extends Error {
   constructor() {
     super('Daily invitation limit reached');
   }
+}
+
+export class IdempotencyConflictError extends Error {
+  constructor() {
+    super('Idempotency key was already used with a different request');
+  }
+}
+
+export class IdempotencySecretMismatchError extends Error {
+  constructor() {
+    super('Idempotency cache secret does not match database configuration');
+  }
+}
+
+export function parseIdempotencyKey(value: string | string[] | undefined) {
+  return typeof value === 'string' && IDEMPOTENCY_KEY_PATTERN.test(value) ? value : null;
+}
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.entries(value as Record<string, unknown>)
+      .filter(([, item]) => item !== undefined)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, item]) => `${JSON.stringify(key)}:${canonicalJson(item)}`)
+      .join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+
+export function canonicalRequestHash(body: unknown) {
+  return createHash('sha256').update(canonicalJson(body)).digest('hex');
 }
 
 export function generateSixDigitToken() {
@@ -223,13 +284,29 @@ function isTokenCollision(error: unknown) {
     : String(target).toLowerCase().includes('tokendigest');
 }
 
-export function createPrismaInvitationStore(client: PrismaClient, tokenSecret: string): InvitationStore {
+export function createPrismaInvitationStore(
+  client: PrismaClient,
+  tokenSecret: string,
+  idempotencySecret?: string,
+  idempotencyTtlMs = 24 * 60 * 60 * 1000
+): InvitationStore {
   if (Buffer.byteLength(tokenSecret) < 32) {
     throw new Error('Invitation token secret must be at least 32 bytes');
   }
 
   const digestToken = (token: string) => createHmac('sha256', tokenSecret).update(token).digest('hex');
   const secretFingerprint = createHash('sha256').update(tokenSecret).digest('hex');
+  const idempotencyKey = idempotencySecret ? createHash('sha256').update(idempotencySecret).digest() : null;
+  const idempotencyFingerprint = idempotencySecret
+    ? createHash('sha256').update(`idempotency-cache:${idempotencySecret}`).digest('hex')
+    : null;
+
+  if (idempotencySecret !== undefined && Buffer.byteLength(idempotencySecret) < 32) {
+    throw new Error('Idempotency cache secret must be at least 32 bytes');
+  }
+  if (!Number.isSafeInteger(idempotencyTtlMs) || idempotencyTtlMs <= 0) {
+    throw new Error('Idempotency TTL must be a positive integer');
+  }
 
   async function verifyTokenSecret(transaction: Prisma.TransactionClient) {
     await transaction.$executeRaw`
@@ -242,6 +319,47 @@ export function createPrismaInvitationStore(client: PrismaClient, tokenSecret: s
     `;
     if (configured[0]?.fingerprint.trim() !== secretFingerprint) {
       throw new InvitationSecretMismatchError();
+    }
+  }
+
+  async function verifyIdempotencySecret(transaction: Prisma.TransactionClient) {
+    if (!idempotencyFingerprint || !idempotencyKey || !idempotencySecret) {
+      throw new IdempotencySecretMismatchError();
+    }
+    await transaction.$executeRaw`
+      INSERT INTO "SecurityKey" (name, fingerprint)
+      VALUES ('idempotency-cache-v1', ${idempotencyFingerprint})
+      ON CONFLICT (name) DO NOTHING
+    `;
+    const configured = await transaction.$queryRaw<Array<{ fingerprint: string }>>`
+      SELECT fingerprint FROM "SecurityKey" WHERE name = 'idempotency-cache-v1'
+    `;
+    if (configured[0]?.fingerprint.trim() !== idempotencyFingerprint) {
+      throw new IdempotencySecretMismatchError();
+    }
+  }
+
+  function encryptProtected(plaintext: string, aad: string) {
+    if (!idempotencyKey) throw new IdempotencySecretMismatchError();
+    const iv = randomBytes(12);
+    const cipher = createCipheriv('aes-256-gcm', idempotencyKey, iv);
+    cipher.setAAD(Buffer.from(aad));
+    return {
+      ciphertext: Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()]),
+      iv,
+      authTag: cipher.getAuthTag()
+    };
+  }
+
+  function decryptProtected(ciphertext: Buffer, iv: Buffer, authTag: Buffer, aad: string) {
+    if (!idempotencyKey) throw new IdempotencySecretMismatchError();
+    try {
+      const decipher = createDecipheriv('aes-256-gcm', idempotencyKey, iv);
+      decipher.setAAD(Buffer.from(aad));
+      decipher.setAuthTag(authTag);
+      return Buffer.concat([decipher.update(ciphertext), decipher.final()]).toString('utf8');
+    } catch {
+      throw new IdempotencySecretMismatchError();
     }
   }
 
@@ -344,6 +462,174 @@ export function createPrismaInvitationStore(client: PrismaClient, tokenSecret: s
       }
       throw error;
     }
+  }
+
+  async function issueIdempotent(args: IdempotentInvitationIssue): Promise<IdempotentInvitationResult | null> {
+    if (!idempotencySecret || !idempotencyKey || !idempotencyFingerprint) {
+      throw new IdempotencySecretMismatchError();
+    }
+    if (args.invitations.length === 0) throw new RangeError('At least one invitation is required');
+    const keyDigest = createHmac('sha256', idempotencySecret).update(args.key).digest('hex');
+
+    for (let attempt = 0; attempt < MAX_TOKEN_ATTEMPTS; attempt += 1) {
+      const now = new Date();
+      if (args.invitations.some((invitation) => invitation.expiresAt.getTime() <= now.getTime())) {
+        throw new RangeError('Invitation expiration must be in the future');
+      }
+      const allocations = args.invitations.map((invitation) => ({
+        ...invitation,
+        token: generateSixDigitToken(),
+        now
+      }));
+      try {
+        return await client.$transaction(async (transaction) => {
+          await verifyIdempotencySecret(transaction);
+          await transaction.$executeRaw`
+            DELETE FROM "IdempotencyRecord"
+            WHERE "actorId" = ${args.actorId}
+              AND "condominioId" = ${args.condominioId}
+              AND method = ${args.method}
+              AND route = ${args.route}
+              AND "keyDigest" = ${keyDigest}
+              AND "confirmedAt" IS NOT NULL
+              AND "expiresAt" <= clock_timestamp()
+          `;
+
+          const recordId = randomUUID();
+          const inserted = await transaction.$queryRaw<Array<{ id: string }>>`
+            INSERT INTO "IdempotencyRecord" (
+              id, "actorId", "condominioId", method, route, "keyDigest", "requestHash", "keyVersion"
+            ) VALUES (
+              ${recordId}::uuid, ${args.actorId}, ${args.condominioId}, ${args.method}, ${args.route},
+              ${keyDigest}, ${args.requestHash}, ${IDEMPOTENCY_KEY_VERSION}
+            )
+            ON CONFLICT ("actorId", "condominioId", method, route, "keyDigest") DO NOTHING
+            RETURNING id
+          `;
+
+          if (inserted.length === 0) {
+            const existing = await transaction.$queryRaw<Array<{
+              id: string;
+              requestHash: string;
+              responseStatus: number | null;
+              responseCiphertext: Buffer | null;
+              responseIv: Buffer | null;
+              responseAuthTag: Buffer | null;
+              keyVersion: number;
+            }>>`
+              SELECT id, "requestHash", "responseStatus", "responseCiphertext",
+                     "responseIv", "responseAuthTag", "keyVersion"
+              FROM "IdempotencyRecord"
+              WHERE "actorId" = ${args.actorId}
+                AND "condominioId" = ${args.condominioId}
+                AND method = ${args.method}
+                AND route = ${args.route}
+                AND "keyDigest" = ${keyDigest}
+            `;
+            const replay = existing[0];
+            if (!replay || replay.requestHash.trim() !== args.requestHash) {
+              throw new IdempotencyConflictError();
+            }
+            if (replay.keyVersion !== IDEMPOTENCY_KEY_VERSION || replay.responseStatus === null
+              || !replay.responseCiphertext || !replay.responseIv || !replay.responseAuthTag) {
+              throw new IdempotencySecretMismatchError();
+            }
+            return {
+              statusCode: replay.responseStatus,
+              responseText: decryptProtected(
+                replay.responseCiphertext,
+                replay.responseIv,
+                replay.responseAuthTag,
+                `idempotency:${replay.id}:v${replay.keyVersion}`
+              ),
+              replayed: true
+            };
+          }
+
+          const convites = await persistBatch(transaction, allocations);
+          if (!convites) return null;
+          const results = convites.map((convite, index) => ({ convite, token: allocations[index]!.token }));
+          const responseText = JSON.stringify(await args.buildResponse(results));
+
+          const rows = await transaction.$queryRaw<Array<{
+            conviteId: string;
+            condominioId: string;
+            createdAt: Date;
+            expiresAt: Date;
+            email: string | null;
+            telefone: string | null;
+            condominiumName: string;
+            residentName: string;
+            timezone: string;
+          }>>(Prisma.sql`
+            SELECT convite.id AS "conviteId", convite."condominioId", convite."createdAt", convite."expiresAt",
+                   convidado.email, convidado.telefone, condominio.nome AS "condominiumName",
+                   morador.nome AS "residentName", condominio.timezone
+            FROM "Convite" AS convite
+            JOIN "Convidado" AS convidado
+              ON convidado.id = convite."convidadoId" AND convidado."condominioId" = convite."condominioId"
+            JOIN "Morador" AS morador
+              ON morador.id = convite."moradorId" AND morador."condominioId" = convite."condominioId"
+            JOIN "Condominio" AS condominio ON condominio.id = convite."condominioId"
+            WHERE convite.id IN (${Prisma.join(convites.map((convite) => convite.id))})
+          `);
+
+          for (const row of rows) {
+            const token = results.find((result) => result.convite.id === row.conviteId)!.token;
+            const message = invitationMessage({
+              condominiumName: row.condominiumName,
+              residentName: row.residentName,
+              generatedAt: row.createdAt,
+              expiresAt: row.expiresAt,
+              token,
+              timeZone: row.timezone
+            });
+            const channels = [
+              ...(row.email ? [{ channel: 'email' as const, to: row.email, content: message }] : []),
+              ...(row.telefone ? [{ channel: 'sms' as const, to: row.telefone, content: { body: message.body } }] : [])
+            ];
+            for (const delivery of channels) {
+              const intentId = randomUUID();
+              const protectedPayload = encryptProtected(
+                JSON.stringify({ intentId, invitationId: row.conviteId, to: delivery.to, ...delivery.content }),
+                `delivery:${intentId}:${row.conviteId}:${delivery.channel}:v${IDEMPOTENCY_KEY_VERSION}`
+              );
+              await transaction.$executeRaw`
+                INSERT INTO "DeliveryIntent" (
+                  id, "conviteId", "condominioId", channel, "payloadCiphertext", "payloadIv",
+                  "payloadAuthTag", "keyVersion"
+                ) VALUES (
+                  ${intentId}::uuid, ${row.conviteId}, ${row.condominioId}, ${delivery.channel}::"DeliveryChannel",
+                  ${protectedPayload.ciphertext}, ${protectedPayload.iv}, ${protectedPayload.authTag},
+                  ${IDEMPOTENCY_KEY_VERSION}
+                )
+                ON CONFLICT ("conviteId", channel) DO NOTHING
+              `;
+            }
+          }
+
+          const protectedResponse = encryptProtected(
+            responseText,
+            `idempotency:${recordId}:v${IDEMPOTENCY_KEY_VERSION}`
+          );
+          const confirmed = await transaction.$executeRaw`
+            UPDATE "IdempotencyRecord"
+            SET "confirmedAt" = clock_timestamp(),
+                "expiresAt" = clock_timestamp() + (${idempotencyTtlMs} * interval '1 millisecond'),
+                "responseStatus" = 201,
+                "responseCiphertext" = ${protectedResponse.ciphertext},
+                "responseIv" = ${protectedResponse.iv},
+                "responseAuthTag" = ${protectedResponse.authTag}
+            WHERE id = ${recordId}::uuid AND "confirmedAt" IS NULL
+          `;
+          if (confirmed !== 1) throw new Error('Could not confirm idempotent invitation response');
+          return { statusCode: 201, responseText, replayed: false };
+        });
+      } catch (error) {
+        if (!isTokenCollision(error)) throw error;
+      }
+    }
+    throw new TokenGenerationExhaustedError();
   }
 
   async function validateActive(args: {
@@ -512,6 +798,12 @@ export function createPrismaInvitationStore(client: PrismaClient, tokenSecret: s
   }
 
   return {
+    issueIdempotent,
+
+    verifyIdempotencyConfiguration() {
+      return client.$transaction((transaction) => verifyIdempotencySecret(transaction));
+    },
+
     async createActive(data) {
       const records = await inTransaction([data]);
       return records?.[0] ?? null;
@@ -617,10 +909,6 @@ export function createPrismaInvitationStore(client: PrismaClient, tokenSecret: s
 
 type ConvitesStore = Pick<AppStore, 'condominio' | 'morador' | 'convidado'>;
 const activeCondominio = { deletedAt: null } as const;
-const activeGuestParents = {
-  condominio: activeCondominio,
-  morador: { is: { deletedAt: null } }
-} as const;
 
 function parseUuidParam(params: unknown, field: string) {
   if (!params || typeof params !== 'object' || Array.isArray(params)) {
@@ -743,7 +1031,7 @@ export function registerConviteRoutes(
   db: ConvitesStore,
   store: InvitationStore | undefined,
   authenticator: Authenticator,
-  notifications: NotificationSender = createUnavailableNotificationSender(),
+  _notifications: NotificationSender = createUnavailableNotificationSender(),
   publicValidationBaseUrl?: string,
   deviceRateLimiter: DeviceRateLimiter = createMemoryDeviceRateLimiter(),
   developmentRateLimiter: DeviceRateLimiter = createMemoryDeviceRateLimiter(),
@@ -885,7 +1173,12 @@ export function registerConviteRoutes(
       return reply.status(400).send({ error: 'Invalid invitation payload' });
     }
 
-    if (!store) {
+    const idempotencyKey = parseIdempotencyKey(request.headers['idempotency-key']);
+    if (!idempotencyKey) {
+      return reply.status(400).send({ error: 'A valid Idempotency-Key header is required' });
+    }
+    const identity = request.authenticatedIdentity;
+    if (!store?.issueIdempotent || !identity || identity.id.length === 0 || identity.id.length > 128) {
       return reply.status(503).send({ error: 'Invitation service unavailable' });
     }
     if (body?.link || body?.qrCode) {
@@ -893,46 +1186,29 @@ export function registerConviteRoutes(
       if (!representation) return reply.status(503).send({ error: 'Invitation link configuration unavailable' });
     }
 
-    const [condominio, morador, convidado] = await Promise.all([
-      db.condominio.findFirst({ where: { id: condominioId, deletedAt: null } }),
-      db.morador.findFirst({
-        where: { id: moradorId, condominioId, deletedAt: null, condominio: activeCondominio }
-      }),
-      db.convidado.findFirst({
-        where: { id: convidadoId, condominioId, moradorId, deletedAt: null, ...activeGuestParents }
-      })
-    ]);
-    if (!condominio || !morador || !convidado) {
-      return reply.status(404).send({ error: 'Guest not found' });
-    }
-
     try {
-      const result = await createInvitation(store, { condominioId, moradorId, convidadoId, ...body });
+      const result = await store.issueIdempotent({
+        key: idempotencyKey,
+        actorId: identity.id,
+        condominioId,
+        method: 'POST',
+        route: singlePath,
+        requestHash: canonicalRequestHash(request.body),
+        invitations: [{ condominioId, moradorId, convidadoId, ...body }],
+        async buildResponse(results) {
+          const issued = results[0]!;
+          const representations = await invitationRepresentations(issued.token, body, publicValidationBaseUrl);
+          if (!representations) throw new Error('Invitation link configuration became unavailable');
+          return { ...invitationResponse(issued.convite, issued.token), ...representations };
+        }
+      });
       if (!result) return reply.status(404).send({ error: 'Guest not found' });
-      // Issuance now prevents anonymization; re-read contacts after its row lock commits.
-      const currentGuest = await db.convidado.findFirst({
-        where: { id: convidadoId, condominioId, moradorId, deletedAt: null, ...activeGuestParents }
-      });
-      const message = invitationMessage({
-        condominiumName: condominio.nome,
-        residentName: morador.nome,
-        generatedAt: result.convite.createdAt,
-        expiresAt: result.convite.expiresAt ?? body.expiresAt,
-        token: result.token,
-        timeZone: condominio.timezone
-      });
-      try {
-        if (currentGuest?.email) await notifications.email.send(currentGuest.email, message);
-        if (currentGuest?.telefone) await notifications.sms.send(currentGuest.telefone, message.body);
-      } catch {
-        return reply.header('cache-control', 'no-store').status(502).send({ error: 'Invitation created but notification delivery failed', invitationId: result.convite.id });
-      }
-      const representations = await invitationRepresentations(result.token, body, publicValidationBaseUrl);
-      if (!representations) return reply.status(503).send({ error: 'Invitation link configuration unavailable' });
-      return reply.header('cache-control', 'no-store').status(201).send({
-        ...invitationResponse(result.convite, result.token),
-        ...representations
-      });
+      return reply
+        .header('cache-control', 'no-store')
+        .header('idempotency-replayed', String(result.replayed))
+        .type('application/json')
+        .status(result.statusCode)
+        .send(result.responseText);
     } catch (error) {
       if (error instanceof RangeError) {
         return reply.status(400).send({ error: 'Invitation expiration must be in the future' });
@@ -942,6 +1218,12 @@ export function registerConviteRoutes(
       }
       if (error instanceof DailyInvitationLimitError) {
         return reply.status(429).send({ error: 'Daily invitation limit reached' });
+      }
+      if (error instanceof IdempotencyConflictError) {
+        return reply.status(409).send({ error: 'Idempotency key conflicts with a different request' });
+      }
+      if (error instanceof IdempotencySecretMismatchError) {
+        return reply.status(503).send({ error: 'Invitation service unavailable' });
       }
       throw error;
     }
@@ -958,7 +1240,12 @@ export function registerConviteRoutes(
     if (new Set(convidadoIds).size !== convidadoIds.length) {
       return reply.status(400).send({ error: 'Guest ids must be unique' });
     }
-    if (!store) {
+    const idempotencyKey = parseIdempotencyKey(request.headers['idempotency-key']);
+    if (!idempotencyKey) {
+      return reply.status(400).send({ error: 'A valid Idempotency-Key header is required' });
+    }
+    const identity = request.authenticatedIdentity;
+    if (!store?.issueIdempotent || !identity || identity.id.length === 0 || identity.id.length > 128) {
       return reply.status(503).send({ error: 'Invitation service unavailable' });
     }
     if (representations.link || representations.qrCode) {
@@ -967,52 +1254,54 @@ export function registerConviteRoutes(
       }
     }
 
-    const morador = await db.morador.findFirst({
-      where: { id: moradorId, condominioId, deletedAt: null, condominio: activeCondominio }
-    });
-    if (!morador) {
-      return reply.status(404).send({ error: 'Resident not found' });
-    }
-
-    for (const convidadoId of convidadoIds) {
-      const convidado = await db.convidado.findFirst({
-        where: { id: convidadoId, condominioId, moradorId, deletedAt: null, ...activeGuestParents }
-      });
-      if (!convidado) {
-        return reply.status(404).send({ error: `Guest is not active or owned by resident: ${convidadoId}` });
-      }
-    }
-
     try {
       const expiresAt = new Date(Date.now() + BATCH_EXPIRATION_MS);
-      const results = await createInvitations(
-        store,
-        convidadoIds.map((convidadoId) => ({
+      const result = await store.issueIdempotent({
+        key: idempotencyKey,
+        actorId: identity.id,
+        condominioId,
+        method: 'POST',
+        route: batchPath,
+        requestHash: canonicalRequestHash(request.body),
+        invitations: convidadoIds.map((convidadoId) => ({
           condominioId,
           moradorId,
           convidadoId,
           tipo: 'visitante',
           expiresAt
-        }))
-      );
-      if (!results) {
+        })),
+        async buildResponse(results) {
+          const convites = await Promise.all(results.map(async ({ convite, token }) => ({
+            id: convite.id,
+            convidadoId: convite.convidadoId,
+            token,
+            expiraEm: convite.expiresAt?.toISOString() ?? expiresAt.toISOString(),
+            ...(await invitationRepresentations(token, representations, publicValidationBaseUrl) ?? {})
+          })));
+          return { convites };
+        }
+      });
+      if (!result) {
         return reply.status(404).send({ error: 'One or more guests are no longer active or owned by resident' });
       }
-
-      const convites = await Promise.all(results.map(async ({ convite, token }) => ({
-        id: convite.id,
-        convidadoId: convite.convidadoId,
-        token,
-        expiraEm: convite.expiresAt?.toISOString() ?? expiresAt.toISOString(),
-        ...(await invitationRepresentations(token, representations, publicValidationBaseUrl) ?? {})
-      })));
-      return reply.header('cache-control', 'no-store').status(201).send({ convites });
+      return reply
+        .header('cache-control', 'no-store')
+        .header('idempotency-replayed', String(result.replayed))
+        .type('application/json')
+        .status(result.statusCode)
+        .send(result.responseText);
     } catch (error) {
       if (error instanceof TokenGenerationExhaustedError) {
         return reply.status(503).send({ error: 'Invitation token unavailable' });
       }
       if (error instanceof DailyInvitationLimitError) {
         return reply.status(429).send({ error: 'Daily invitation limit reached' });
+      }
+      if (error instanceof IdempotencyConflictError) {
+        return reply.status(409).send({ error: 'Idempotency key conflicts with a different request' });
+      }
+      if (error instanceof IdempotencySecretMismatchError) {
+        return reply.status(503).send({ error: 'Invitation service unavailable' });
       }
       throw error;
     }

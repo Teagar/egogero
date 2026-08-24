@@ -16,7 +16,8 @@ test('feature migrations form one immutable sequence after invitation tokens', a
     '0011_add_guest_anonymization',
     '0012_index_pending_guest_anonymization',
     '0013_add_gatehouse_devices',
-    '0016_add_condominium_timezone_and_timestamptz'
+    '0016_add_condominium_timezone_and_timestamptz',
+    '0017_add_invitation_idempotency_outbox'
   ];
   let previousIndex = -1;
   for (const migration of immutableSequence) {

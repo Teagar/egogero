@@ -15,6 +15,7 @@ import {
 
 const runDatabaseTests = process.env.RUN_DATABASE_TESTS === 'true';
 const secret = 'database-e2e-invitation-secret-32-bytes-minimum';
+const idempotencySecret = 'database-e2e-idempotency-secret-32-bytes-minimum';
 const uuid = (n: number) => `10000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
 
 test('PostgreSQL invitation creation is secure, atomic, scoped, and one-use', { skip: !runDatabaseTests }, async () => {
@@ -28,6 +29,8 @@ test('PostgreSQL invitation creation is secure, atomic, scoped, and one-use', { 
   const expiresAt = new Date(Date.now() + 60 * 60 * 1000);
 
   try {
+    await prisma.deliveryIntent.deleteMany();
+    await prisma.idempotencyRecord.deleteMany();
     await prisma.convite.deleteMany();
     await prisma.convidado.deleteMany();
     await prisma.morador.deleteMany();
@@ -55,12 +58,14 @@ test('PostgreSQL invitation creation is secure, atomic, scoped, and one-use', { 
 
     const app = createApp({
       authenticator: createDevelopmentHeaderAuthenticator(true),
-      invitationTokenSecret: secret
+      invitationTokenSecret: secret,
+      idempotencyCacheSecret: idempotencySecret
     });
     const headers = {
       'x-development-user-id': moradorId,
       'x-development-user-role': 'morador',
-      'x-development-condominio-id': condominioId
+      'x-development-condominio-id': condominioId,
+      'idempotency-key': 'database-invitation-key-0001'
     };
     const validate = (token: string) => store.validateActive({
       token,
@@ -255,6 +260,8 @@ test('PostgreSQL gatehouse validation is tenant-scoped, one-use, and fail-closed
   });
 
   try {
+    await prisma.deliveryIntent.deleteMany();
+    await prisma.idempotencyRecord.deleteMany();
     await prisma.convite.deleteMany();
     await prisma.convidado.deleteMany();
     await prisma.morador.deleteMany();
@@ -570,6 +577,8 @@ test('PostgreSQL daily limits use condominium civil days and serialized batch is
   const invitation = (convidadoId: string) => ({ condominioId, moradorId, convidadoId, tipo: 'visitante' as const, expiresAt });
 
   try {
+    await prisma.deliveryIntent.deleteMany();
+    await prisma.idempotencyRecord.deleteMany();
     await prisma.convite.deleteMany();
     await prisma.convidado.deleteMany();
     await prisma.morador.deleteMany();

@@ -1,4 +1,5 @@
 const DEFAULT_PORT = 3000;
+const DEFAULT_IDEMPOTENCY_TTL_SECONDS = 24 * 60 * 60;
 
 export function normalizePublicValidationBaseUrl(value: string) {
   let url: URL;
@@ -38,6 +39,18 @@ export function getEnv(environment: NodeJS.ProcessEnv = process.env) {
     throw new Error('DEVICE_API_KEY_SECRET must be at least 32 bytes');
   }
 
+  const idempotencyCacheSecret = environment.IDEMPOTENCY_CACHE_SECRET;
+  if (!idempotencyCacheSecret || Buffer.byteLength(idempotencyCacheSecret) < 32) {
+    throw new Error('IDEMPOTENCY_CACHE_SECRET must be at least 32 bytes');
+  }
+  const idempotencyTtlSeconds = Number(
+    environment.IDEMPOTENCY_REPLAY_TTL_SECONDS ?? DEFAULT_IDEMPOTENCY_TTL_SECONDS
+  );
+  if (!Number.isSafeInteger(idempotencyTtlSeconds) || idempotencyTtlSeconds < 60
+    || idempotencyTtlSeconds > 30 * 24 * 60 * 60) {
+    throw new Error('IDEMPOTENCY_REPLAY_TTL_SECONDS must be an integer between 60 and 2592000');
+  }
+
   const publicValidationBaseUrl = environment.PUBLIC_VALIDATION_BASE_URL
     ? normalizePublicValidationBaseUrl(environment.PUBLIC_VALIDATION_BASE_URL)
     : undefined;
@@ -46,6 +59,8 @@ export function getEnv(environment: NodeJS.ProcessEnv = process.env) {
     port,
     databaseUrl,
     invitationTokenSecret,
+    idempotencyCacheSecret,
+    idempotencyTtlMs: idempotencyTtlSeconds * 1000,
     deviceApiKeySecret,
     publicValidationBaseUrl,
     host: environment.HOST ?? (environment.LOCAL_DEVELOPMENT_AUTH === 'true' ? '127.0.0.1' : '0.0.0.0'),

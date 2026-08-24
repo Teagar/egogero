@@ -129,6 +129,13 @@ function createAuthorizationStore(): AppDependencies {
       }
     },
     convite: {
+      async issueIdempotent(args) {
+        const results = args.invitations.map((item, index) => ({
+          convite: { ...convite, ...item, id: `convite-${index}` },
+          token: String(index).padStart(6, '0')
+        }));
+        return { statusCode: 201, responseText: JSON.stringify(await args.buildResponse(results)), replayed: false };
+      },
       async createActive(data) {
         return { ...convite, ...data };
       },
@@ -415,7 +422,8 @@ function developmentHeaders(role: Role) {
   return {
     'x-development-user-id': role === 'morador' ? MORADOR_ID : `${role}-1`,
     'x-development-user-role': role,
-    'x-development-condominio-id': role === 'provedor' ? '*' : CONDOMINIO_ID
+    'x-development-condominio-id': role === 'provedor' ? '*' : CONDOMINIO_ID,
+    'idempotency-key': `rbac-test-${role}-invitation-key`
   };
 }
 
@@ -553,6 +561,10 @@ test('tenant matrix prevents a sindico from reaching another condominium before 
           }
         },
         convite: {
+          issueIdempotent: async (args) => {
+            storeCalls += 1;
+            return store.convite!.issueIdempotent!(args);
+          },
           createActive: async (args) => {
             storeCalls += 1;
             return store.convite!.createActive(args);

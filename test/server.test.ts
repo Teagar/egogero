@@ -8,6 +8,7 @@ import { getEnv, normalizePublicValidationBaseUrl } from '../src/env.js';
 
 const INVITATION_TOKEN_SECRET = 'test-invitation-token-secret-at-least-32-bytes';
 const DEVICE_API_KEY_SECRET = 'test-device-api-key-secret-at-least-32-bytes';
+const IDEMPOTENCY_CACHE_SECRET = 'test-idempotency-cache-secret-at-least-32-bytes';
 
 async function reservePort() {
   const server = createServer();
@@ -32,6 +33,7 @@ async function startRuntime(nodeEnvironment: string, localDevelopmentAuth: boole
       DATABASE_URL: 'postgresql://unused:unused@127.0.0.1:1/unused',
       INVITATION_TOKEN_SECRET,
       DEVICE_API_KEY_SECRET,
+      IDEMPOTENCY_CACHE_SECRET,
       HOST: '127.0.0.1',
       LOCAL_DEVELOPMENT_AUTH: localDevelopmentAuth ? 'true' : '',
       NODE_ENV: nodeEnvironment,
@@ -128,6 +130,7 @@ test('local development authentication binds to loopback by default', () => {
     DATABASE_URL: 'postgresql://unused:unused@127.0.0.1:1/unused',
     INVITATION_TOKEN_SECRET,
     DEVICE_API_KEY_SECRET,
+    IDEMPOTENCY_CACHE_SECRET,
     LOCAL_DEVELOPMENT_AUTH: 'true'
   });
 
@@ -152,11 +155,30 @@ test('startup rejects a missing or weak device API key secret', () => {
   );
 });
 
+test('startup rejects a missing or weak idempotency cache secret and invalid replay TTL', () => {
+  const base = {
+    DATABASE_URL: 'postgresql://unused',
+    INVITATION_TOKEN_SECRET,
+    DEVICE_API_KEY_SECRET
+  };
+  assert.throws(() => getEnv(base), /IDEMPOTENCY_CACHE_SECRET must be at least 32 bytes/);
+  assert.throws(
+    () => getEnv({ ...base, IDEMPOTENCY_CACHE_SECRET: 'too-short' }),
+    /IDEMPOTENCY_CACHE_SECRET must be at least 32 bytes/
+  );
+  assert.throws(
+    () => getEnv({ ...base, IDEMPOTENCY_CACHE_SECRET, IDEMPOTENCY_REPLAY_TTL_SECONDS: '59' }),
+    /IDEMPOTENCY_REPLAY_TTL_SECONDS/
+  );
+  assert.equal(getEnv({ ...base, IDEMPOTENCY_CACHE_SECRET }).idempotencyTtlMs, 24 * 60 * 60 * 1000);
+});
+
 test('public validation URL is optional but rejects unsafe values', () => {
   const base = getEnv({
     DATABASE_URL: 'postgresql://unused',
     INVITATION_TOKEN_SECRET,
     DEVICE_API_KEY_SECRET,
+    IDEMPOTENCY_CACHE_SECRET,
     PUBLIC_VALIDATION_BASE_URL: 'https://access.example.test/'
   });
   assert.equal(base.publicValidationBaseUrl, 'https://access.example.test');
