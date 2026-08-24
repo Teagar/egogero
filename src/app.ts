@@ -15,7 +15,7 @@ import type { DeviceRateLimiter, DeviceStore } from './dispositivos.js';
 import { createPrismaNotificationStore, registerNotificationRoutes } from './notificacoes.js';
 import type { NotificationStore } from './notificacoes.js';
 import { prisma as defaultPrisma } from './lib/prisma.js';
-import { isValidTimeZone } from './timezones.js';
+import { isDatabaseTimeZoneRejection, isValidTimeZone } from './timezones.js';
 
 type CondominioRecord = {
   id: string;
@@ -489,7 +489,15 @@ export function createApp(
       return reply.status(400).send({ error: 'Invalid condominium payload' });
     }
 
-    const condominio = await db.condominio.create({ data });
+    let condominio: CondominioRecord;
+    try {
+      condominio = await db.condominio.create({ data });
+    } catch (error) {
+      if (isDatabaseTimeZoneRejection(error)) {
+        return reply.status(400).send({ error: 'Invalid condominium timezone' });
+      }
+      throw error;
+    }
     return reply.status(201).send(toCondominioResponse(condominio));
   });
 
@@ -539,7 +547,15 @@ export function createApp(
       return reply.status(400).send({ error: 'Invalid condominium payload' });
     }
 
-    const result = await db.condominio.updateMany({ where: { id, deletedAt: null }, data });
+    let result: { count: number };
+    try {
+      result = await db.condominio.updateMany({ where: { id, deletedAt: null }, data });
+    } catch (error) {
+      if (isDatabaseTimeZoneRejection(error)) {
+        return reply.status(400).send({ error: 'Invalid condominium timezone' });
+      }
+      throw error;
+    }
 
     if (result.count === 0) {
       return reply.status(404).send({ error: 'Condominium not found' });

@@ -54,7 +54,8 @@ function record(input: InvitationAllocation, index = 0): InvitationRecord {
     expiresAt: input.expiresAt,
     usedAt: null,
     revokedAt: null,
-    tokenDigest: null
+    tokenDigest: null,
+    timeZone: 'America/Sao_Paulo'
   };
 }
 

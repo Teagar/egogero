@@ -10,6 +10,7 @@ import type { Authenticator } from './auth.js';
 import { createMemoryDeviceRateLimiter, DEVICE_RATE_LIMIT } from './dispositivos.js';
 import type { DeviceRateLimiter } from './dispositivos.js';
 import { insertEntryNotification } from './notificacoes.js';
+import { isValidTimeZone } from './timezones.js';
 
 export const INVITATION_TYPES = ['visitante', 'prestador', 'entregador'] as const satisfies readonly TipoConvite[];
 export const ACCESS_TYPES = ['pedestre', 'veiculo'] as const;
@@ -70,6 +71,7 @@ export type InvitationRecord = {
   usedAt: Date | null;
   revokedAt: Date | null;
   tokenDigest: string | null;
+  timeZone: string;
 };
 
 export type InvitationCreateData = {
@@ -155,6 +157,16 @@ export class DailyInvitationLimitError extends Error {
   }
 }
 
+export class InvalidCondominiumTimeZoneError extends Error {
+  constructor() {
+    super('Condominium timezone is unavailable');
+  }
+}
+
+type InvitationStoreOptions = {
+  readDatabaseTime?: (transaction: Prisma.TransactionClient) => Promise<Date>;
+};
+
 export function generateSixDigitToken() {
   return randomInt(TOKEN_LIMIT).toString().padStart(6, '0');
 }
@@ -223,13 +235,23 @@ function isTokenCollision(error: unknown) {
     : String(target).toLowerCase().includes('tokendigest');
 }
 
-export function createPrismaInvitationStore(client: PrismaClient, tokenSecret: string): InvitationStore {
+export function createPrismaInvitationStore(
+  client: PrismaClient,
+  tokenSecret: string,
+  options: InvitationStoreOptions = {}
+): InvitationStore {
   if (Buffer.byteLength(tokenSecret) < 32) {
     throw new Error('Invitation token secret must be at least 32 bytes');
   }
 
   const digestToken = (token: string) => createHmac('sha256', tokenSecret).update(token).digest('hex');
   const secretFingerprint = createHash('sha256').update(tokenSecret).digest('hex');
+  const readDatabaseTime = options.readDatabaseTime ?? (async (transaction: Prisma.TransactionClient) => {
+    const [{ now }] = await transaction.$queryRaw<Array<{ now: Date }>>`
+      SELECT clock_timestamp() AS now
+    `;
+    return now;
+  });
 
   async function verifyTokenSecret(transaction: Prisma.TransactionClient) {
     await transaction.$executeRaw`
@@ -292,13 +314,19 @@ export function createPrismaInvitationStore(client: PrismaClient, tokenSecret: s
         AND convidado."anonymizedAt" IS NULL
         AND morador."deletedAt" IS NULL
         AND condominio."deletedAt" IS NULL
-        AND ${earliestExpiration} > clock_timestamp()
       ORDER BY convidado.id
       FOR UPDATE OF convidado, morador, condominio
     `);
 
     if (activeGuests.length !== allocations.length) {
       return null;
+    }
+
+    const timeZone = activeGuests[0]!.timezone;
+    if (!isValidTimeZone(timeZone)) throw new InvalidCondominiumTimeZoneError();
+    const issuanceTime = await readDatabaseTime(transaction);
+    if (earliestExpiration.getTime() <= issuanceTime.getTime()) {
+      throw new RangeError('Invitation expiration must be in the future');
     }
 
     // The resident and condominium locks above serialize all issuance for this resident.
@@ -311,8 +339,8 @@ export function createPrismaInvitationStore(client: PrismaClient, tokenSecret: s
         WHERE "condominioId" = ${first.condominioId}
           AND "moradorId" = ${first.moradorId}
           AND "deletedAt" IS NULL
-          AND "createdAt" >= (((clock_timestamp() AT TIME ZONE ${activeGuests[0]!.timezone})::date)::timestamp AT TIME ZONE ${activeGuests[0]!.timezone})
-          AND "createdAt" < ((((clock_timestamp() AT TIME ZONE ${activeGuests[0]!.timezone})::date + 1)::timestamp) AT TIME ZONE ${activeGuests[0]!.timezone})
+          AND "createdAt" >= (((${issuanceTime} AT TIME ZONE ${timeZone})::date)::timestamp AT TIME ZONE ${timeZone})
+          AND "createdAt" < ((((${issuanceTime} AT TIME ZONE ${timeZone})::date + 1)::timestamp) AT TIME ZONE ${timeZone})
       `;
       if (count + BigInt(allocations.length) > BigInt(limit)) {
         throw new DailyInvitationLimitError();
@@ -321,16 +349,18 @@ export function createPrismaInvitationStore(client: PrismaClient, tokenSecret: s
 
     const convites: InvitationRecord[] = [];
     for (const allocation of withDigests) {
-      convites.push(await transaction.convite.create({
+      const convite = await transaction.convite.create({
         data: {
           condominioId: allocation.condominioId,
           moradorId: allocation.moradorId,
           convidadoId: allocation.convidadoId,
           tipo: allocation.tipo,
+          createdAt: issuanceTime,
           expiresAt: allocation.expiresAt,
           tokenDigest: allocation.tokenDigest
         }
-      }));
+      });
+      convites.push({ ...convite, timeZone });
     }
     return convites;
   }
@@ -919,7 +949,7 @@ export function registerConviteRoutes(
         generatedAt: result.convite.createdAt,
         expiresAt: result.convite.expiresAt ?? body.expiresAt,
         token: result.token,
-        timeZone: condominio.timezone
+        timeZone: result.convite.timeZone
       });
       try {
         if (currentGuest?.email) await notifications.email.send(currentGuest.email, message);
@@ -942,6 +972,9 @@ export function registerConviteRoutes(
       }
       if (error instanceof DailyInvitationLimitError) {
         return reply.status(429).send({ error: 'Daily invitation limit reached' });
+      }
+      if (error instanceof InvalidCondominiumTimeZoneError) {
+        return reply.status(503).send({ error: 'Condominium timezone unavailable' });
       }
       throw error;
     }
@@ -1008,11 +1041,17 @@ export function registerConviteRoutes(
       })));
       return reply.header('cache-control', 'no-store').status(201).send({ convites });
     } catch (error) {
+      if (error instanceof RangeError) {
+        return reply.status(400).send({ error: 'Invitation expiration must be in the future' });
+      }
       if (error instanceof TokenGenerationExhaustedError) {
         return reply.status(503).send({ error: 'Invitation token unavailable' });
       }
       if (error instanceof DailyInvitationLimitError) {
         return reply.status(429).send({ error: 'Daily invitation limit reached' });
+      }
+      if (error instanceof InvalidCondominiumTimeZoneError) {
+        return reply.status(503).send({ error: 'Condominium timezone unavailable' });
       }
       throw error;
     }
