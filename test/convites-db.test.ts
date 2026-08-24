@@ -36,8 +36,8 @@ test('PostgreSQL invitation creation is secure, atomic, scoped, and one-use', { 
 
     await prisma.condominio.createMany({
       data: [
-        { id: condominioId, nome: 'Principal', responsavel: 'Owner', tipo: 'residencial' },
-        { id: otherCondominioId, nome: 'Other', responsavel: 'Other', tipo: 'residencial' }
+        { id: condominioId, nome: 'Principal', responsavel: 'Owner', tipo: 'residencial', timezone: 'America/Sao_Paulo' },
+        { id: otherCondominioId, nome: 'Other', responsavel: 'Other', tipo: 'residencial', timezone: 'America/Manaus' }
       ]
     });
     await prisma.morador.createMany({
@@ -262,8 +262,8 @@ test('PostgreSQL gatehouse validation is tenant-scoped, one-use, and fail-closed
     await prisma.securityKey.deleteMany();
     await prisma.condominio.createMany({
       data: [
-        { id: condominioId, nome: 'Principal', responsavel: 'Owner', tipo: 'residencial' },
-        { id: otherCondominioId, nome: 'Other', responsavel: 'Other', tipo: 'residencial' }
+        { id: condominioId, nome: 'Principal', responsavel: 'Owner', tipo: 'residencial', timezone: 'America/Sao_Paulo' },
+        { id: otherCondominioId, nome: 'Other', responsavel: 'Other', tipo: 'residencial', timezone: 'America/Manaus' }
       ]
     });
     await prisma.morador.createMany({
@@ -560,7 +560,7 @@ test('PostgreSQL gatehouse validation is tenant-scoped, one-use, and fail-closed
   }
 });
 
-test('PostgreSQL daily limits use resident precedence, UTC days, and serialized batch issuance', { skip: !runDatabaseTests }, async () => {
+test('PostgreSQL daily limits use condominium civil days and serialized batch issuance', { skip: !runDatabaseTests }, async () => {
   const prisma = new PrismaClient();
   const store = createPrismaInvitationStore(prisma, secret);
   const condominioId = uuid(10);
@@ -575,7 +575,7 @@ test('PostgreSQL daily limits use resident precedence, UTC days, and serialized 
     await prisma.morador.deleteMany();
     await prisma.condominio.deleteMany();
     await prisma.securityKey.deleteMany();
-    await prisma.condominio.create({ data: { id: condominioId, nome: 'Principal', responsavel: 'Owner', tipo: 'residencial', dailyInvitationLimit: 10 } });
+    await prisma.condominio.create({ data: { id: condominioId, nome: 'Principal', responsavel: 'Owner', tipo: 'residencial', timezone: 'America/Sao_Paulo', dailyInvitationLimit: 10 } });
     await prisma.morador.create({ data: { id: moradorId, nome: 'Resident', condominioId } });
     await prisma.convidado.createMany({ data: guestIds.map((id) => ({ id, nome: id, condominioId, moradorId })) });
 
@@ -595,13 +595,35 @@ test('PostgreSQL daily limits use resident precedence, UTC days, and serialized 
     );
     assert.equal(await prisma.convite.count(), 9, 'a batch over the remaining allowance rolls back entirely');
 
-    await prisma.convite.deleteMany();
-    const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000);
-    await prisma.convite.create({ data: { ...invitation(guestIds[0]!), createdAt: yesterday, tokenDigest: createHmac('sha256', secret).update('999999').digest('hex') } });
-    for (const guestId of guestIds.slice(1, 11)) {
-      assert.ok(await createInvitation(store, invitation(guestId)));
+    for (const [index, timezone] of ['America/Sao_Paulo', 'America/Manaus'].entries()) {
+      await prisma.convite.deleteMany();
+      await prisma.condominio.update({ where: { id: condominioId }, data: { timezone, dailyInvitationLimit: 1 } });
+      const [{ localStart }] = await prisma.$queryRaw<Array<{ localStart: Date }>>`
+        SELECT (((clock_timestamp() AT TIME ZONE ${timezone})::date)::timestamp AT TIME ZONE ${timezone}) AS "localStart"
+      `;
+      await prisma.convite.create({
+        data: {
+          ...invitation(guestIds[0]!), createdAt: new Date(localStart.getTime() - 1),
+          tokenDigest: createHmac('sha256', secret).update(`99999${index}`).digest('hex')
+        }
+      });
+      assert.ok(await createInvitation(store, invitation(guestIds[1]!)));
+      await assert.rejects(createInvitation(store, invitation(guestIds[2]!)), DailyInvitationLimitError);
+      assert.equal(await prisma.convite.count(), 2, `${timezone} resets exactly at its local midnight`);
     }
-    assert.equal(await prisma.convite.count(), 11, 'an invitation before the UTC day boundary does not consume today allowance');
+
+    const [dst] = await prisma.$queryRaw<Array<{ springHours: number; fallHours: number }>>`
+      SELECT
+        (EXTRACT(EPOCH FROM (
+          TIMESTAMP '2026-03-09 00:00:00' AT TIME ZONE 'America/New_York'
+          - TIMESTAMP '2026-03-08 00:00:00' AT TIME ZONE 'America/New_York'
+        )) / 3600)::double precision AS "springHours",
+        (EXTRACT(EPOCH FROM (
+          TIMESTAMP '2026-11-02 00:00:00' AT TIME ZONE 'America/New_York'
+          - TIMESTAMP '2026-11-01 00:00:00' AT TIME ZONE 'America/New_York'
+        )) / 3600)::double precision AS "fallHours"
+    `;
+    assert.deepEqual(dst, { springHours: 23, fallHours: 25 });
 
     await prisma.convite.deleteMany();
     await prisma.morador.update({ where: { id: moradorId }, data: { dailyInvitationLimit: 1 } });

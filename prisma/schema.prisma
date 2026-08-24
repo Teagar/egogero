@@ -9,11 +9,12 @@ datasource db {
 
 model Condominio {
   id          String      @id @default(uuid())
-  createdAt   DateTime    @default(now())
-  deletedAt   DateTime?
+  createdAt   DateTime    @default(now()) @db.Timestamptz(3)
+  deletedAt   DateTime?   @db.Timestamptz(3)
   nome        String
   responsavel String
   tipo        String
+  timezone    String
   dailyInvitationLimit Int?
   moradores   Morador[]
   convidados  Convidado[]
@@ -24,8 +25,8 @@ model Condominio {
 
 model Morador {
   id                  String      @id @default(uuid())
-  createdAt           DateTime    @default(now())
-  deletedAt           DateTime?
+  createdAt           DateTime    @default(now()) @db.Timestamptz(3)
+  deletedAt           DateTime?   @db.Timestamptz(3)
   nome                String
   enderecoRua         String?
   enderecoNumero      String?
@@ -44,16 +45,16 @@ model Morador {
 
 model Convidado {
   id            String    @id @default(uuid())
-  createdAt     DateTime  @default(now())
-  deletedAt     DateTime?
+  createdAt     DateTime  @default(now()) @db.Timestamptz(3)
+  deletedAt     DateTime? @db.Timestamptz(3)
   nome          String
   email         String?
   telefone      String?
   condominioId  String
   moradorId     String?
   // PC-7 records this when it generates a Convite; guest CRUD never simulates invitation use.
-  ultimoUsoEm   DateTime?
-  anonymizedAt  DateTime?
+  ultimoUsoEm   DateTime? @db.Timestamptz(3)
+  anonymizedAt  DateTime? @db.Timestamptz(3)
   condominio    Condominio @relation(fields: [condominioId], references: [id], onDelete: Restrict)
   morador       Morador?  @relation("ConvidadoMorador", fields: [moradorId, condominioId], references: [id, condominioId], onDelete: Restrict)
   convites      Convite[] @relation("ConviteConvidado")
@@ -66,15 +67,15 @@ model Convidado {
 
 model Convite {
   id           String       @id @default(uuid())
-  createdAt    DateTime     @default(now())
-  deletedAt    DateTime?
+  createdAt    DateTime     @default(now()) @db.Timestamptz(3)
+  deletedAt    DateTime?    @db.Timestamptz(3)
   condominioId String
   moradorId    String?
   convidadoId  String?
   tipo         TipoConvite?
-  expiresAt    DateTime?
-  usedAt       DateTime?
-  revokedAt    DateTime?
+  expiresAt    DateTime?    @db.Timestamptz(3)
+  usedAt       DateTime?    @db.Timestamptz(3)
+  revokedAt    DateTime?    @db.Timestamptz(3)
   tokenDigest  String?      @unique @db.Char(64)
   condominio   Condominio   @relation(fields: [condominioId], references: [id], onDelete: Restrict)
   morador      Morador?     @relation("ConviteMorador", fields: [moradorId, condominioId], references: [id, condominioId], onDelete: Restrict)
@@ -91,7 +92,7 @@ model Convite {
 
 model AuditoriaAcesso {
   id             String          @id @default(uuid())
-  createdAt      DateTime        @default(now())
+  createdAt      DateTime        @default(now()) @db.Timestamptz(3)
   condominioId   String
   dispositivoId  String
   conviteId      String?
@@ -106,13 +107,13 @@ model AuditoriaAcesso {
 
 model Dispositivo {
   id            String                   @id @default(uuid())
-  createdAt     DateTime                 @default(now())
-  deletedAt     DateTime?
+  createdAt     DateTime                 @default(now()) @db.Timestamptz(3)
+  deletedAt     DateTime?                @db.Timestamptz(3)
   nome          String
   condominioId  String
   apiKeyDigest  String?                  @unique @db.Char(64)
   status        StatusDispositivo        @default(ativo)
-  ultimoUsoEm   DateTime?
+  ultimoUsoEm   DateTime?                @db.Timestamptz(3)
   condominio    Condominio               @relation(fields: [condominioId], references: [id], onDelete: Restrict)
   rateLimit     DispositivoRateLimit?
 
@@ -122,8 +123,8 @@ model Dispositivo {
 
 model DispositivoRateLimit {
   dispositivoId String      @id
-  attempts      DateTime[]  @default([])
-  blockedUntil  DateTime?
+  attempts      DateTime[]  @default([]) @db.Timestamptz(3)
+  blockedUntil  DateTime?   @db.Timestamptz(3)
   backoffLevel  Int         @default(0)
   dispositivo   Dispositivo @relation(fields: [dispositivoId], references: [id], onDelete: Cascade)
 }
@@ -156,13 +157,13 @@ model SecurityKey {
 
 model Notificacao {
   id            String    @id @default(uuid())
-  createdAt     DateTime  @default(now())
-  deletedAt     DateTime?
-  lidaEm        DateTime?
+  createdAt     DateTime  @default(now()) @db.Timestamptz(3)
+  deletedAt     DateTime? @db.Timestamptz(3)
+  lidaEm        DateTime? @db.Timestamptz(3)
   tipo          String
   mensagem      String
   nomeConvidado String
-  entrouEm      DateTime
+  entrouEm      DateTime  @db.Timestamptz(3)
   condominioId  String
   moradorId     String
   convidadoId   String

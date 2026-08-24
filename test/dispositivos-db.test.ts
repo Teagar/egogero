@@ -26,8 +26,8 @@ test('PostgreSQL device credentials are tenant-scoped, revocable, and never stor
     await prisma.securityKey.deleteMany({ where: { name: 'device-api-key' } });
     await prisma.condominio.createMany({
       data: [
-        { id: condominiumId, nome: 'Principal', responsavel: 'Owner', tipo: 'residencial' },
-        { id: otherCondominiumId, nome: 'Other', responsavel: 'Owner', tipo: 'residencial' }
+        { id: condominiumId, nome: 'Principal', responsavel: 'Owner', tipo: 'residencial', timezone: 'America/Sao_Paulo' },
+        { id: otherCondominiumId, nome: 'Other', responsavel: 'Owner', tipo: 'residencial', timezone: 'America/Manaus' }
       ]
     });
     await prisma.morador.create({ data: { id: residentId, nome: 'Resident', condominioId: condominiumId } });
@@ -121,7 +121,7 @@ test('PostgreSQL rate limiter serializes concurrent replicas at exactly 20 attem
   try {
     await prisma.securityKey.deleteMany({ where: { name: 'device-api-key' } });
     await prisma.condominio.create({
-      data: { id: condominiumId, nome: 'Concurrent', responsavel: 'Owner', tipo: 'residencial' }
+      data: { id: condominiumId, nome: 'Concurrent', responsavel: 'Owner', tipo: 'residencial', timezone: 'America/Sao_Paulo' }
     });
     const created = await store.create({ condominiumId, name: 'Concurrent tablet' });
     assert.ok(created);
