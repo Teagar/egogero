@@ -13,6 +13,7 @@ import { normalizeIpPrefix, trustedProxyFromEnvironment } from '../src/client-ip
 import { createApp } from '../src/app.js';
 import type { AuthRateLimiter } from '../src/auth-rate-limits.js';
 import type { PrismaClient } from '@prisma/client';
+import { createHumanAdministrationService } from '../src/human-administration.js';
 import { createPrismaBrowserSessionStore, generateSessionToken } from '../src/sessions.js';
 
 test('IP minimization handles IPv4, mapped IPv4, and canonical IPv6 prefixes', () => {
@@ -86,7 +87,19 @@ test('recovery initiation is generic, marks recovery intent, and returns Retry-A
         return new URL('https://identity.example.test/authorize');
       },
       async completeCallback() { throw new Error('unused'); }
-    }
+    },
+    humanAdministrationService: createHumanAdministrationService({} as PrismaClient, {
+      publicApplicationOrigin: 'https://app.example.test',
+      recoveryUrl: 'https://identity.example.test/authorize',
+      recoveryWebhookIssuers: new Set(['https://identity.example.test']),
+      recoveryWebhookSecret: Buffer.alloc(32),
+      mfaPolicy: {
+        provedor: { amr: ['webauthn'], acr: [] },
+        sindico: { amr: ['webauthn'], acr: [] },
+        morador: { amr: ['webauthn'], acr: [] },
+        portaria: { amr: ['webauthn'], acr: [] }
+      }
+    })
   });
   for (let index = 0; index < 3; index += 1) {
     const response = await app.inject({ method: 'GET', url: '/auth/recovery' });
