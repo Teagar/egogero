@@ -65,6 +65,7 @@ model Convite {
   tipo         TipoConvite?
   expiresAt    DateTime?
   usedAt       DateTime?
+  revokedAt    DateTime?
   tokenDigest  String?      @unique @db.Char(64)
   condominio   Condominio   @relation(fields: [condominioId], references: [id], onDelete: Restrict)
   morador      Morador?     @relation("ConviteMorador", fields: [moradorId, condominioId], references: [id, condominioId], onDelete: Restrict)

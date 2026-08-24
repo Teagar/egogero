@@ -3,11 +3,13 @@ import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 const migrationPath = new URL('../prisma/migrations/0005_add_invitation_token/migration.sql', import.meta.url);
+const revocationMigrationPath = new URL('../prisma/migrations/0006_add_invitation_revocation/migration.sql', import.meta.url);
 const schemaPath = new URL('../prisma/schema.prisma', import.meta.url);
 
 test('invitation migration preserves legacy rows and enforces token shape and uniqueness in PostgreSQL', async () => {
-  const [migration, schema] = await Promise.all([
+  const [migration, revocationMigration, schema] = await Promise.all([
     readFile(migrationPath, 'utf8'),
+    readFile(revocationMigrationPath, 'utf8'),
     readFile(schemaPath, 'utf8')
   ]);
 
@@ -24,4 +26,9 @@ test('invitation migration preserves legacy rows and enforces token shape and un
   assert.match(schema, /tokenDigest\s+String\?\s+@unique @db\.Char\(64\)/);
   assert.doesNotMatch(schema, /^\s+token\s/m);
   assert.match(schema, /enum TipoConvite \{\s+visitante\s+prestador\s+entregador\s+\}/);
+  assert.match(revocationMigration, /^BEGIN;/);
+  assert.match(revocationMigration, /ADD COLUMN "revokedAt" TIMESTAMP\(3\)/);
+  assert.match(revocationMigration, /"revokedAt" IS NULL OR "usedAt" IS NULL/);
+  assert.match(revocationMigration, /COMMIT;\s*$/);
+  assert.match(schema, /revokedAt\s+DateTime\?/);
 });
