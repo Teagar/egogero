@@ -20,6 +20,10 @@ export type NotificationSender = { email: EmailSender; sms: SmsSender };
 export function createDevelopmentNotificationSender(): NotificationSender {
   return { email: { async send() {} }, sms: { async send() {} } };
 }
+export function createUnavailableNotificationSender(): NotificationSender {
+  const unavailable = async () => { throw new Error('Notification delivery is unavailable'); };
+  return { email: { send: unavailable }, sms: { send: unavailable } };
+}
 export function invitationMessage(input: { guestName: string; type: TipoConvite; expiresAt: Date; token: string }): InvitationMessage {
   const values = { '{CONVIDADO_NOME}': input.guestName, '{TIPO_CONVITE}': input.type, '{EXPIRA_EM}': input.expiresAt.toISOString(), '{TOKEN}': input.token };
   const replace = (text: string) => Object.entries(values).reduce((result, [placeholder, value]) => result.replaceAll(placeholder, value), text);
@@ -438,7 +442,7 @@ export function registerConviteRoutes(
   db: ConvitesStore,
   store: InvitationStore | undefined,
   authenticator: Authenticator,
-  notifications: NotificationSender = createDevelopmentNotificationSender()
+  notifications: NotificationSender = createUnavailableNotificationSender()
 ) {
   const singlePath = '/condominios/:condominioId/moradores/:moradorId/convidados/:convidadoId/convites';
   const batchPath = '/condominios/:condominioId/moradores/:moradorId/convites/multiplos';

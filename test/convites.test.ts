@@ -311,6 +311,49 @@ test('single invitation sends exactly one message per supplied channel and none 
   }
 });
 
+test('createApp honors an explicit notification sender when a database is supplied', async () => {
+  const convite = uniqueMemoryStore();
+  const sent: string[] = [];
+  const notificationSender: NotificationSender = {
+    email: { async send(to) { sent.push(to); } },
+    sms: { async send() { throw new Error('Unexpected SMS'); } }
+  };
+  const app = createApp({
+    db: { ...batchStore({ email: 'ana@example.com' }), convite },
+    authenticator,
+    notificationSender
+  });
+  const response = await app.inject({
+    method: 'POST',
+    url: `/condominios/${CONDOMINIO_ID}/moradores/${MORADOR_ID}/convidados/${CONVIDADO_ID}/convites`,
+    headers: residentHeaders,
+    payload: { tipo: 'visitante', expiresAt: EXPIRES_AT.toISOString() }
+  });
+
+  assert.equal(response.statusCode, 201);
+  assert.deepEqual(sent, ['ana@example.com']);
+  await app.close();
+});
+
+test('production default reports unavailable delivery after issuing without exposing the token', async () => {
+  const convite = uniqueMemoryStore();
+  const app = createApp({
+    db: { ...batchStore({ email: 'ana@example.com' }), convite },
+    authenticator
+  });
+  const response = await app.inject({
+    method: 'POST',
+    url: `/condominios/${CONDOMINIO_ID}/moradores/${MORADOR_ID}/convidados/${CONVIDADO_ID}/convites`,
+    headers: residentHeaders,
+    payload: { tipo: 'visitante', expiresAt: EXPIRES_AT.toISOString() }
+  });
+
+  assert.equal(response.statusCode, 502);
+  assert.equal(response.json().token, undefined);
+  assert.equal(convite.activeTokens.size, 1);
+  await app.close();
+});
+
 test('sender failure is explicit after issuance and does not expose the token', async () => {
   const convite = uniqueMemoryStore();
   const notifications: NotificationSender = {

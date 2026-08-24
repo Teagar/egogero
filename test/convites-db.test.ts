@@ -287,7 +287,17 @@ test('PostgreSQL daily limits use resident precedence, UTC days, and serialized 
     assert.equal(await consumeInvitationToken(store, used.token), true);
     await assert.rejects(createInvitation(store, invitation(guestIds[1]!)), DailyInvitationLimitError);
     await prisma.convite.update({ where: { id: used.convite.id }, data: { deletedAt: new Date() } });
-    assert.ok(await createInvitation(store, invitation(guestIds[1]!)), 'soft-deleted invitations no longer count');
+    const revocable = await createInvitation(store, invitation(guestIds[1]!));
+    assert.ok(revocable, 'soft-deleted invitations no longer count');
+    assert.equal(
+      await store.revokeActive({ id: revocable.convite.id, condominioId, moradorId }, new Date()),
+      'revoked'
+    );
+    await assert.rejects(
+      createInvitation(store, invitation(guestIds[2]!)),
+      DailyInvitationLimitError,
+      'revoked invitations still count toward the daily limit'
+    );
 
     await prisma.convite.deleteMany();
     await prisma.morador.update({ where: { id: moradorId }, data: { dailyInvitationLimit: null } });

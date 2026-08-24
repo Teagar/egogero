@@ -2,6 +2,7 @@ import { pathToFileURL } from 'node:url';
 
 import { createApp } from './app.js';
 import { createDevelopmentHeaderAuthenticator, unauthenticatedAuthenticator } from './auth.js';
+import { createDevelopmentNotificationSender, createUnavailableNotificationSender } from './convites.js';
 import { getEnv } from './env.js';
 
 export async function startServer(environment: NodeJS.ProcessEnv = process.env) {
@@ -9,7 +10,10 @@ export async function startServer(environment: NodeJS.ProcessEnv = process.env) 
   const authenticator = env.localDevelopmentAuth
     ? createDevelopmentHeaderAuthenticator(true)
     : unauthenticatedAuthenticator;
-  const app = createApp({ authenticator, invitationTokenSecret: env.invitationTokenSecret });
+  const notificationSender = environment.NODE_ENV === 'development'
+    ? createDevelopmentNotificationSender()
+    : createUnavailableNotificationSender();
+  const app = createApp({ authenticator, invitationTokenSecret: env.invitationTokenSecret, notificationSender });
 
   await app.listen({ host: env.host, port: env.port });
   return app;

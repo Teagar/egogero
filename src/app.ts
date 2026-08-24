@@ -3,7 +3,7 @@ import Fastify from 'fastify';
 import { authorize, isUuid, unauthenticatedAuthenticator } from './auth.js';
 import type { Authenticator } from './auth.js';
 import { registerConvidadoRoutes } from './convidados.js';
-import { createDevelopmentNotificationSender, createPrismaInvitationStore, registerConviteRoutes } from './convites.js';
+import { createPrismaInvitationStore, createUnavailableNotificationSender, registerConviteRoutes } from './convites.js';
 import type { InvitationStore, NotificationSender } from './convites.js';
 import { prisma as defaultPrisma } from './lib/prisma.js';
 
@@ -383,16 +383,18 @@ export function createApp(
     db: suppliedDb,
     authenticator = unauthenticatedAuthenticator,
     invitationTokenSecret = process.env.INVITATION_TOKEN_SECRET,
-    notificationSender = createDevelopmentNotificationSender()
+    notificationSender
   }: { db?: AppDependencies; authenticator?: Authenticator; invitationTokenSecret?: string; notificationSender?: NotificationSender } = {}
 ) {
   const db: AppDependencies = suppliedDb ?? {
     ...defaultStore,
     convite: invitationTokenSecret
       ? createPrismaInvitationStore(defaultPrisma, invitationTokenSecret)
-      : undefined,
-    notificationSender
+      : undefined
   };
+  const effectiveNotificationSender = notificationSender
+    ?? suppliedDb?.notificationSender
+    ?? createUnavailableNotificationSender();
   const app = Fastify({ logger: false });
   const condominioManagement = { preHandler: authorize(authenticator, 'condominios:manage') };
   const createMoradorManagement = {
@@ -648,7 +650,7 @@ export function createApp(
   });
 
   registerConvidadoRoutes(app, db, authenticator);
-  registerConviteRoutes(app, db, db.convite, authenticator, db.notificationSender);
+  registerConviteRoutes(app, db, db.convite, authenticator, effectiveNotificationSender);
 
   return app;
 }

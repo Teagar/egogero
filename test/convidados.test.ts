@@ -22,7 +22,14 @@ type MoradorRow = BaseRow & {
   enderecoBloco: string | null;
   enderecoApartamento: string | null;
 };
-type ConvidadoRow = BaseRow & { nome: string; condominioId: string; moradorId: string; ultimoUsoEm: Date | null };
+type ConvidadoRow = BaseRow & {
+  nome: string;
+  email: string | null;
+  telefone: string | null;
+  condominioId: string;
+  moradorId: string;
+  ultimoUsoEm: Date | null;
+};
 
 function fakeStore() {
   const condominios = new Map<string, CondominioRow>();
@@ -115,6 +122,43 @@ test('guest CRUD and recent guests are ordered, limited, and scoped to the respo
   assert.equal(deleted.statusCode, 204);
   const afterDelete = await app.inject({ method: 'GET', url: `/condominios/${first.condominioId}/moradores/${first.moradorId}/convidados`, headers: residentHeaders });
   assert.equal(afterDelete.json().length, 2);
+  await app.close();
+});
+
+test('guest contacts are nullable, trimmed, and validated', async () => {
+  const store = fakeStore();
+  const app = createApp({ db: store.db, authenticator });
+  const { condominioId, moradorId } = await setup(app);
+  const path = `/condominios/${condominioId}/moradores/${moradorId}/convidados`;
+
+  const valid = await app.inject({
+    method: 'POST',
+    url: path,
+    headers: providerHeaders,
+    payload: { nome: 'Ana', email: ' ana@example.com ', telefone: ' +55 11 99999-9999 ' }
+  });
+  assert.equal(valid.statusCode, 201);
+  assert.equal(valid.json().email, 'ana@example.com');
+  assert.equal(valid.json().telefone, '+55 11 99999-9999');
+
+  for (const payload of [
+    { nome: 'Ana', email: 'invalid' },
+    { nome: 'Ana', telefone: '123' },
+    { nome: 'Ana', email: 1 },
+    { nome: 'Ana', telefone: {} }
+  ]) {
+    assert.equal((await app.inject({ method: 'POST', url: path, headers: providerHeaders, payload })).statusCode, 400);
+  }
+
+  const nullable = await app.inject({
+    method: 'PATCH',
+    url: `${path}/${valid.json().id}`,
+    headers: providerHeaders,
+    payload: { nome: 'Ana', email: null, telefone: null }
+  });
+  assert.equal(nullable.statusCode, 200);
+  assert.equal(nullable.json().email, null);
+  assert.equal(nullable.json().telefone, null);
   await app.close();
 });
 
