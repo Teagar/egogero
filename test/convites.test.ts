@@ -313,6 +313,41 @@ test('single creation exposes plaintext once with no-store and enforces scope be
   await app.close();
 });
 
+test('link and QR output are opt-in, fragment-only, and fail closed without configuration', async () => {
+  const path = `/condominios/${CONDOMINIO_ID}/moradores/${MORADOR_ID}/convidados/${CONVIDADO_ID}/convites`;
+  const payload = { tipo: 'visitante', expiresAt: EXPIRES_AT.toISOString() };
+  const withoutRepresentations = uniqueMemoryStore();
+  const defaultApp = Fastify({ logger: false });
+  registerConviteRoutes(defaultApp, batchStore(), withoutRepresentations, authenticator);
+  const numeric = await defaultApp.inject({ method: 'POST', url: path, headers: residentHeaders, payload });
+  assert.equal(numeric.statusCode, 201);
+  assert.equal(numeric.json().link, undefined);
+  assert.equal(numeric.json().qrCode, undefined);
+  await defaultApp.close();
+
+  const unavailableApp = Fastify({ logger: false });
+  const unavailableStore = uniqueMemoryStore();
+  registerConviteRoutes(unavailableApp, batchStore(), unavailableStore, authenticator);
+  const unavailable = await unavailableApp.inject({
+    method: 'POST', url: path, headers: residentHeaders, payload: { ...payload, qrCode: true }
+  });
+  assert.equal(unavailable.statusCode, 503);
+  assert.equal(unavailableStore.batchCalls, 0);
+  await unavailableApp.close();
+
+  const app = Fastify({ logger: false });
+  registerConviteRoutes(app, batchStore(), uniqueMemoryStore(), authenticator, undefined, 'https://access.example.test/scan');
+  const represented = await app.inject({
+    method: 'POST', url: path, headers: residentHeaders, payload: { ...payload, link: true, qrCode: true }
+  });
+  assert.equal(represented.statusCode, 201);
+  const body = represented.json() as { token: string; link: string; qrCode: string };
+  assert.equal(body.link, `https://access.example.test/scan/portaria/convites/validar#token=${body.token}`);
+  assert.match(body.qrCode, /^data:image\/png;base64,/);
+  assert.equal(represented.headers['cache-control'], 'no-store');
+  await app.close();
+});
+
 test('gatehouse validation is portaria-only, tenant-scoped, non-oracular, and minimal', async () => {
   const token = '123456';
   const store = uniqueMemoryStore([token]);

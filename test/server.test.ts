@@ -4,7 +4,7 @@ import { once } from 'node:events';
 import { createServer } from 'node:net';
 import test from 'node:test';
 
-import { getEnv } from '../src/env.js';
+import { getEnv, normalizePublicValidationBaseUrl } from '../src/env.js';
 
 const INVITATION_TOKEN_SECRET = 'test-invitation-token-secret-at-least-32-bytes';
 
@@ -136,6 +136,17 @@ test('startup rejects a missing or weak invitation token secret', () => {
     () => getEnv({ DATABASE_URL: 'postgresql://unused', INVITATION_TOKEN_SECRET: 'too-short' }),
     /at least 32 bytes/
   );
+});
+
+test('public validation URL is optional but rejects unsafe values', () => {
+  const base = getEnv({
+    DATABASE_URL: 'postgresql://unused',
+    INVITATION_TOKEN_SECRET,
+    PUBLIC_VALIDATION_BASE_URL: 'https://access.example.test/'
+  });
+  assert.equal(base.publicValidationBaseUrl, 'https://access.example.test');
+  assert.throws(() => normalizePublicValidationBaseUrl('http://access.example.test'), /absolute HTTPS URL/);
+  assert.throws(() => normalizePublicValidationBaseUrl('https://access.example.test/?token=secret'), /without credentials/);
 });
 
 test('bootstrap configuration failures exit cleanly through the startup handler', async () => {

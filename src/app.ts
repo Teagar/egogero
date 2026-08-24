@@ -385,8 +385,15 @@ export function createApp(
     db: suppliedDb,
     authenticator = unauthenticatedAuthenticator,
     invitationTokenSecret = process.env.INVITATION_TOKEN_SECRET,
-    notificationSender
-  }: { db?: AppDependencies; authenticator?: Authenticator; invitationTokenSecret?: string; notificationSender?: NotificationSender } = {}
+    notificationSender,
+    publicValidationBaseUrl
+  }: {
+    db?: AppDependencies;
+    authenticator?: Authenticator;
+    invitationTokenSecret?: string;
+    notificationSender?: NotificationSender;
+    publicValidationBaseUrl?: string;
+  } = {}
 ) {
   const db: AppDependencies = suppliedDb ?? {
     ...defaultStore,
@@ -653,7 +660,7 @@ export function createApp(
   });
 
   registerConvidadoRoutes(app, db, authenticator);
-  registerConviteRoutes(app, db, db.convite, authenticator, effectiveNotificationSender);
+  registerConviteRoutes(app, db, db.convite, authenticator, effectiveNotificationSender, publicValidationBaseUrl);
   registerNotificationRoutes(app, db.notificacao, authenticator);
 
   return app;

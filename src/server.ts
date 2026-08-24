@@ -13,7 +13,12 @@ export async function startServer(environment: NodeJS.ProcessEnv = process.env) 
   const notificationSender = environment.NODE_ENV === 'development'
     ? createDevelopmentNotificationSender()
     : createUnavailableNotificationSender();
-  const app = createApp({ authenticator, invitationTokenSecret: env.invitationTokenSecret, notificationSender });
+  const app = createApp({
+    authenticator,
+    invitationTokenSecret: env.invitationTokenSecret,
+    notificationSender,
+    publicValidationBaseUrl: env.publicValidationBaseUrl
+  });
 
   await app.listen({ host: env.host, port: env.port });
   return app;
