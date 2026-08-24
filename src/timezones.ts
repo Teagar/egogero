@@ -1,5 +1,5 @@
 export function isValidTimeZone(value: string) {
-  if (!/^[A-Za-z_+-]+(?:\/[A-Za-z0-9_+-]+)*$/.test(value)) return false;
+  if (!/^[A-Za-z][A-Za-z0-9._+-]*(?:\/[A-Za-z0-9._+-]+)*$/.test(value)) return false;
   try {
     new Intl.DateTimeFormat('en-US', { timeZone: value }).format();
     return true;
