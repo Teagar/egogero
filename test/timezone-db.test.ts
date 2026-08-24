@@ -6,7 +6,7 @@ import test from 'node:test';
 import { Client } from 'pg';
 
 const runDatabaseTests = process.env.RUN_DATABASE_TESTS === 'true';
-const migrationPath = new URL('../prisma/migrations/0016_add_condominium_timezone_and_timestamptz/migration.sql', import.meta.url);
+const migrationPath = new URL('../prisma/migrations/0014_add_condominium_timezone_and_timestamptz/migration.sql', import.meta.url);
 const timestampColumns = {
   Condominio: ['createdAt', 'deletedAt'],
   Morador: ['createdAt', 'deletedAt'],
