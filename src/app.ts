@@ -104,7 +104,7 @@ function requireProvedor(request: FastifyRequest, reply: FastifyReply) {
 }
 
 function requireMoradorManager(request: FastifyRequest, reply: FastifyReply) {
-  return requireRoles(request, reply, ['provedor', 'contratante']);
+  return requireRoles(request, reply, ['provedor', 'sindico']);
 }
 
 function readRequiredString(body: Partial<Record<string, unknown>>, field: string) {

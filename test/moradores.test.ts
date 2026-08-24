@@ -5,7 +5,7 @@ import { createApp } from '../src/app.js';
 import type { AppStore } from '../src/app.js';
 
 const providerHeaders = { 'x-user-role': 'provedor' };
-const contratanteHeaders = { 'x-user-role': 'contratante' };
+const sindicoHeaders = { 'x-user-role': 'sindico' };
 const moradorHeaders = { 'x-user-role': 'morador' };
 
 type StoredCondominio = Awaited<ReturnType<AppStore['condominio']['create']>>;
@@ -155,14 +155,14 @@ async function createMorador(app: ReturnType<typeof createApp>, condominioId: st
   return response.json() as { id: string; condominioId: string; nome: string };
 }
 
-test('provedor or contratante creates resident only for an active condominium', async () => {
+test('provedor or sindico creates resident only for an active condominium', async () => {
   const app = createApp({ db: createFakeStore() });
   const condominio = await createCondominio(app);
 
   const createResponse = await app.inject({
     method: 'POST',
     url: '/moradores',
-    headers: contratanteHeaders,
+    headers: sindicoHeaders,
     payload: {
       condominioId: condominio.id,
       nome: 'Maria Souza',
