@@ -11,6 +11,7 @@ const OTHER_CONDOMINIO_ID = '00000000-0000-4000-8000-000000000002';
 const MORADOR_ID = '00000000-0000-4000-8000-000000000101';
 const CONVIDADO_ID = '00000000-0000-4000-8000-000000000201';
 const NOTIFICATION_ID = '00000000-0000-4000-8000-000000000401';
+const DEVICE_ID = '00000000-0000-4000-8000-000000000501';
 const createdAt = new Date('2026-01-01T00:00:00.000Z');
 const authenticator = createDevelopmentHeaderAuthenticator(true);
 
@@ -153,6 +154,31 @@ function createAuthorizationStore(): AppDependencies {
       },
       async revokeActive() {
         return 'revoked' as const;
+      }
+    },
+    dispositivo: {
+      async create({ condominiumId, name }) {
+        return {
+          device: {
+            id: DEVICE_ID,
+            createdAt,
+            deletedAt: null,
+            nome: name,
+            condominioId: condominiumId,
+            status: 'ativo' as const,
+            ultimoUsoEm: null
+          },
+          apiKey: `egdev_${'a'.repeat(43)}`
+        };
+      },
+      async list() {
+        return [];
+      },
+      async revoke() {
+        return 'revoked' as const;
+      },
+      async authenticate() {
+        return null;
       }
     },
     notificacao: {
@@ -359,6 +385,24 @@ const endpoints: Endpoint[] = [
     successStatus: 200
   },
   {
+    name: 'provision gatehouse device',
+    request: { method: 'POST', url: `/condominios/${CONDOMINIO_ID}/dispositivos`, payload: { nome: 'Tablet portaria' } },
+    roles: ['provedor', 'sindico'],
+    successStatus: 201
+  },
+  {
+    name: 'list gatehouse devices',
+    request: { method: 'GET', url: `/condominios/${CONDOMINIO_ID}/dispositivos` },
+    roles: ['provedor', 'sindico'],
+    successStatus: 200
+  },
+  {
+    name: 'revoke gatehouse device',
+    request: { method: 'DELETE', url: `/condominios/${CONDOMINIO_ID}/dispositivos/${DEVICE_ID}` },
+    roles: ['provedor', 'sindico'],
+    successStatus: 204
+  },
+  {
     name: 'validate invitation at gatehouse',
     request: { method: 'POST', url: '/portaria/convites/validar', payload: { token: '123456', tipoAcesso: 'pedestre' } },
     roles: ['portaria'],
@@ -431,13 +475,14 @@ test('tenant matrix prevents a sindico from reaching another condominium before 
         .replaceAll(MORADOR_ID, otherMorador.id)
         .replaceAll(CONVIDADO_ID, otherConvidado.id),
       payload: endpoint.request.payload
-        ? {
-            ...endpoint.request.payload,
-            condominioId: OTHER_CONDOMINIO_ID,
-            convidadoIds: Array.isArray(endpoint.request.payload.convidadoIds)
-              ? endpoint.request.payload.convidadoIds.map((id) => id === CONVIDADO_ID ? otherConvidado.id : id)
-              : undefined
-          }
+        ? Object.fromEntries(Object.entries(endpoint.request.payload).map(([key, value]) => [
+            key,
+            key === 'condominioId' && value === CONDOMINIO_ID
+              ? OTHER_CONDOMINIO_ID
+              : Array.isArray(value)
+                ? value.map((id) => id === CONVIDADO_ID ? otherConvidado.id : id)
+                : value
+          ]))
         : undefined
     }
   }));
@@ -527,6 +572,24 @@ test('tenant matrix prevents a sindico from reaching another condominium before 
             storeCalls += 1;
             return store.convite!.revokeActive(args, now);
           }
+        },
+        dispositivo: {
+          async create(args) {
+            storeCalls += 1;
+            return store.dispositivo!.create(args);
+          },
+          async list(args) {
+            storeCalls += 1;
+            return store.dispositivo!.list(args);
+          },
+          async revoke(args) {
+            storeCalls += 1;
+            return store.dispositivo!.revoke(args);
+          },
+          async authenticate(apiKey, now) {
+            storeCalls += 1;
+            return store.dispositivo!.authenticate(apiKey, now);
+          }
         }
       };
       const app = createApp({ db, authenticator });
@@ -586,24 +649,26 @@ test('route inventory keeps every business route in the RBAC matrix', async () =
       '├── /condominios (POST, GET, HEAD)',
       '│   └── /:id|:condominioId (GET, HEAD, PATCH, DELETE)',
       '│       ├── /limite-diario-convites (PATCH)',
-      '│       └── /moradores (GET, HEAD)',
-      '│           └── /:id|:moradorId (GET, HEAD, PATCH, DELETE)',
-      '│               ├── /limite-diario-convites (PATCH)',
-      '│               ├── /convidados (POST, GET, HEAD)',
-      '│               │   ├── /recentes (GET, HEAD)',
-      '│               │   └── /:id|:convidadoId (GET, HEAD, PATCH, DELETE)',
-      '│               │       └── /convites (POST)',
-      '│               ├── /convites/multiplos (POST)',
-      '│               ├── /convites/:conviteId (DELETE)',
-      '│               ├── /auditorias-acesso (GET, HEAD)',
-      '│               └── /notificacoes (GET, HEAD)',
-      '│                   └── /:notificationId (PATCH)',
+      '│       ├── /moradores (GET, HEAD)',
+      '│       │   └── /:id|:moradorId (GET, HEAD, PATCH, DELETE)',
+      '│       │       ├── /limite-diario-convites (PATCH)',
+      '│       │       ├── /convidados (POST, GET, HEAD)',
+      '│       │       │   ├── /recentes (GET, HEAD)',
+      '│       │       │   └── /:id|:convidadoId (GET, HEAD, PATCH, DELETE)',
+      '│       │       │       └── /convites (POST)',
+      '│       │       ├── /convites/multiplos (POST)',
+      '│       │       ├── /convites/:conviteId (DELETE)',
+      '│       │       ├── /auditorias-acesso (GET, HEAD)',
+      '│       │       └── /notificacoes (GET, HEAD)',
+      '│       │           └── /:notificationId (PATCH)',
+      '│       └── /dispositivos (POST, GET, HEAD)',
+      '│           └── /:deviceId (DELETE)',
       '├── /moradores (POST)',
       '└── /portaria/convites/validar (POST)',
       ''
     ].join('\n')
   );
-  assert.equal(endpoints.length, 25);
+  assert.equal(endpoints.length, 28);
 
   await app.close();
 });

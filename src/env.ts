@@ -33,6 +33,11 @@ export function getEnv(environment: NodeJS.ProcessEnv = process.env) {
     throw new Error('INVITATION_TOKEN_SECRET must be at least 32 bytes');
   }
 
+  const deviceApiKeySecret = environment.DEVICE_API_KEY_SECRET;
+  if (!deviceApiKeySecret || Buffer.byteLength(deviceApiKeySecret) < 32) {
+    throw new Error('DEVICE_API_KEY_SECRET must be at least 32 bytes');
+  }
+
   const publicValidationBaseUrl = environment.PUBLIC_VALIDATION_BASE_URL
     ? normalizePublicValidationBaseUrl(environment.PUBLIC_VALIDATION_BASE_URL)
     : undefined;
@@ -41,8 +46,11 @@ export function getEnv(environment: NodeJS.ProcessEnv = process.env) {
     port,
     databaseUrl,
     invitationTokenSecret,
+    deviceApiKeySecret,
     publicValidationBaseUrl,
     host: environment.HOST ?? (environment.LOCAL_DEVELOPMENT_AUTH === 'true' ? '127.0.0.1' : '0.0.0.0'),
-    localDevelopmentAuth: environment.LOCAL_DEVELOPMENT_AUTH === 'true'
+    localDevelopmentAuth: environment.LOCAL_DEVELOPMENT_AUTH === 'true',
+    secureValidationTransport: environment.NODE_ENV === 'production',
+    trustProxy: environment.TRUST_PROXY?.trim() || false
   };
 }

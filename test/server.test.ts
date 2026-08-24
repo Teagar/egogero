@@ -7,6 +7,7 @@ import test from 'node:test';
 import { getEnv, normalizePublicValidationBaseUrl } from '../src/env.js';
 
 const INVITATION_TOKEN_SECRET = 'test-invitation-token-secret-at-least-32-bytes';
+const DEVICE_API_KEY_SECRET = 'test-device-api-key-secret-at-least-32-bytes';
 
 async function reservePort() {
   const server = createServer();
@@ -30,6 +31,7 @@ async function startRuntime(nodeEnvironment: string, localDevelopmentAuth: boole
       ...process.env,
       DATABASE_URL: 'postgresql://unused:unused@127.0.0.1:1/unused',
       INVITATION_TOKEN_SECRET,
+      DEVICE_API_KEY_SECRET,
       HOST: '127.0.0.1',
       LOCAL_DEVELOPMENT_AUTH: localDevelopmentAuth ? 'true' : '',
       NODE_ENV: nodeEnvironment,
@@ -73,7 +75,7 @@ async function stopRuntime(child: ReturnType<typeof spawn>) {
   }
 }
 
-test('production startup is fail-closed when no production authenticator is configured', async () => {
+test('production device authentication fails closed without credentials', async () => {
   const runtime = await startRuntime('production', false);
 
   try {
@@ -125,6 +127,7 @@ test('local development authentication binds to loopback by default', () => {
   const env = getEnv({
     DATABASE_URL: 'postgresql://unused:unused@127.0.0.1:1/unused',
     INVITATION_TOKEN_SECRET,
+    DEVICE_API_KEY_SECRET,
     LOCAL_DEVELOPMENT_AUTH: 'true'
   });
 
@@ -138,15 +141,45 @@ test('startup rejects a missing or weak invitation token secret', () => {
   );
 });
 
+test('startup rejects a missing or weak device API key secret', () => {
+  assert.throws(
+    () => getEnv({
+      DATABASE_URL: 'postgresql://unused',
+      INVITATION_TOKEN_SECRET,
+      DEVICE_API_KEY_SECRET: 'too-short'
+    }),
+    /DEVICE_API_KEY_SECRET must be at least 32 bytes/
+  );
+});
+
 test('public validation URL is optional but rejects unsafe values', () => {
   const base = getEnv({
     DATABASE_URL: 'postgresql://unused',
     INVITATION_TOKEN_SECRET,
+    DEVICE_API_KEY_SECRET,
     PUBLIC_VALIDATION_BASE_URL: 'https://access.example.test/'
   });
   assert.equal(base.publicValidationBaseUrl, 'https://access.example.test');
   assert.throws(() => normalizePublicValidationBaseUrl('http://access.example.test'), /absolute HTTPS URL/);
   assert.throws(() => normalizePublicValidationBaseUrl('https://access.example.test/?token=secret'), /without credentials/);
+});
+
+test('production gatehouse validation rejects HTTP and untrusted forwarded protocol', async () => {
+  const runtime = await startRuntime('production', false);
+
+  try {
+    for (const headers of [{}, { 'x-forwarded-proto': 'https' }]) {
+      const response = await fetch(`${runtime.url}/portaria/convites/validar`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', ...headers },
+        body: JSON.stringify({ token: '123456', tipoAcesso: 'pedestre' })
+      });
+      assert.equal(response.status, 426);
+      assert.deepEqual(await response.json(), { error: 'HTTPS required' });
+    }
+  } finally {
+    await stopRuntime(runtime.child);
+  }
 });
 
 test('bootstrap configuration failures exit cleanly through the startup handler', async () => {

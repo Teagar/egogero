@@ -19,6 +19,7 @@ model Condominio {
   convidados  Convidado[]
   convites    Convite[]
   notificacoes Notificacao[]
+  dispositivos Dispositivo[]
 }
 
 model Morador {
@@ -103,6 +104,30 @@ model AuditoriaAcesso {
   @@index([condominioId, createdAt])
 }
 
+model Dispositivo {
+  id            String                   @id @default(uuid())
+  createdAt     DateTime                 @default(now())
+  deletedAt     DateTime?
+  nome          String
+  condominioId  String
+  apiKeyDigest  String?                  @unique @db.Char(64)
+  status        StatusDispositivo        @default(ativo)
+  ultimoUsoEm   DateTime?
+  condominio    Condominio               @relation(fields: [condominioId], references: [id], onDelete: Restrict)
+  rateLimit     DispositivoRateLimit?
+
+  @@index([condominioId, status, deletedAt])
+  @@unique([id, condominioId])
+}
+
+model DispositivoRateLimit {
+  dispositivoId String      @id
+  attempts      DateTime[]  @default([])
+  blockedUntil  DateTime?
+  backoffLevel  Int         @default(0)
+  dispositivo   Dispositivo @relation(fields: [dispositivoId], references: [id], onDelete: Cascade)
+}
+
 enum TipoConvite {
   visitante
   prestador
@@ -117,6 +142,11 @@ enum TipoAcesso {
 enum ResultadoAcesso {
   permitido
   negado
+}
+
+enum StatusDispositivo {
+  ativo
+  revogado
 }
 
 model SecurityKey {

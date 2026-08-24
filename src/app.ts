@@ -5,6 +5,13 @@ import type { Authenticator } from './auth.js';
 import { registerConvidadoRoutes } from './convidados.js';
 import { createPrismaInvitationStore, createUnavailableNotificationSender, registerConviteRoutes } from './convites.js';
 import type { InvitationStore, NotificationSender } from './convites.js';
+import {
+  createMemoryDeviceRateLimiter,
+  createPrismaDeviceStore,
+  DeviceSecretMismatchError,
+  registerDeviceRoutes
+} from './dispositivos.js';
+import type { DeviceRateLimiter, DeviceStore } from './dispositivos.js';
 import { createPrismaNotificationStore, registerNotificationRoutes } from './notificacoes.js';
 import type { NotificationStore } from './notificacoes.js';
 import { prisma as defaultPrisma } from './lib/prisma.js';
@@ -123,7 +130,12 @@ export type AppStore = {
   };
 };
 
-export type AppDependencies = AppStore & { convite?: InvitationStore; notificacao?: NotificationStore; notificationSender?: NotificationSender };
+export type AppDependencies = AppStore & {
+  convite?: InvitationStore;
+  dispositivo?: DeviceStore;
+  notificacao?: NotificationStore;
+  notificationSender?: NotificationSender;
+};
 
 export type CondominioStore = AppStore;
 
@@ -387,14 +399,24 @@ export function createApp(
     db: suppliedDb,
     authenticator = unauthenticatedAuthenticator,
     invitationTokenSecret = process.env.INVITATION_TOKEN_SECRET,
+    deviceApiKeySecret = process.env.DEVICE_API_KEY_SECRET,
+    deviceRateLimiter = createMemoryDeviceRateLimiter(),
+    developmentRateLimiter = createMemoryDeviceRateLimiter(),
     notificationSender,
-    publicValidationBaseUrl
+    publicValidationBaseUrl,
+    secureValidationTransport = false,
+    trustProxy = false
   }: {
     db?: AppDependencies;
     authenticator?: Authenticator;
     invitationTokenSecret?: string;
+    deviceApiKeySecret?: string;
+    deviceRateLimiter?: DeviceRateLimiter;
+    developmentRateLimiter?: DeviceRateLimiter;
     notificationSender?: NotificationSender;
     publicValidationBaseUrl?: string;
+    secureValidationTransport?: boolean;
+    trustProxy?: boolean | string;
   } = {}
 ) {
   const db: AppDependencies = suppliedDb ?? {
@@ -402,12 +424,21 @@ export function createApp(
     convite: invitationTokenSecret
       ? createPrismaInvitationStore(defaultPrisma, invitationTokenSecret)
       : undefined,
+    dispositivo: deviceApiKeySecret
+      ? createPrismaDeviceStore(defaultPrisma, deviceApiKeySecret)
+      : undefined,
     notificacao: createPrismaNotificationStore(defaultPrisma)
   };
   const effectiveNotificationSender = notificationSender
     ?? suppliedDb?.notificationSender
     ?? createUnavailableNotificationSender();
-  const app = Fastify({ logger: false });
+  const app = Fastify({ logger: false, trustProxy });
+  app.setErrorHandler((error, _request, reply) => {
+    if (error instanceof DeviceSecretMismatchError) {
+      return reply.status(503).send({ error: 'Device service unavailable' });
+    }
+    return reply.send(error);
+  });
   const condominioManagement = { preHandler: authorize(authenticator, 'condominios:manage') };
   const createMoradorManagement = {
     preHandler: authorize(authenticator, 'moradores:manage', (request) => {
@@ -662,7 +693,18 @@ export function createApp(
   });
 
   registerConvidadoRoutes(app, db, authenticator);
-  registerConviteRoutes(app, db, db.convite, authenticator, effectiveNotificationSender, publicValidationBaseUrl);
+  registerDeviceRoutes(app, db.dispositivo, authenticator);
+  registerConviteRoutes(
+    app,
+    db,
+    db.convite,
+    authenticator,
+    effectiveNotificationSender,
+    publicValidationBaseUrl,
+    deviceRateLimiter,
+    developmentRateLimiter,
+    secureValidationTransport
+  );
   registerNotificationRoutes(app, db.notificacao, authenticator);
 
   return app;

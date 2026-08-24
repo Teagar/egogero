@@ -7,6 +7,8 @@ import QRCode from 'qrcode';
 import type { AppStore } from './app.js';
 import { authorize, isUuid } from './auth.js';
 import type { Authenticator } from './auth.js';
+import { createMemoryDeviceRateLimiter, DEVICE_RATE_LIMIT } from './dispositivos.js';
+import type { DeviceRateLimiter } from './dispositivos.js';
 import { insertEntryNotification } from './notificacoes.js';
 
 export const INVITATION_TYPES = ['visitante', 'prestador', 'entregador'] as const satisfies readonly TipoConvite[];
@@ -117,6 +119,7 @@ export interface InvitationStore {
     condominiumId: string;
     deviceId: string;
     accessType: AccessType;
+    requireActiveDevice?: boolean;
   }, now: Date): Promise<InvitationValidationResult>;
   listOwnedAudits(args: {
     condominiumId: string;
@@ -344,6 +347,7 @@ export function createPrismaInvitationStore(client: PrismaClient, tokenSecret: s
     condominiumId: string;
     deviceId: string;
     accessType: AccessType;
+    requireActiveDevice?: boolean;
   }): Promise<InvitationValidationResult> {
     return client.$transaction(async (transaction) => {
       const insertAudit = async (
@@ -363,6 +367,24 @@ export function createPrismaInvitationStore(client: PrismaClient, tokenSecret: s
           )
         `;
       };
+
+      if (args.requireActiveDevice) {
+        const activeDevices = await transaction.$queryRaw<Array<{ id: string }>>`
+          SELECT dispositivo.id
+          FROM "Dispositivo" AS dispositivo
+          JOIN "Condominio" AS condominio ON condominio.id = dispositivo."condominioId"
+          WHERE dispositivo.id = ${args.deviceId}
+            AND dispositivo."condominioId" = ${args.condominiumId}
+            AND dispositivo.status = 'ativo'
+            AND dispositivo."apiKeyDigest" IS NOT NULL
+            AND dispositivo."deletedAt" IS NULL
+            AND condominio."deletedAt" IS NULL
+          FOR SHARE OF dispositivo
+        `;
+        if (activeDevices.length === 0) {
+          return { allowed: false, reason: 'invalid_or_unavailable' };
+        }
+      }
 
       if (!args.token) {
         await insertAudit('negado');
@@ -718,7 +740,10 @@ export function registerConviteRoutes(
   store: InvitationStore | undefined,
   authenticator: Authenticator,
   notifications: NotificationSender = createUnavailableNotificationSender(),
-  publicValidationBaseUrl?: string
+  publicValidationBaseUrl?: string,
+  deviceRateLimiter: DeviceRateLimiter = createMemoryDeviceRateLimiter(),
+  developmentRateLimiter: DeviceRateLimiter = createMemoryDeviceRateLimiter(),
+  secureValidationTransport = false
 ) {
   const singlePath = '/condominios/:condominioId/moradores/:moradorId/convidados/:convidadoId/convites';
   const batchPath = '/condominios/:condominioId/moradores/:moradorId/convites/multiplos';
@@ -735,10 +760,13 @@ export function registerConviteRoutes(
   };
 
   app.post(validationPath, {
-    onRequest: async (_request, reply) => {
+    onRequest: async (request, reply) => {
       reply.header('cache-control', 'no-store');
       reply.header('pragma', 'no-cache');
       reply.header('expires', '0');
+      if (secureValidationTransport && request.protocol !== 'https') {
+        return reply.status(426).send({ error: 'HTTPS required' });
+      }
     },
     preHandler: authorize(authenticator, 'convites:validate')
   }, async (request, reply) => {
@@ -753,6 +781,19 @@ export function registerConviteRoutes(
       return reply.status(403).send({ error: 'Forbidden' });
     }
 
+    const now = new Date();
+    const rateLimiter = identity.authMethod === 'device' ? deviceRateLimiter : developmentRateLimiter;
+    const rateLimit = await rateLimiter.consume(identity.id, now);
+    reply.header('x-ratelimit-limit', DEVICE_RATE_LIMIT);
+    if (!rateLimit.allowed) {
+      return reply
+        .header('x-ratelimit-remaining', 0)
+        .header('retry-after', rateLimit.retryAfterSeconds)
+        .status(429)
+        .send({ allowed: false, reason: 'rate_limited' });
+    }
+    reply.header('x-ratelimit-remaining', rateLimit.remaining);
+
     const body = parseValidationBody(request.body);
     if (!body) {
       return reply.status(400).send({ error: 'Invalid access type' });
@@ -766,8 +807,9 @@ export function registerConviteRoutes(
         token: body.token,
         condominiumId,
         deviceId: identity.id,
-        accessType: body.accessType
-      }, new Date());
+        accessType: body.accessType,
+        requireActiveDevice: identity.authMethod === 'device'
+      }, now);
       return result.allowed
         ? { allowed: true, guest: result.guest, invitation: result.invitation }
         : result;

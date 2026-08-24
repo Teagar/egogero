@@ -10,20 +10,21 @@ export type Permission =
   | 'convidados:manage'
   | 'convites:create'
   | 'convites:limits:manage'
+  | 'dispositivos:manage'
   | 'convites:validate'
   | 'auditorias:read-own'
   | 'notificacoes:read';
 
 export const ROLE_PERMISSIONS = {
-  provedor: ['condominios:manage', 'moradores:manage', 'convidados:manage', 'convites:create', 'convites:limits:manage'],
-  sindico: ['moradores:manage', 'convidados:manage', 'convites:create', 'convites:limits:manage'],
+  provedor: ['condominios:manage', 'moradores:manage', 'convidados:manage', 'convites:create', 'convites:limits:manage', 'dispositivos:manage'],
+  sindico: ['moradores:manage', 'convidados:manage', 'convites:create', 'convites:limits:manage', 'dispositivos:manage'],
   morador: ['convidados:manage', 'convites:create', 'auditorias:read-own', 'notificacoes:read'],
   portaria: ['convites:validate']
 } as const satisfies Record<Role, readonly Permission[]>;
 
 export type AuthenticatedIdentity =
-  | { id: string; role: 'provedor'; condominioIds: null }
-  | { id: string; role: Exclude<Role, 'provedor'>; condominioIds: readonly string[] };
+  | { id: string; role: 'provedor'; condominioIds: null; authMethod?: 'development' | 'device' }
+  | { id: string; role: Exclude<Role, 'provedor'>; condominioIds: readonly string[]; authMethod?: 'development' | 'device' };
 
 declare module 'fastify' {
   interface FastifyRequest {
@@ -75,14 +76,26 @@ export function createDevelopmentHeaderAuthenticator(enabled: boolean): Authenti
       }
 
       if (role === 'provedor') {
-        return condominioId === '*' ? { id, role, condominioIds: null } : null;
+        return condominioId === '*' ? { id, role, condominioIds: null, authMethod: 'development' } : null;
       }
 
       if (!isUuid(condominioId)) {
         return null;
       }
 
-      return { id, role, condominioIds: [condominioId] };
+      return { id, role, condominioIds: [condominioId], authMethod: 'development' };
+    }
+  };
+}
+
+export function createCompositeAuthenticator(...authenticators: readonly Authenticator[]): Authenticator {
+  return {
+    async authenticate(request) {
+      for (const authenticator of authenticators) {
+        const identity = await authenticator.authenticate(request);
+        if (identity) return identity;
+      }
+      return null;
     }
   };
 }
