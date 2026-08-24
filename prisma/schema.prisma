@@ -184,6 +184,13 @@ model DeliveryIntent {
   id                String    @id @default(uuid())
   createdAt         DateTime  @default(now()) @db.Timestamptz(3)
   deliveredAt       DateTime? @db.Timestamptz(3)
+  status            DeliveryStatus @default(pending)
+  attempts          Int       @default(0)
+  leaseOwner        String?
+  leaseToken        String?   @db.Uuid
+  leaseExpiresAt    DateTime? @db.Timestamptz(3)
+  nextAttemptAt     DateTime  @default(now()) @db.Timestamptz(3)
+  lastError         String?
   conviteId         String
   condominioId      String
   channel           DeliveryChannel
@@ -201,6 +208,14 @@ model DeliveryIntent {
 enum DeliveryChannel {
   email
   sms
+}
+
+enum DeliveryStatus {
+  pending
+  processing
+  retry
+  delivered
+  dead_letter
 }
 
 model Notificacao {

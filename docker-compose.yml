@@ -46,5 +46,22 @@ services:
         condition: service_healthy
     restart: "no"
 
+  delivery-worker:
+    profiles: ["workers"]
+    build: .
+    command: ["sh", "-c", "npm run db:migrate:deploy && npm run delivery:worker"]
+    environment:
+      NODE_ENV: development
+      DATABASE_URL: postgresql://office:office@db:5432/office?schema=public
+      IDEMPOTENCY_CACHE_SECRET: local-development-idempotency-cache-secret-change-me
+      DELIVERY_BATCH_SIZE: "50"
+      DELIVERY_CONCURRENCY: "5"
+      DELIVERY_LEASE_MS: "60000"
+      DELIVERY_PROVIDER_TIMEOUT_MS: "30000"
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
 volumes:
   postgres_data:

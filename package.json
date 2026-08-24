@@ -12,7 +12,8 @@
     "db:migrate:deploy": "prisma migrate deploy",
     "db:generate": "prisma generate",
     "privacy:anonymize": "node dist/src/jobs/anonymize-old-guests.js",
-    "idempotency:cleanup": "node dist/src/jobs/cleanup-idempotency.js"
+    "idempotency:cleanup": "node dist/src/jobs/cleanup-idempotency.js",
+    "delivery:worker": "node dist/src/jobs/deliver-invitations.js"
   },
   "dependencies": {
     "@prisma/client": "6.12.0",
