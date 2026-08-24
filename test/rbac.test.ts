@@ -150,6 +150,9 @@ function createAuthorizationStore(): AppDependencies {
           }
         };
       },
+      async listOwnedAudits() {
+        return [];
+      },
       async revokeActive() {
         return 'revoked' as const;
       }
@@ -332,8 +335,14 @@ const endpoints: Endpoint[] = [
     successStatus: 200
   },
   {
+    name: 'list owned access audits',
+    request: { method: 'GET', url: `/condominios/${CONDOMINIO_ID}/moradores/${MORADOR_ID}/auditorias-acesso` },
+    roles: ['morador'],
+    successStatus: 200
+  },
+  {
     name: 'validate invitation at gatehouse',
-    request: { method: 'POST', url: '/portaria/convites/validar', payload: { token: '123456' } },
+    request: { method: 'POST', url: '/portaria/convites/validar', payload: { token: '123456', tipoAcesso: 'pedestre' } },
     roles: ['portaria'],
     successStatus: 200
   }
@@ -496,6 +505,10 @@ test('tenant matrix prevents a sindico from reaching another condominium before 
             storeCalls += 1;
             return store.convite!.validateActive(args, now);
           },
+          listOwnedAudits: async (args) => {
+            storeCalls += 1;
+            return store.convite!.listOwnedAudits(args);
+          },
           revokeActive: async (args, now) => {
             storeCalls += 1;
             return store.convite!.revokeActive(args, now);
@@ -531,7 +544,7 @@ test('resident guest ownership is enforced before any store access', async () =>
     condominio: { create: inaccessible, findMany: inaccessible, findFirst: inaccessible, updateMany: inaccessible },
     morador: { create: inaccessible, findMany: inaccessible, findFirst: inaccessible, updateMany: inaccessible },
     convidado: { create: inaccessible, findMany: inaccessible, findFirst: inaccessible, updateMany: inaccessible },
-    convite: { createActive: inaccessible, createBatchActive: inaccessible, consumeActive: inaccessible, validateActive: inaccessible, revokeActive: inaccessible }
+    convite: { createActive: inaccessible, createBatchActive: inaccessible, consumeActive: inaccessible, validateActive: inaccessible, listOwnedAudits: inaccessible, revokeActive: inaccessible }
   };
 
   for (const endpoint of endpoints.slice(10)) {
@@ -567,13 +580,14 @@ test('route inventory keeps every business route in the RBAC matrix', async () =
       '│               │   └── /:id|:convidadoId (GET, HEAD, PATCH, DELETE)',
       '│               │       └── /convites (POST)',
       '│               ├── /convites/multiplos (POST)',
-      '│               └── /convites/:conviteId (DELETE)',
+      '│               ├── /convites/:conviteId (DELETE)',
+      '│               └── /auditorias-acesso (GET, HEAD)',
       '├── /moradores (POST)',
       '└── /portaria/convites/validar (POST)',
       ''
     ].join('\n')
   );
-  assert.equal(endpoints.length, 22);
+  assert.equal(endpoints.length, 23);
 
   await app.close();
 });

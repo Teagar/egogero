@@ -10,12 +10,13 @@ export type Permission =
   | 'convidados:manage'
   | 'convites:create'
   | 'convites:limits:manage'
-  | 'convites:validate';
+  | 'convites:validate'
+  | 'auditorias:read-own';
 
 export const ROLE_PERMISSIONS = {
   provedor: ['condominios:manage', 'moradores:manage', 'convidados:manage', 'convites:create', 'convites:limits:manage'],
   sindico: ['moradores:manage', 'convidados:manage', 'convites:create', 'convites:limits:manage'],
-  morador: ['convidados:manage', 'convites:create'],
+  morador: ['convidados:manage', 'convites:create', 'auditorias:read-own'],
   portaria: ['convites:validate']
 } as const satisfies Record<Role, readonly Permission[]>;
 

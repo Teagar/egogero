@@ -82,10 +82,35 @@ model Convite {
   @@index([condominioId, expiresAt])
 }
 
+model AuditoriaAcesso {
+  id             String          @id @default(uuid())
+  createdAt      DateTime        @default(now())
+  condominioId   String
+  dispositivoId  String
+  conviteId      String?
+  moradorId      String?
+  convidadoId    String?
+  tipoAcesso     TipoAcesso
+  resultado      ResultadoAcesso
+
+  @@index([condominioId, moradorId, createdAt])
+  @@index([condominioId, createdAt])
+}
+
 enum TipoConvite {
   visitante
   prestador
   entregador
+}
+
+enum TipoAcesso {
+  pedestre
+  veiculo
+}
+
+enum ResultadoAcesso {
+  permitido
+  negado
 }
 
 model SecurityKey {

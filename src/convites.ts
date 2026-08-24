@@ -1,4 +1,4 @@
-import { createHash, createHmac, randomInt } from 'node:crypto';
+import { createHash, createHmac, randomInt, randomUUID } from 'node:crypto';
 
 import { Prisma, type PrismaClient, type TipoConvite } from '@prisma/client';
 import type { FastifyInstance } from 'fastify';
@@ -8,6 +8,8 @@ import { authorize, isUuid } from './auth.js';
 import type { Authenticator } from './auth.js';
 
 export const INVITATION_TYPES = ['visitante', 'prestador', 'entregador'] as const satisfies readonly TipoConvite[];
+export const ACCESS_TYPES = ['pedestre', 'veiculo'] as const;
+export type AccessType = (typeof ACCESS_TYPES)[number];
 const TOKEN_PATTERN = /^[0-9]{6}$/;
 const TOKEN_LIMIT = 1_000_000;
 const MAX_TOKEN_ATTEMPTS = 32;
@@ -92,11 +94,34 @@ export type InvitationValidationResult =
       event: InvitationValidationEvent;
     };
 
+export type AccessAuditRecord = {
+  id: string;
+  createdAt: Date;
+  condominiumId: string;
+  deviceId: string;
+  invitationId: string | null;
+  residentId: string | null;
+  guestId: string | null;
+  accessType: AccessType;
+  result: 'permitido' | 'negado';
+};
+
 export interface InvitationStore {
   createActive(args: InvitationAllocation): Promise<InvitationRecord | null>;
   createBatchActive(args: readonly InvitationAllocation[]): Promise<readonly InvitationRecord[] | null>;
   consumeActive(token: string, now: Date): Promise<boolean>;
-  validateActive(args: { token: string; condominiumId: string }, now: Date): Promise<InvitationValidationResult>;
+  validateActive(args: {
+    token: string | null;
+    condominiumId: string;
+    deviceId: string;
+    accessType: AccessType;
+  }, now: Date): Promise<InvitationValidationResult>;
+  listOwnedAudits(args: {
+    condominiumId: string;
+    residentId: string;
+    cursor: string | null;
+    limit: number;
+  }): Promise<readonly AccessAuditRecord[]>;
   revokeActive(args: { id: string; condominioId: string; moradorId: string }, now: Date): Promise<'revoked' | 'already-revoked' | 'unavailable'>;
 }
 
@@ -319,10 +344,56 @@ export function createPrismaInvitationStore(client: PrismaClient, tokenSecret: s
     }
   }
 
-  async function validateActive(token: string, condominiumId: string): Promise<InvitationValidationResult> {
-    const tokenDigest = digestToken(token);
+  async function validateActive(args: {
+    token: string | null;
+    condominiumId: string;
+    deviceId: string;
+    accessType: AccessType;
+  }): Promise<InvitationValidationResult> {
     return client.$transaction(async (transaction) => {
+      const insertAudit = async (
+        result: 'permitido' | 'negado',
+        identified?: { id: string; condominioId: string; moradorId: string | null; convidadoId: string | null },
+        createdAt?: Date
+      ) => {
+        const auditTime = createdAt ?? new Date();
+        await transaction.$executeRaw`
+          INSERT INTO "AuditoriaAcesso" (
+            id, "createdAt", "condominioId", "dispositivoId", "conviteId",
+            "moradorId", "convidadoId", "tipoAcesso", resultado
+          ) VALUES (
+            ${randomUUID()}, ${auditTime}, ${args.condominiumId}, ${args.deviceId}, ${identified?.id ?? null},
+            ${identified?.moradorId ?? null}, ${identified?.convidadoId ?? null},
+            ${args.accessType}::"TipoAcesso", ${result}::"ResultadoAcesso"
+          )
+        `;
+      };
+
+      if (!args.token) {
+        await insertAudit('negado');
+        return { allowed: false, reason: 'invalid_or_unavailable' };
+      }
+
       await verifyTokenSecret(transaction);
+      const tokenDigest = digestToken(args.token);
+      const candidates = await transaction.$queryRaw<Array<{
+        id: string;
+        condominioId: string;
+        moradorId: string | null;
+        convidadoId: string | null;
+      }>>`
+        SELECT id, "condominioId", "moradorId", "convidadoId"
+        FROM "Convite"
+        WHERE "tokenDigest" = ${tokenDigest}
+          AND "condominioId" = ${args.condominiumId}
+        FOR UPDATE
+      `;
+      const candidate = candidates[0];
+      if (!candidate) {
+        await insertAudit('negado');
+        return { allowed: false, reason: 'invalid_or_unavailable' };
+      }
+
       const activeInvitations = await transaction.$queryRaw<Array<{
         id: string;
         condominioId: string;
@@ -345,8 +416,9 @@ export function createPrismaInvitationStore(client: PrismaClient, tokenSecret: s
           ON morador.id = convite."moradorId"
          AND morador."condominioId" = convite."condominioId"
         JOIN "Condominio" AS condominio ON condominio.id = convite."condominioId"
-        WHERE convite."tokenDigest" = ${tokenDigest}
-          AND convite."condominioId" = ${condominiumId}
+        WHERE convite.id = ${candidate.id}
+          AND convite."tokenDigest" = ${tokenDigest}
+          AND convite."condominioId" = ${args.condominiumId}
           AND convite."deletedAt" IS NULL
           AND convite."usedAt" IS NULL
           AND convite."revokedAt" IS NULL
@@ -354,11 +426,12 @@ export function createPrismaInvitationStore(client: PrismaClient, tokenSecret: s
           AND convidado."deletedAt" IS NULL
           AND morador."deletedAt" IS NULL
           AND condominio."deletedAt" IS NULL
-        FOR UPDATE OF convite, convidado, morador, condominio
+        FOR UPDATE OF convidado, morador, condominio
       `;
 
       const invitation = activeInvitations[0];
       if (!invitation) {
+        await insertAudit('negado', candidate);
         return { allowed: false, reason: 'invalid_or_unavailable' };
       }
 
@@ -367,7 +440,7 @@ export function createPrismaInvitationStore(client: PrismaClient, tokenSecret: s
         SET "tokenDigest" = NULL, "usedAt" = clock_timestamp()
         WHERE id = ${invitation.id}
           AND "tokenDigest" = ${tokenDigest}
-          AND "condominioId" = ${condominiumId}
+          AND "condominioId" = ${args.condominiumId}
           AND "deletedAt" IS NULL
           AND "usedAt" IS NULL
           AND "revokedAt" IS NULL
@@ -376,6 +449,7 @@ export function createPrismaInvitationStore(client: PrismaClient, tokenSecret: s
       `;
       const usedAt = consumed[0]?.usedAt;
       if (!usedAt) {
+        await insertAudit('negado', invitation);
         return { allowed: false, reason: 'invalid_or_unavailable' };
       }
 
@@ -383,12 +457,14 @@ export function createPrismaInvitationStore(client: PrismaClient, tokenSecret: s
         UPDATE "Convidado"
         SET "ultimoUsoEm" = ${usedAt}
         WHERE id = ${invitation.convidadoId}
-          AND "condominioId" = ${condominiumId}
+          AND "condominioId" = ${args.condominiumId}
           AND "deletedAt" IS NULL
       `;
       if (guestUpdated !== 1) {
         throw new Error('Invitation guest became unavailable during validation');
       }
+
+      await insertAudit('permitido', invitation, usedAt);
 
       return {
         allowed: true,
@@ -396,7 +472,7 @@ export function createPrismaInvitationStore(client: PrismaClient, tokenSecret: s
         invitation: { type: invitation.tipo },
         event: {
           invitationId: invitation.id,
-          condominiumId,
+          condominiumId: args.condominiumId,
           residentId: invitation.moradorId,
           guestId: invitation.convidadoId,
           invitationType: invitation.tipo,
@@ -458,8 +534,51 @@ export function createPrismaInvitationStore(client: PrismaClient, tokenSecret: s
       });
     },
 
-    validateActive({ token, condominiumId }) {
-      return validateActive(token, condominiumId);
+    validateActive(args) {
+      return validateActive(args);
+    },
+
+    async listOwnedAudits({ condominiumId, residentId, cursor, limit }) {
+      const rows = await client.$queryRaw<Array<{
+        id: string;
+        createdAt: Date;
+        condominioId: string;
+        dispositivoId: string;
+        conviteId: string | null;
+        moradorId: string | null;
+        convidadoId: string | null;
+        tipoAcesso: AccessType;
+        resultado: 'permitido' | 'negado';
+      }>>`
+        SELECT id, "createdAt", "condominioId", "dispositivoId", "conviteId",
+               "moradorId", "convidadoId", "tipoAcesso", resultado
+        FROM "AuditoriaAcesso"
+        WHERE "condominioId" = ${condominiumId}
+          AND "moradorId" = ${residentId}
+          AND (
+            ${cursor}::text IS NULL
+            OR ("createdAt", id) < (
+              SELECT "createdAt", id
+              FROM "AuditoriaAcesso"
+              WHERE id = ${cursor}
+                AND "condominioId" = ${condominiumId}
+                AND "moradorId" = ${residentId}
+            )
+          )
+        ORDER BY "createdAt" DESC, id DESC
+        LIMIT ${limit}
+      `;
+      return rows.map((row) => ({
+        id: row.id,
+        createdAt: row.createdAt,
+        condominiumId: row.condominioId,
+        deviceId: row.dispositivoId,
+        invitationId: row.conviteId,
+        residentId: row.moradorId,
+        guestId: row.convidadoId,
+        accessType: row.tipoAcesso,
+        result: row.resultado
+      }));
     },
 
     async revokeActive({ id, condominioId, moradorId }, _now) {
@@ -557,16 +676,35 @@ function parseGuestIds(body: unknown) {
   return convidadoIds;
 }
 
-function parseValidationToken(body: unknown) {
+function parseValidationBody(body: unknown) {
   if (!body || typeof body !== 'object' || Array.isArray(body)) {
     return null;
   }
 
   const payload = body as Record<string, unknown>;
+  const accessType = ACCESS_TYPES.find((candidate) => candidate === payload.tipoAcesso);
+  if (!accessType) return null;
+
+  const keys = Object.keys(payload).sort();
+  const validToken = keys.length === 2
+    && keys[0] === 'tipoAcesso'
+    && keys[1] === 'token'
+    && typeof payload.token === 'string'
+    && TOKEN_PATTERN.test(payload.token);
+  return { accessType, token: validToken ? payload.token as string : null };
+}
+
+function parseAuditQuery(query: unknown) {
+  if (!query || typeof query !== 'object' || Array.isArray(query)) return null;
+  const payload = query as Record<string, unknown>;
   const keys = Object.keys(payload);
-  return keys.length === 1 && keys[0] === 'token' && typeof payload.token === 'string' && TOKEN_PATTERN.test(payload.token)
-    ? payload.token
-    : null;
+  if (keys.some((key) => key !== 'cursor' && key !== 'limit')) return null;
+
+  const cursor = payload.cursor === undefined ? null : payload.cursor;
+  if (cursor !== null && !isUuid(cursor)) return null;
+  const limit = payload.limit === undefined ? 50 : Number(payload.limit);
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) return null;
+  return { cursor, limit };
 }
 
 function invitationResponse(convite: InvitationRecord, token: string) {
@@ -592,6 +730,7 @@ export function registerConviteRoutes(
   const singlePath = '/condominios/:condominioId/moradores/:moradorId/convidados/:convidadoId/convites';
   const batchPath = '/condominios/:condominioId/moradores/:moradorId/convites/multiplos';
   const revokePath = '/condominios/:condominioId/moradores/:moradorId/convites/:conviteId';
+  const auditPath = '/condominios/:condominioId/moradores/:moradorId/auditorias-acesso';
   const validationPath = '/portaria/convites/validar';
   const management = {
     preHandler: authorize(
@@ -614,20 +753,25 @@ export function registerConviteRoutes(
     const condominiumId = identity?.role === 'portaria' && identity.condominioIds.length === 1
       ? identity.condominioIds[0]
       : null;
-    if (!condominiumId) {
+    if (!condominiumId || !identity) {
       return reply.status(403).send({ error: 'Forbidden' });
     }
 
-    const token = parseValidationToken(request.body);
-    if (!token) {
-      return { allowed: false, reason: 'invalid_or_unavailable' };
+    const body = parseValidationBody(request.body);
+    if (!body) {
+      return reply.status(400).send({ error: 'Invalid access type' });
     }
     if (!store) {
       return reply.status(503).send({ allowed: false, reason: 'service_unavailable' });
     }
 
     try {
-      const result = await store.validateActive({ token, condominiumId }, new Date());
+      const result = await store.validateActive({
+        token: body.token,
+        condominiumId,
+        deviceId: identity.id,
+        accessType: body.accessType
+      }, new Date());
       return result.allowed
         ? { allowed: true, guest: result.guest, invitation: result.invitation }
         : result;
@@ -637,6 +781,57 @@ export function registerConviteRoutes(
       }
       throw error;
     }
+  });
+
+  app.get(auditPath, {
+    onRequest: async (_request, reply) => {
+      reply.header('cache-control', 'no-store');
+      reply.header('pragma', 'no-cache');
+    },
+    preHandler: authorize(
+      authenticator,
+      'auditorias:read-own',
+      (request) => parseUuidParam(request.params, 'condominioId'),
+      (request) => parseUuidParam(request.params, 'moradorId')
+    )
+  }, async (request, reply) => {
+    const condominioId = parseUuidParam(request.params, 'condominioId');
+    const moradorId = parseUuidParam(request.params, 'moradorId');
+    const query = parseAuditQuery(request.query);
+    if (!condominioId || !moradorId || !query) {
+      return reply.status(400).send({ error: 'Invalid audit scope' });
+    }
+    if (!store) {
+      return reply.status(503).send({ error: 'Audit service unavailable' });
+    }
+
+    const [condominio, morador] = await Promise.all([
+      db.condominio.findFirst({ where: { id: condominioId, deletedAt: null } }),
+      db.morador.findFirst({
+        where: { id: moradorId, condominioId, deletedAt: null, condominio: activeCondominio }
+      })
+    ]);
+    if (!condominio || !morador) {
+      return reply.status(404).send({ error: 'Resident not found' });
+    }
+
+    const audits = await store.listOwnedAudits({
+      condominiumId: condominioId,
+      residentId: moradorId,
+      cursor: query.cursor,
+      limit: query.limit
+    });
+    return audits.map((audit) => ({
+      id: audit.id,
+      ocorreuEm: audit.createdAt.toISOString(),
+      condominioId: audit.condominiumId,
+      dispositivoId: audit.deviceId,
+      conviteId: audit.invitationId,
+      moradorId: audit.residentId,
+      convidadoId: audit.guestId,
+      tipoAcesso: audit.accessType,
+      resultado: audit.result
+    }));
   });
 
   app.post(singlePath, management, async (request, reply) => {
