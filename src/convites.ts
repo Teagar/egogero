@@ -23,6 +23,7 @@ export type InvitationRecord = {
   tipo: TipoConvite | null;
   expiresAt: Date | null;
   usedAt: Date | null;
+  revokedAt: Date | null;
   tokenDigest: string | null;
 };
 
@@ -40,6 +41,7 @@ export interface InvitationStore {
   createActive(args: InvitationAllocation): Promise<InvitationRecord | null>;
   createBatchActive(args: readonly InvitationAllocation[]): Promise<readonly InvitationRecord[] | null>;
   consumeActive(token: string, now: Date): Promise<boolean>;
+  revokeActive(args: { id: string; condominioId: string; moradorId: string }, now: Date): Promise<'revoked' | 'already-revoked' | 'unavailable'>;
 }
 
 export class ActiveTokenCollisionError extends Error {
@@ -113,6 +115,12 @@ export function consumeInvitationToken(store: InvitationStore, token: string, no
   return store.consumeActive(token, now);
 }
 
+export function invitationStatus(invitation: Pick<InvitationRecord, 'usedAt' | 'revokedAt' | 'expiresAt'>, now = new Date()) {
+  if (invitation.usedAt) return 'used';
+  if (invitation.revokedAt) return 'revoked';
+  return !invitation.expiresAt || invitation.expiresAt.getTime() <= now.getTime() ? 'expired' : 'active';
+}
+
 function isTokenCollision(error: unknown) {
   if (!(error instanceof Prisma.PrismaClientKnownRequestError) || error.code !== 'P2002') {
     return false;
@@ -154,7 +162,7 @@ export function createPrismaInvitationStore(client: PrismaClient, tokenSecret: s
     }));
 
     for (const allocation of withDigests) {
-      // Expired, consumed, and deleted rows no longer own a candidate digest.
+      // Terminal, expired, and deleted rows no longer own a candidate digest.
       await transaction.$executeRaw`
         UPDATE "Convite"
         SET "tokenDigest" = NULL
@@ -162,6 +170,7 @@ export function createPrismaInvitationStore(client: PrismaClient, tokenSecret: s
           AND (
             "expiresAt" <= clock_timestamp()
             OR "usedAt" IS NOT NULL
+            OR "revokedAt" IS NOT NULL
             OR "deletedAt" IS NOT NULL
           )
       `;
@@ -244,6 +253,7 @@ export function createPrismaInvitationStore(client: PrismaClient, tokenSecret: s
           WHERE convite."tokenDigest" = ${tokenDigest}
             AND convite."deletedAt" IS NULL
             AND convite."usedAt" IS NULL
+            AND convite."revokedAt" IS NULL
             AND convite."expiresAt" > clock_timestamp()
             AND convidado."deletedAt" IS NULL
             AND morador."deletedAt" IS NULL
@@ -263,9 +273,57 @@ export function createPrismaInvitationStore(client: PrismaClient, tokenSecret: s
             AND "tokenDigest" = ${tokenDigest}
             AND "deletedAt" IS NULL
             AND "usedAt" IS NULL
+            AND "revokedAt" IS NULL
             AND "expiresAt" > clock_timestamp()
         `;
         return consumed === 1;
+      });
+    },
+
+    async revokeActive({ id, condominioId, moradorId }, _now) {
+      return client.$transaction(async (transaction) => {
+        const revoked = await transaction.$executeRaw`
+          UPDATE "Convite" AS convite
+          SET "tokenDigest" = NULL, "revokedAt" = clock_timestamp()
+          FROM "Convidado" AS convidado, "Morador" AS morador, "Condominio" AS condominio
+          WHERE convite.id = ${id}
+            AND convite."condominioId" = ${condominioId}
+            AND convite."moradorId" = ${moradorId}
+            AND convite."convidadoId" = convidado.id
+            AND convidado."condominioId" = convite."condominioId"
+            AND morador.id = convite."moradorId"
+            AND morador."condominioId" = convite."condominioId"
+            AND condominio.id = convite."condominioId"
+            AND convite."deletedAt" IS NULL
+            AND convite."usedAt" IS NULL
+            AND convite."revokedAt" IS NULL
+            AND convite."expiresAt" > clock_timestamp()
+            AND convidado."deletedAt" IS NULL
+            AND morador."deletedAt" IS NULL
+            AND condominio."deletedAt" IS NULL
+        `;
+        if (revoked === 1) return 'revoked';
+
+        const alreadyRevoked = await transaction.$queryRaw<Array<{ id: string }>>`
+          SELECT convite.id
+          FROM "Convite" AS convite
+          JOIN "Convidado" AS convidado
+            ON convidado.id = convite."convidadoId"
+           AND convidado."condominioId" = convite."condominioId"
+          JOIN "Morador" AS morador
+            ON morador.id = convite."moradorId"
+           AND morador."condominioId" = convite."condominioId"
+          JOIN "Condominio" AS condominio ON condominio.id = convite."condominioId"
+          WHERE convite.id = ${id}
+            AND convite."condominioId" = ${condominioId}
+            AND convite."moradorId" = ${moradorId}
+            AND convite."deletedAt" IS NULL
+            AND convite."revokedAt" IS NOT NULL
+            AND convidado."deletedAt" IS NULL
+            AND morador."deletedAt" IS NULL
+            AND condominio."deletedAt" IS NULL
+        `;
+        return alreadyRevoked.length === 1 ? 'already-revoked' : 'unavailable';
       });
     }
   };
@@ -338,6 +396,7 @@ export function registerConviteRoutes(
 ) {
   const singlePath = '/condominios/:condominioId/moradores/:moradorId/convidados/:convidadoId/convites';
   const batchPath = '/condominios/:condominioId/moradores/:moradorId/convites/multiplos';
+  const revokePath = '/condominios/:condominioId/moradores/:moradorId/convites/:conviteId';
   const management = {
     preHandler: authorize(
       authenticator,
@@ -436,5 +495,22 @@ export function registerConviteRoutes(
       }
       throw error;
     }
+  });
+
+  app.delete(revokePath, management, async (request, reply) => {
+    const condominioId = parseUuidParam(request.params, 'condominioId');
+    const moradorId = parseUuidParam(request.params, 'moradorId');
+    const conviteId = parseUuidParam(request.params, 'conviteId');
+    if (!condominioId || !moradorId || !conviteId) {
+      return reply.status(400).send({ error: 'Invalid invitation id' });
+    }
+    if (!store) {
+      return reply.status(503).send({ error: 'Invitation service unavailable' });
+    }
+
+    const result = await store.revokeActive({ id: conviteId, condominioId, moradorId }, new Date());
+    return result === 'unavailable'
+      ? reply.status(404).send({ error: 'Active invitation not found' })
+      : reply.status(204).send();
   });
 }

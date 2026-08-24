@@ -61,6 +61,7 @@ const convite = {
   tipo: 'visitante' as const,
   expiresAt: new Date('2099-01-01T00:00:00.000Z'),
   usedAt: null,
+  revokedAt: null,
   tokenDigest: null
 };
 
@@ -133,6 +134,9 @@ function createAuthorizationStore(): AppDependencies {
       },
       async consumeActive() {
         return true;
+      },
+      async revokeActive() {
+        return 'revoked' as const;
       }
     }
   };
@@ -286,6 +290,15 @@ const endpoints: Endpoint[] = [
     },
     roles: ['provedor', 'sindico', 'morador'],
     successStatus: 201
+  },
+  {
+    name: 'revoke invitation',
+    request: {
+      method: 'DELETE',
+      url: `/condominios/${CONDOMINIO_ID}/moradores/${MORADOR_ID}/convites/${convite.id}`
+    },
+    roles: ['provedor', 'sindico', 'morador'],
+    successStatus: 204
   }
 ];
 
@@ -441,6 +454,10 @@ test('tenant matrix prevents a sindico from reaching another condominium before 
           consumeActive: async (token, now) => {
             storeCalls += 1;
             return store.convite!.consumeActive(token, now);
+          },
+          revokeActive: async (args, now) => {
+            storeCalls += 1;
+            return store.convite!.revokeActive(args, now);
           }
         }
       };
@@ -471,7 +488,7 @@ test('resident guest ownership is enforced before any store access', async () =>
     condominio: { create: inaccessible, findMany: inaccessible, findFirst: inaccessible, updateMany: inaccessible },
     morador: { create: inaccessible, findMany: inaccessible, findFirst: inaccessible, updateMany: inaccessible },
     convidado: { create: inaccessible, findMany: inaccessible, findFirst: inaccessible, updateMany: inaccessible },
-    convite: { createActive: inaccessible, createBatchActive: inaccessible, consumeActive: inaccessible }
+    convite: { createActive: inaccessible, createBatchActive: inaccessible, consumeActive: inaccessible, revokeActive: inaccessible }
   };
 
   for (const endpoint of endpoints.slice(10)) {
@@ -504,12 +521,13 @@ test('route inventory keeps every business route in the RBAC matrix', async () =
       '│               │   ├── /recentes (GET, HEAD)',
       '│               │   └── /:id|:convidadoId (GET, HEAD, PATCH, DELETE)',
       '│               │       └── /convites (POST)',
-      '│               └── /convites/multiplos (POST)',
+      '│               ├── /convites/multiplos (POST)',
+      '│               └── /convites/:conviteId (DELETE)',
       '└── /moradores (POST)',
       ''
     ].join('\n')
   );
-  assert.equal(endpoints.length, 18);
+  assert.equal(endpoints.length, 19);
 
   await app.close();
 });

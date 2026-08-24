@@ -24,7 +24,7 @@ test('PostgreSQL invitation creation is secure, atomic, scoped, and one-use', { 
   const otherCondominioId = uuid(2);
   const moradorId = uuid(101);
   const otherMoradorId = uuid(102);
-  const guestIds = [uuid(201), uuid(202), uuid(203), uuid(204), uuid(205), uuid(206)];
+  const guestIds = [uuid(201), uuid(202), uuid(203), uuid(204), uuid(205), uuid(206), uuid(207)];
   const expiresAt = new Date(Date.now() + 60 * 60 * 1000);
 
   try {
@@ -151,6 +151,73 @@ test('PostgreSQL invitation creation is secure, atomic, scoped, and one-use', { 
     const consumed = await prisma.convite.findUniqueOrThrow({ where: { id: single.id } });
     assert.equal(consumed.tokenDigest, null);
     assert.ok(consumed.usedAt);
+
+    const revoked = await app.inject({
+      method: 'DELETE',
+      url: `/condominios/${condominioId}/moradores/${moradorId}/convites/${batch.convites[0]!.id}`,
+      headers
+    });
+    assert.equal(revoked.statusCode, 204);
+    assert.equal(
+      (await app.inject({
+        method: 'DELETE',
+        url: `/condominios/${condominioId}/moradores/${moradorId}/convites/${batch.convites[0]!.id}`,
+        headers
+      })).statusCode,
+      204,
+      'repeating a successful revocation is idempotent'
+    );
+    assert.equal(await consumeInvitationToken(store, batch.convites[0]!.token), false, 'revocation denies consumption immediately');
+    const revokedRecord = await prisma.convite.findUniqueOrThrow({ where: { id: batch.convites[0]!.id } });
+    assert.equal(revokedRecord.tokenDigest, null);
+    assert.equal(revokedRecord.usedAt, null);
+    assert.ok(revokedRecord.revokedAt);
+
+    const race = await createInvitation(
+      store,
+      { condominioId, moradorId, convidadoId: guestIds[6]!, tipo: 'visitante', expiresAt }
+    );
+    assert.ok(race);
+    const [raceConsumed, raceRevoked] = await Promise.all([
+      consumeInvitationToken(store, race.token),
+      store.revokeActive({ id: race.convite.id, condominioId, moradorId }, new Date())
+    ]);
+    assert.equal(Number(raceConsumed) + Number(raceRevoked === 'revoked'), 1, 'consume and revoke cannot both win');
+    const racedRecord = await prisma.convite.findUniqueOrThrow({ where: { id: race.convite.id } });
+    assert.equal(Boolean(racedRecord.usedAt) && Boolean(racedRecord.revokedAt), false);
+
+    assert.equal(
+      (await app.inject({
+        method: 'DELETE',
+        url: `/condominios/${otherCondominioId}/moradores/${otherMoradorId}/convites/${batch.convites[1]!.id}`,
+        headers
+      })).statusCode,
+      403,
+      'cross-tenant revocation is denied before reaching the store'
+    );
+
+    await prisma.morador.update({ where: { id: moradorId }, data: { deletedAt: new Date() } });
+    assert.equal(
+      (await app.inject({
+        method: 'DELETE',
+        url: `/condominios/${condominioId}/moradores/${moradorId}/convites/${race.convite.id}`,
+        headers
+      })).statusCode,
+      404,
+      'an inactive resident prevents revocation'
+    );
+    await prisma.morador.update({ where: { id: moradorId }, data: { deletedAt: null } });
+    await prisma.condominio.update({ where: { id: condominioId }, data: { deletedAt: new Date() } });
+    assert.equal(
+      (await app.inject({
+        method: 'DELETE',
+        url: `/condominios/${condominioId}/moradores/${moradorId}/convites/${race.convite.id}`,
+        headers
+      })).statusCode,
+      404,
+      'an inactive condominium prevents revocation'
+    );
+    await prisma.condominio.update({ where: { id: condominioId }, data: { deletedAt: null } });
 
     await prisma.convidado.update({ where: { id: guestIds[1] }, data: { deletedAt: new Date() } });
     assert.equal(await consumeInvitationToken(store, batch.convites[0]!.token), false);

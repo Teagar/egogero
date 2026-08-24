@@ -12,6 +12,7 @@ import {
   createInvitation,
   createInvitations,
   generateSixDigitToken,
+  invitationStatus,
   registerConviteRoutes
 } from '../src/convites.js';
 import type { InvitationAllocation, InvitationRecord, InvitationStore } from '../src/convites.js';
@@ -52,6 +53,7 @@ function record(input: InvitationAllocation, index = 0): InvitationRecord {
     tipo: input.tipo,
     expiresAt: input.expiresAt,
     usedAt: null,
+    revokedAt: null,
     tokenDigest: null
   };
 }
@@ -84,6 +86,9 @@ function uniqueMemoryStore(initialTokens: string[] = []): InvitationStore & {
     },
     async consumeActive(token: string) {
       return activeTokens.delete(token);
+    },
+    async revokeActive() {
+      return 'revoked' as const;
     }
   };
   return store;
@@ -206,6 +211,40 @@ test('atomic consumption rejects replay and malformed tokens without store acces
   assert.equal(await consumeInvitationToken(store, '123456', NOW), true);
   assert.equal(await consumeInvitationToken(store, '123456', NOW), false);
   assert.equal(await consumeInvitationToken(store, 'not-a-token', NOW), false);
+});
+
+test('invitation lifecycle derives active and expired from time while used and revoked are terminal', () => {
+  const base = { usedAt: null, revokedAt: null, expiresAt: EXPIRES_AT };
+  assert.equal(invitationStatus(base, NOW), 'active');
+  assert.equal(invitationStatus({ ...base, expiresAt: NOW }, NOW), 'expired');
+  assert.equal(invitationStatus({ ...base, revokedAt: NOW }, new Date('2026-08-26T05:00:00.000Z')), 'revoked');
+  assert.equal(invitationStatus({ ...base, usedAt: NOW }, new Date('2026-08-26T05:00:00.000Z')), 'used');
+});
+
+test('revocation route is scoped, idempotent for revoked invitations, and fails closed otherwise', async () => {
+  const outcomes: Array<'revoked' | 'already-revoked' | 'unavailable'> = ['revoked', 'already-revoked', 'unavailable'];
+  const calls: Array<{ id: string; condominioId: string; moradorId: string }> = [];
+  const store: InvitationStore = {
+    async createActive() { throw new Error('Unexpected create'); },
+    async createBatchActive() { throw new Error('Unexpected create'); },
+    async consumeActive() { throw new Error('Unexpected consume'); },
+    async revokeActive(args) {
+      calls.push(args);
+      return outcomes.shift() ?? 'unavailable';
+    }
+  };
+  const app = Fastify({ logger: false });
+  registerConviteRoutes(app, batchStore(), store, authenticator);
+  const path = `/condominios/${CONDOMINIO_ID}/moradores/${MORADOR_ID}/convites/${uuid(300)}`;
+
+  assert.equal((await app.inject({ method: 'DELETE', url: path, headers: residentHeaders })).statusCode, 204);
+  assert.equal((await app.inject({ method: 'DELETE', url: path, headers: residentHeaders })).statusCode, 204);
+  assert.equal((await app.inject({ method: 'DELETE', url: path, headers: residentHeaders })).statusCode, 404);
+  assert.deepEqual(calls[0], { id: uuid(300), condominioId: CONDOMINIO_ID, moradorId: MORADOR_ID });
+  assert.equal((await app.inject({ method: 'DELETE', url: path.replace(MORADOR_ID, OTHER_MORADOR_ID), headers: residentHeaders })).statusCode, 403);
+  assert.equal((await app.inject({ method: 'DELETE', url: path.replace(CONDOMINIO_ID, OTHER_CONDOMINIO_ID), headers: residentHeaders })).statusCode, 403);
+  assert.equal((await app.inject({ method: 'DELETE', url: path.replace(uuid(300), 'invalid'), headers: residentHeaders })).statusCode, 400);
+  await app.close();
 });
 
 test('single creation exposes plaintext once with no-store and enforces scope before storage', async () => {
