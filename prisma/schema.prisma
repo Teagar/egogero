@@ -8,120 +8,122 @@ datasource db {
 }
 
 model Condominio {
-  id          String      @id @default(uuid())
-  createdAt   DateTime    @default(now()) @db.Timestamptz(3)
-  deletedAt   DateTime?   @db.Timestamptz(3)
-  nome        String
-  responsavel String
-  tipo        String
-  timezone    String
+  id                   String              @id @default(uuid())
+  createdAt            DateTime            @default(now()) @db.Timestamptz(3)
+  deletedAt            DateTime?           @db.Timestamptz(3)
+  nome                 String
+  responsavel          String
+  tipo                 String
+  timezone             String
   dailyInvitationLimit Int?
-  moradores   Morador[]
-  convidados  Convidado[]
-  convites    Convite[]
-  idempotencias IdempotencyRecord[]
-  notificacoes Notificacao[]
-  dispositivos Dispositivo[]
+  moradores            Morador[]
+  convidados           Convidado[]
+  convites             Convite[]
+  idempotencias        IdempotencyRecord[]
+  notificacoes         Notificacao[]
+  dispositivos         Dispositivo[]
+  humanMemberships     HumanMembership[]
 }
 
 model Morador {
-  id                  String      @id @default(uuid())
-  createdAt           DateTime    @default(now()) @db.Timestamptz(3)
-  deletedAt           DateTime?   @db.Timestamptz(3)
-  nome                String
-  enderecoRua         String?
-  enderecoNumero      String?
-  enderecoBloco       String?
-  enderecoApartamento String?
+  id                   String            @id @default(uuid())
+  createdAt            DateTime          @default(now()) @db.Timestamptz(3)
+  deletedAt            DateTime?         @db.Timestamptz(3)
+  nome                 String
+  enderecoRua          String?
+  enderecoNumero       String?
+  enderecoBloco        String?
+  enderecoApartamento  String?
   dailyInvitationLimit Int?
-  condominioId        String
-  condominio          Condominio  @relation(fields: [condominioId], references: [id], onDelete: Restrict)
-  convites            Convite[] @relation("ConviteMorador")
-  convidados          Convidado[] @relation("ConvidadoMorador")
-  notificacoes        Notificacao[]
+  condominioId         String
+  condominio           Condominio        @relation(fields: [condominioId], references: [id], onDelete: Restrict)
+  convites             Convite[]         @relation("ConviteMorador")
+  convidados           Convidado[]       @relation("ConvidadoMorador")
+  notificacoes         Notificacao[]
+  humanMemberships     HumanMembership[]
 
-  @@index([condominioId])
   @@unique([id, condominioId])
+  @@index([condominioId])
 }
 
 model Convidado {
-  id            String    @id @default(uuid())
-  createdAt     DateTime  @default(now()) @db.Timestamptz(3)
-  deletedAt     DateTime? @db.Timestamptz(3)
-  nome          String
-  email         String?
-  telefone      String?
-  condominioId  String
-  moradorId     String?
+  id           String        @id @default(uuid())
+  createdAt    DateTime      @default(now()) @db.Timestamptz(3)
+  deletedAt    DateTime?     @db.Timestamptz(3)
+  nome         String
+  email        String?
+  telefone     String?
+  condominioId String
+  moradorId    String?
   // PC-7 records this when it generates a Convite; guest CRUD never simulates invitation use.
-  ultimoUsoEm   DateTime? @db.Timestamptz(3)
-  anonymizedAt  DateTime? @db.Timestamptz(3)
-  condominio    Condominio @relation(fields: [condominioId], references: [id], onDelete: Restrict)
-  morador       Morador?  @relation("ConvidadoMorador", fields: [moradorId, condominioId], references: [id, condominioId], onDelete: Restrict)
-  convites      Convite[] @relation("ConviteConvidado")
-  notificacoes  Notificacao[]
+  ultimoUsoEm  DateTime?     @db.Timestamptz(3)
+  anonymizedAt DateTime?     @db.Timestamptz(3)
+  condominio   Condominio    @relation(fields: [condominioId], references: [id], onDelete: Restrict)
+  morador      Morador?      @relation("ConvidadoMorador", fields: [moradorId, condominioId], references: [id, condominioId], onDelete: Restrict)
+  convites     Convite[]     @relation("ConviteConvidado")
+  notificacoes Notificacao[]
 
+  @@unique([id, condominioId])
   @@index([condominioId])
   @@index([moradorId, ultimoUsoEm])
-  @@unique([id, condominioId])
 }
 
 model Convite {
-  id           String       @id @default(uuid())
-  createdAt    DateTime     @default(now()) @db.Timestamptz(3)
-  deletedAt    DateTime?    @db.Timestamptz(3)
+  id           String           @id @default(uuid())
+  createdAt    DateTime         @default(now()) @db.Timestamptz(3)
+  deletedAt    DateTime?        @db.Timestamptz(3)
   condominioId String
   moradorId    String?
   convidadoId  String?
   tipo         TipoConvite?
-  expiresAt    DateTime?    @db.Timestamptz(3)
-  usedAt       DateTime?    @db.Timestamptz(3)
-  revokedAt    DateTime?    @db.Timestamptz(3)
-  tokenDigest  String?      @unique @db.Char(64)
-  condominio   Condominio   @relation(fields: [condominioId], references: [id], onDelete: Restrict)
-  morador      Morador?     @relation("ConviteMorador", fields: [moradorId, condominioId], references: [id, condominioId], onDelete: Restrict)
-  convidado    Convidado?   @relation("ConviteConvidado", fields: [convidadoId, condominioId], references: [id, condominioId], onDelete: Restrict)
+  expiresAt    DateTime?        @db.Timestamptz(3)
+  usedAt       DateTime?        @db.Timestamptz(3)
+  revokedAt    DateTime?        @db.Timestamptz(3)
+  tokenDigest  String?          @unique @db.Char(64)
+  condominio   Condominio       @relation(fields: [condominioId], references: [id], onDelete: Restrict)
+  morador      Morador?         @relation("ConviteMorador", fields: [moradorId, condominioId], references: [id, condominioId], onDelete: Restrict)
+  convidado    Convidado?       @relation("ConviteConvidado", fields: [convidadoId, condominioId], references: [id, condominioId], onDelete: Restrict)
   notificacao  Notificacao?
   entregas     DeliveryIntent[]
 
+  @@unique([id, condominioId])
+  @@unique([id, condominioId, moradorId, convidadoId])
   @@index([condominioId])
   @@index([moradorId])
   @@index([condominioId, moradorId, createdAt])
   @@index([convidadoId])
   @@index([condominioId, expiresAt])
-  @@unique([id, condominioId])
-  @@unique([id, condominioId, moradorId, convidadoId])
 }
 
 model AuditoriaAcesso {
-  id             String          @id @default(uuid())
-  createdAt      DateTime        @default(now()) @db.Timestamptz(3)
-  condominioId   String
-  dispositivoId  String
-  conviteId      String?
-  moradorId      String?
-  convidadoId    String?
-  tipoAcesso     TipoAcesso
-  resultado      ResultadoAcesso
+  id            String          @id @default(uuid())
+  createdAt     DateTime        @default(now()) @db.Timestamptz(3)
+  condominioId  String
+  dispositivoId String
+  conviteId     String?
+  moradorId     String?
+  convidadoId   String?
+  tipoAcesso    TipoAcesso
+  resultado     ResultadoAcesso
 
   @@index([condominioId, moradorId, createdAt])
   @@index([condominioId, createdAt])
 }
 
 model Dispositivo {
-  id            String                   @id @default(uuid())
-  createdAt     DateTime                 @default(now()) @db.Timestamptz(3)
-  deletedAt     DateTime?                @db.Timestamptz(3)
-  nome          String
-  condominioId  String
-  apiKeyDigest  String?                  @unique @db.Char(64)
-  status        StatusDispositivo        @default(ativo)
-  ultimoUsoEm   DateTime?                @db.Timestamptz(3)
-  condominio    Condominio               @relation(fields: [condominioId], references: [id], onDelete: Restrict)
-  rateLimit     DispositivoRateLimit?
+  id           String                @id @default(uuid())
+  createdAt    DateTime              @default(now()) @db.Timestamptz(3)
+  deletedAt    DateTime?             @db.Timestamptz(3)
+  nome         String
+  condominioId String
+  apiKeyDigest String?               @unique @db.Char(64)
+  status       StatusDispositivo     @default(ativo)
+  ultimoUsoEm  DateTime?             @db.Timestamptz(3)
+  condominio   Condominio            @relation(fields: [condominioId], references: [id], onDelete: Restrict)
+  rateLimit    DispositivoRateLimit?
 
-  @@index([condominioId, status, deletedAt])
   @@unique([id, condominioId])
+  @@index([condominioId, status, deletedAt])
 }
 
 model DispositivoRateLimit {
@@ -159,37 +161,37 @@ model SecurityKey {
 }
 
 model IdempotencyRecord {
-  id                 String    @id @default(uuid())
-  createdAt          DateTime  @default(now()) @db.Timestamptz(3)
-  confirmedAt        DateTime? @db.Timestamptz(3)
-  expiresAt          DateTime? @db.Timestamptz(3)
+  id                 String     @id @default(uuid())
+  createdAt          DateTime   @default(now()) @db.Timestamptz(3)
+  confirmedAt        DateTime?  @db.Timestamptz(3)
+  expiresAt          DateTime?  @db.Timestamptz(3)
   actorId            String
   condominioId       String
   method             String
-  route               String
-  keyDigest           String   @db.Char(64)
-  requestHash         String   @db.Char(64)
-  responseStatus      Int?
-  responseCiphertext  Bytes?
-  responseIv          Bytes?
-  responseAuthTag     Bytes?
-  keyVersion          Int
-  condominio          Condominio @relation(fields: [condominioId], references: [id], onDelete: Restrict)
+  route              String
+  keyDigest          String     @db.Char(64)
+  requestHash        String     @db.Char(64)
+  responseStatus     Int?
+  responseCiphertext Bytes?
+  responseIv         Bytes?
+  responseAuthTag    Bytes?
+  keyVersion         Int
+  condominio         Condominio @relation(fields: [condominioId], references: [id], onDelete: Restrict)
 
   @@unique([actorId, condominioId, method, route, keyDigest])
   @@index([expiresAt, id])
 }
 
 model DeliveryIntent {
-  id                String    @id @default(uuid())
-  createdAt         DateTime  @default(now()) @db.Timestamptz(3)
-  deliveredAt       DateTime? @db.Timestamptz(3)
-  status            DeliveryStatus @default(pending)
-  attempts          Int       @default(0)
+  id                String          @id @default(uuid())
+  createdAt         DateTime        @default(now()) @db.Timestamptz(3)
+  deliveredAt       DateTime?       @db.Timestamptz(3)
+  status            DeliveryStatus  @default(pending)
+  attempts          Int             @default(0)
   leaseOwner        String?
-  leaseToken        String?   @db.Uuid
-  leaseExpiresAt    DateTime? @db.Timestamptz(3)
-  nextAttemptAt     DateTime  @default(now()) @db.Timestamptz(3)
+  leaseToken        String?         @db.Uuid
+  leaseExpiresAt    DateTime?       @db.Timestamptz(3)
+  nextAttemptAt     DateTime        @default(now()) @db.Timestamptz(3)
   lastError         String?
   conviteId         String
   condominioId      String
@@ -198,7 +200,7 @@ model DeliveryIntent {
   payloadIv         Bytes
   payloadAuthTag    Bytes
   keyVersion        Int
-  convite           Convite   @relation(fields: [conviteId, condominioId], references: [id, condominioId], onDelete: Restrict)
+  convite           Convite         @relation(fields: [conviteId, condominioId], references: [id, condominioId], onDelete: Restrict)
 
   @@unique([conviteId, channel])
   @@index([deliveredAt, createdAt, id])
@@ -218,24 +220,179 @@ enum DeliveryStatus {
   dead_letter
 }
 
+model HumanAccount {
+  id                 String             @id @default(uuid()) @db.Uuid
+  createdAt          DateTime           @default(now()) @db.Timestamptz(3)
+  updatedAt          DateTime           @updatedAt @db.Timestamptz(3)
+  displayName        String
+  status             HumanAccountStatus @default(invited)
+  sessionVersion     Int                @default(0)
+  disabledAt         DateTime?          @db.Timestamptz(3)
+  externalIdentities ExternalIdentity[]
+  memberships        HumanMembership[]
+  browserSessions    BrowserSession[]
+}
+
+model ExternalIdentity {
+  id            String       @id @default(uuid()) @db.Uuid
+  createdAt     DateTime     @default(now()) @db.Timestamptz(3)
+  lastLoginAt   DateTime?    @db.Timestamptz(3)
+  accountId     String       @db.Uuid
+  issuer        String
+  subject       String
+  email         String?
+  emailVerified Boolean      @default(false)
+  account       HumanAccount @relation(fields: [accountId], references: [id], onDelete: Restrict)
+
+  @@unique([issuer, subject])
+  @@index([accountId])
+}
+
+model HumanMembership {
+  id              String                @id @default(uuid()) @db.Uuid
+  createdAt       DateTime              @default(now()) @db.Timestamptz(3)
+  disabledAt      DateTime?             @db.Timestamptz(3)
+  accountId       String                @db.Uuid
+  condominioId    String?
+  residentId      String?
+  role            HumanRole
+  status          HumanMembershipStatus @default(invited)
+  account         HumanAccount          @relation(fields: [accountId], references: [id], onDelete: Restrict)
+  condominio      Condominio?           @relation(fields: [condominioId], references: [id], onDelete: Restrict)
+  resident        Morador?              @relation(fields: [residentId, condominioId], references: [id, condominioId], onDelete: Restrict)
+  browserSessions BrowserSession[]
+
+  @@unique([id, accountId])
+  @@index([accountId, status])
+  @@index([condominioId, status])
+  @@index([residentId, condominioId])
+}
+
+model OidcLoginTransaction {
+  id                     String    @id @default(uuid()) @db.Uuid
+  createdAt              DateTime  @default(now()) @db.Timestamptz(3)
+  expiresAt              DateTime  @db.Timestamptz(3)
+  consumedAt             DateTime? @db.Timestamptz(3)
+  stateDigest            Bytes     @unique
+  nonceDigest            Bytes
+  pkceVerifierCiphertext Bytes
+  pkceVerifierNonce      Bytes
+  pkceVerifierAuthTag    Bytes
+  pkceKeyVersion         Int
+  issuer                 String
+  clientId               String
+  redirectUri            String
+  returnTo               String
+  recoveryIntent         Boolean   @default(false)
+
+  @@index([expiresAt, consumedAt])
+}
+
+model BrowserSession {
+  id                    String          @id @default(uuid()) @db.Uuid
+  familyId              String          @db.Uuid
+  createdAt             DateTime        @default(now()) @db.Timestamptz(3)
+  lastSeenAt            DateTime        @default(now()) @db.Timestamptz(3)
+  idleExpiresAt         DateTime        @db.Timestamptz(3)
+  absoluteExpiresAt     DateTime        @db.Timestamptz(3)
+  authenticatedAt       DateTime        @db.Timestamptz(3)
+  revokedAt             DateTime?       @db.Timestamptz(3)
+  revokeReason          String?
+  tokenDigest           Bytes           @unique
+  csrfDigest            Bytes
+  csrfCiphertext        Bytes
+  csrfNonce             Bytes
+  csrfAuthTag           Bytes
+  csrfKeyVersion        Int
+  accountId             String          @db.Uuid
+  accountSessionVersion Int
+  activeMembershipId    String          @db.Uuid
+  ipPrefix              String?
+  userAgentHash         Bytes?
+  account               HumanAccount    @relation(fields: [accountId], references: [id], onDelete: Restrict)
+  activeMembership      HumanMembership @relation(fields: [activeMembershipId, accountId], references: [id, accountId], onDelete: Restrict)
+
+  @@index([accountId, revokedAt])
+  @@index([idleExpiresAt, absoluteExpiresAt])
+  @@index([activeMembershipId])
+  @@index([familyId])
+}
+
+model AuthenticationAuditEvent {
+  id                   String                  @id @default(uuid()) @db.Uuid
+  createdAt            DateTime                @default(now()) @db.Timestamptz(3)
+  eventType            String
+  outcome              AuthenticationOutcome
+  accountId            String?                 @db.Uuid
+  externalIdentityId   String?                 @db.Uuid
+  sessionId            String?                 @db.Uuid
+  membershipId         String?                 @db.Uuid
+  condominioId         String?
+  actorType            AuthenticationActorType
+  actorId              String?
+  requestCorrelationId String
+  ipPrefix             String?
+  userAgentHash        Bytes?
+  reasonCode           String?
+  metadata             Json                    @default("{}")
+
+  @@index([accountId, createdAt])
+  @@index([condominioId, createdAt])
+  @@index([eventType, createdAt])
+  @@index([createdAt])
+}
+
+enum HumanAccountStatus {
+  invited
+  active
+  suspended
+  disabled
+}
+
+enum HumanMembershipStatus {
+  invited
+  active
+  disabled
+}
+
+enum HumanRole {
+  provedor
+  sindico
+  morador
+  portaria
+}
+
+enum AuthenticationOutcome {
+  success
+  failure
+  denied
+}
+
+enum AuthenticationActorType {
+  human
+  device
+  system
+  anonymous
+}
+
 model Notificacao {
-  id            String    @id @default(uuid())
-  createdAt     DateTime  @default(now()) @db.Timestamptz(3)
-  deletedAt     DateTime? @db.Timestamptz(3)
-  lidaEm        DateTime? @db.Timestamptz(3)
+  id            String     @id @default(uuid())
+  createdAt     DateTime   @default(now()) @db.Timestamptz(3)
+  deletedAt     DateTime?  @db.Timestamptz(3)
+  lidaEm        DateTime?  @db.Timestamptz(3)
   tipo          String
   mensagem      String
   nomeConvidado String
-  entrouEm      DateTime  @db.Timestamptz(3)
+  entrouEm      DateTime   @db.Timestamptz(3)
   condominioId  String
   moradorId     String
   convidadoId   String
-  conviteId     String    @unique
+  conviteId     String     @unique
   condominio    Condominio @relation(fields: [condominioId], references: [id], onDelete: Restrict)
-  morador       Morador   @relation(fields: [moradorId, condominioId], references: [id, condominioId], onDelete: Restrict)
-  convidado     Convidado @relation(fields: [convidadoId, condominioId], references: [id, condominioId], onDelete: Restrict)
-  convite       Convite   @relation(fields: [conviteId, condominioId, moradorId, convidadoId], references: [id, condominioId, moradorId, convidadoId], onDelete: Cascade)
+  morador       Morador    @relation(fields: [moradorId, condominioId], references: [id, condominioId], onDelete: Restrict)
+  convidado     Convidado  @relation(fields: [convidadoId, condominioId], references: [id, condominioId], onDelete: Restrict)
+  convite       Convite    @relation(fields: [conviteId, condominioId, moradorId, convidadoId], references: [id, condominioId, moradorId, convidadoId], onDelete: Cascade)
 
-  @@index([condominioId, moradorId, deletedAt, createdAt])
   @@unique([conviteId, condominioId, moradorId, convidadoId])
+  @@index([condominioId, moradorId, deletedAt, createdAt])
 }

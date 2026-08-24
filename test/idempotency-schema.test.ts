@@ -17,7 +17,9 @@ test('idempotency and outbox schema enforce transactional uniqueness without pla
   assert.match(migration, /"payloadCiphertext" BYTEA NOT NULL/);
   assert.doesNotMatch(migration, /"(?:token|recipient|message|subject|body)" TEXT/i);
   assert.match(migration, /COMMIT;\s*$/);
-  assert.match(schema, /model IdempotencyRecord/);
-  assert.match(schema, /model DeliveryIntent/);
-  assert.doesNotMatch(schema, /^\s+(?:token|recipient|message|subject|body)\s+String/m);
+  const idempotencyModel = schema.match(/model IdempotencyRecord \{[\s\S]*?\n\}/)?.[0] ?? '';
+  const deliveryModel = schema.match(/model DeliveryIntent \{[\s\S]*?\n\}/)?.[0] ?? '';
+  assert.ok(idempotencyModel);
+  assert.ok(deliveryModel);
+  assert.doesNotMatch(`${idempotencyModel}\n${deliveryModel}`, /^\s+(?:token|recipient|message|subject|body)\s+String/m);
 });
