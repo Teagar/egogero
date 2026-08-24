@@ -17,13 +17,16 @@ import {
 } from 'jose';
 import * as oidc from 'openid-client';
 
+import { parseBrowserSessionCookie } from './sessions.js';
+import type { BrowserSessionService } from './sessions.js';
+
 const LOGIN_TRANSACTION_TTL_MS = 10 * 60 * 1000;
 const OIDC_CLOCK_TOLERANCE_SECONDS = 60;
 const OIDC_HTTP_TIMEOUT_SECONDS = 5;
 const MAX_OIDC_RESPONSE_BYTES = 1024 * 1024;
 const HANDOFF_TTL_MS = 5 * 60 * 1000;
-const HANDOFF_COOKIE = '__Host-eg_oidc_handoff';
-const CLEARED_HANDOFF_COOKIE = `${HANDOFF_COOKIE}=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0`;
+export const HANDOFF_COOKIE = '__Host-eg_oidc_handoff';
+export const CLEARED_HANDOFF_COOKIE = `${HANDOFF_COOKIE}=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0`;
 const DEFAULT_FAILURE_PATH = '/auth/error';
 const SAFE_ID_TOKEN_ALGORITHMS = new Set(['RS256', 'PS256', 'ES256', 'EdDSA']);
 
@@ -856,7 +859,11 @@ function oneQueryValue(value: unknown) {
   return typeof value === 'string' ? value : undefined;
 }
 
-export function registerOidcRoutes(app: FastifyInstance, service?: OidcService) {
+export function registerOidcRoutes(
+  app: FastifyInstance,
+  service?: OidcService,
+  browserSessionService?: BrowserSessionService
+) {
   if (!service) return;
 
   app.get('/auth/login', async (request, reply) => {
@@ -884,10 +891,24 @@ export function registerOidcRoutes(app: FastifyInstance, service?: OidcService) 
     try {
       const callbackUrl = new URL(request.url, 'https://egogero.invalid');
       const result = await service.completeCallback({ callbackUrl, requestCorrelationId: request.id });
-      reply.header(
-        'Set-Cookie',
-        `${HANDOFF_COOKIE}=${result.handoffToken}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${HANDOFF_TTL_MS / 1000}`
-      );
+      if (browserSessionService) {
+        const issued = await browserSessionService.issueFromHandoff({
+          handoffToken: result.handoffToken,
+          oldSessionToken: parseBrowserSessionCookie(request.headers.cookie) ?? undefined,
+          requestCorrelationId: request.id,
+          userAgent: typeof request.headers['user-agent'] === 'string' ? request.headers['user-agent'] : null
+        });
+        if (!issued) throw new OidcCallbackError();
+        reply.header('Set-Cookie', [
+          browserSessionService.sessionCookie(issued.sessionToken),
+          CLEARED_HANDOFF_COOKIE
+        ]);
+      } else {
+        reply.header(
+          'Set-Cookie',
+          `${HANDOFF_COOKIE}=${result.handoffToken}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${HANDOFF_TTL_MS / 1000}`
+        );
+      }
       return reply.redirect(result.returnTo, 303);
     } catch {
       reply.header('Set-Cookie', CLEARED_HANDOFF_COOKIE);

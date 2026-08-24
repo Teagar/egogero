@@ -22,9 +22,32 @@ export const ROLE_PERMISSIONS = {
   portaria: ['convites:validate']
 } as const satisfies Record<Role, readonly Permission[]>;
 
+type ScopedIdentity =
+  | { id: string; role: 'provedor'; condominioIds: null }
+  | { id: string; role: Exclude<Role, 'provedor'>; condominioIds: readonly string[] };
+
+export type HumanSessionIdentity = ScopedIdentity & {
+  principalType: 'human';
+  authMethod: 'oidc-session';
+  accountId: string;
+  sessionId: string;
+};
+
 export type AuthenticatedIdentity =
-  | { id: string; role: 'provedor'; condominioIds: null; authMethod?: 'development' | 'device' }
-  | { id: string; role: Exclude<Role, 'provedor'>; condominioIds: readonly string[]; authMethod?: 'development' | 'device' };
+  | HumanSessionIdentity
+  | (ScopedIdentity & { principalType: 'human'; authMethod: 'development' })
+  | { id: string; role: 'portaria'; condominioIds: readonly string[]; principalType: 'device'; authMethod: 'device' };
+
+export class AuthenticationError extends Error {
+  constructor(
+    readonly statusCode: 400 | 401 | 403,
+    readonly code: 'ambiguous_credentials' | 'authentication_required' | 'csrf_required',
+    readonly headers: Readonly<Record<string, string>> = {}
+  ) {
+    super(code);
+    this.name = 'AuthenticationError';
+  }
+}
 
 declare module 'fastify' {
   interface FastifyRequest {
@@ -76,14 +99,16 @@ export function createDevelopmentHeaderAuthenticator(enabled: boolean): Authenti
       }
 
       if (role === 'provedor') {
-        return condominioId === '*' ? { id, role, condominioIds: null, authMethod: 'development' } : null;
+        return condominioId === '*'
+          ? { id, role, condominioIds: null, principalType: 'human', authMethod: 'development' }
+          : null;
       }
 
       if (!isUuid(condominioId)) {
         return null;
       }
 
-      return { id, role, condominioIds: [condominioId], authMethod: 'development' };
+      return { id, role, condominioIds: [condominioId], principalType: 'human', authMethod: 'development' };
     }
   };
 }
@@ -107,7 +132,14 @@ export function authorize(
   getMoradorId?: (request: FastifyRequest) => string | null
 ) {
   return async function authorizationHook(request: FastifyRequest, reply: FastifyReply) {
-    const identity = await authenticator.authenticate(request);
+    let identity: AuthenticatedIdentity | null;
+    try {
+      identity = await authenticator.authenticate(request);
+    } catch (error) {
+      if (!(error instanceof AuthenticationError)) throw error;
+      for (const [name, value] of Object.entries(error.headers)) reply.header(name, value);
+      return reply.status(error.statusCode).send({ error: error.code });
+    }
 
     if (!identity) {
       return reply.status(401).send({ error: 'Authentication required' });

@@ -21,6 +21,7 @@ import { createPrismaNotificationStore, registerNotificationRoutes } from './not
 import type { NotificationStore } from './notificacoes.js';
 import { registerOidcRoutes } from './oidc.js';
 import type { OidcService } from './oidc.js';
+import type { BrowserSessionService } from './sessions.js';
 import { prisma as defaultPrisma } from './lib/prisma.js';
 import { isDatabaseTimeZoneRejection, isValidTimeZone } from './timezones.js';
 
@@ -428,7 +429,8 @@ export function createApp(
     publicValidationBaseUrl,
     secureValidationTransport = false,
     trustProxy = false,
-    oidcService
+    oidcService,
+    browserSessionService
   }: {
     db?: AppDependencies;
     invitationStore?: InvitationStore;
@@ -445,6 +447,7 @@ export function createApp(
     secureValidationTransport?: boolean;
     trustProxy?: boolean | string;
     oidcService?: OidcService;
+    browserSessionService?: BrowserSessionService;
   } = {}
 ) {
   const db: AppDependencies = suppliedDb ?? {
@@ -772,7 +775,7 @@ export function createApp(
     secureValidationTransport
   );
   registerNotificationRoutes(app, db.notificacao, authenticator);
-  registerOidcRoutes(app, oidcService);
+  registerOidcRoutes(app, oidcService, browserSessionService);
 
   return app;
 }

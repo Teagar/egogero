@@ -119,6 +119,7 @@ test('Bearer authentication resolves the device tenant and rejects malformed cre
     id: DEVICE_ID,
     role: 'portaria',
     condominioIds: [CONDOMINIUM_ID],
+    principalType: 'device',
     authMethod: 'device'
   });
   assert.deepEqual(seen, [API_KEY]);
@@ -160,6 +161,7 @@ function validationDependencies() {
         id: DEVICE_ID,
         role: 'portaria' as const,
         condominioIds: [CONDOMINIUM_ID],
+        principalType: 'device' as const,
         authMethod: 'device' as const
       };
     }

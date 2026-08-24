@@ -11,6 +11,11 @@ import { createDeviceAuthenticator, createPrismaDeviceRateLimiter, createPrismaD
 import { getEnv } from './env.js';
 import { prisma } from './lib/prisma.js';
 import { createOidcService, createPrismaOidcLoginStore } from './oidc.js';
+import {
+  createBrowserSessionService,
+  createCredentialRouter,
+  createPrismaBrowserSessionStore
+} from './sessions.js';
 
 export async function startServer(environment: NodeJS.ProcessEnv = process.env) {
   const env = getEnv(environment);
@@ -22,15 +27,26 @@ export async function startServer(environment: NodeJS.ProcessEnv = process.env) 
   );
   await invitationStore.verifyIdempotencyConfiguration!();
   const deviceAuthenticator = createDeviceAuthenticator(deviceStore);
-  const authenticator = env.localDevelopmentAuth
-    ? createCompositeAuthenticator(deviceAuthenticator, createDevelopmentHeaderAuthenticator(true))
-    : deviceAuthenticator;
+  const developmentAuthenticator = env.localDevelopmentAuth
+    ? createDevelopmentHeaderAuthenticator(true)
+    : undefined;
   const notificationSender = environment.NODE_ENV === 'development'
     ? createDevelopmentNotificationSender()
     : createUnavailableNotificationSender();
   const oidcService = env.oidc
     ? await createOidcService(env.oidc, createPrismaOidcLoginStore(prisma))
     : undefined;
+  const browserSessionStore = env.sessions
+    ? createPrismaBrowserSessionStore(prisma, env.sessions)
+    : undefined;
+  const browserSessionService = browserSessionStore
+    ? createBrowserSessionService(browserSessionStore)
+    : undefined;
+  const authenticator = browserSessionStore
+    ? createCredentialRouter(browserSessionStore, deviceAuthenticator, developmentAuthenticator)
+    : developmentAuthenticator
+      ? createCompositeAuthenticator(deviceAuthenticator, developmentAuthenticator)
+      : deviceAuthenticator;
   const app = createApp({
     authenticator,
     invitationStore,
@@ -40,7 +56,8 @@ export async function startServer(environment: NodeJS.ProcessEnv = process.env) 
     publicValidationBaseUrl: env.publicValidationBaseUrl,
     secureValidationTransport: env.secureValidationTransport,
     trustProxy: env.trustProxy,
-    oidcService
+    oidcService,
+    browserSessionService
   });
 
   await app.listen({ host: env.host, port: env.port });

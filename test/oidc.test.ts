@@ -11,6 +11,8 @@ import {
   oidcConfigFromEnvironment
 } from '../src/oidc.js';
 import type { OidcLoginStore, OidcRuntimeConfig } from '../src/oidc.js';
+import { createBrowserSessionService, generateSessionToken, SESSION_COOKIE_NAME } from '../src/sessions.js';
+import type { BrowserSessionStore } from '../src/sessions.js';
 
 type StoredTransaction = Parameters<OidcLoginStore['createTransaction']>[0] & { createdAt: Date; consumed: boolean };
 
@@ -492,4 +494,70 @@ test('OIDC startup fails closed on metadata drift and never follows redirects', 
     service.completeCallback({ callbackUrl: callbackUrl(config, authorization), requestCorrelationId: 'token-redirect' }),
     OidcCallbackError
   );
+});
+
+test('OIDC callback converts its one-time handoff into the final browser session', async () => {
+  const handoffToken = generateSessionToken();
+  const oldSessionToken = generateSessionToken();
+  const sessionToken = generateSessionToken();
+  let suppliedOldSession: string | undefined;
+  const sessionStore = {
+    async issueFromHandoff(input) {
+      suppliedOldSession = input.oldSessionToken;
+      assert.equal(input.handoffToken, handoffToken);
+      return {
+        sessionToken,
+        csrfToken: generateSessionToken(),
+        absoluteExpiresAt: new Date(Date.now() + 43_200_000),
+        identity: {
+          principalType: 'human' as const,
+          authMethod: 'oidc-session' as const,
+          accountId: randomUUID(),
+          sessionId: randomUUID(),
+          id: randomUUID(),
+          role: 'provedor' as const,
+          condominioIds: null
+        }
+      };
+    },
+    async authenticate() { return null; },
+    async rotate() { return { status: 'stale' as const }; },
+    async revoke() { return 'unavailable' as const; },
+    async revokeAll() { return 0; },
+    async recordAmbiguousCredentials() {}
+  } satisfies BrowserSessionStore;
+  const oidcService = {
+    failurePath: '/auth/error',
+    async startLogin() { return new URL('https://identity.example.test/authorize'); },
+    async completeCallback() {
+      return {
+        returnTo: '/dashboard',
+        handoffToken,
+        identity: {
+          accountId: randomUUID(),
+          externalIdentityId: randomUUID(),
+          issuer: 'https://identity.example.test',
+          subject: 'subject',
+          authenticatedAt: new Date()
+        }
+      };
+    }
+  };
+  const app = createApp({
+    oidcService,
+    browserSessionService: createBrowserSessionService(sessionStore)
+  });
+  const response = await app.inject({
+    method: 'GET',
+    url: '/auth/callback?code=code&state=state',
+    headers: { cookie: `${SESSION_COOKIE_NAME}=${oldSessionToken}` }
+  });
+  assert.equal(response.statusCode, 303);
+  assert.equal(response.headers.location, '/dashboard');
+  assert.equal(suppliedOldSession, oldSessionToken);
+  assert.deepEqual(response.headers['set-cookie'], [
+    `${SESSION_COOKIE_NAME}=${sessionToken}; Path=/; HttpOnly; Secure; SameSite=Lax`,
+    '__Host-eg_oidc_handoff=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0'
+  ]);
+  await app.close();
 });

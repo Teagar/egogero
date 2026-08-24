@@ -148,7 +148,13 @@ export function createDeviceAuthenticator(store: DeviceStore): Authenticator {
       if (!match) return null;
       const device = await store.authenticate(match[1]!, new Date());
       return device
-        ? { id: device.id, role: 'portaria', condominioIds: [device.condominiumId], authMethod: 'device' }
+        ? {
+            id: device.id,
+            role: 'portaria',
+            condominioIds: [device.condominiumId],
+            principalType: 'device',
+            authMethod: 'device'
+          }
         : null;
     }
   };
