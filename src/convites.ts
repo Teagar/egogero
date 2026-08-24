@@ -2,6 +2,7 @@ import { createHash, createHmac, randomInt } from 'node:crypto';
 
 import { Prisma, type PrismaClient, type TipoConvite } from '@prisma/client';
 import type { FastifyInstance } from 'fastify';
+import QRCode from 'qrcode';
 
 import type { AppStore } from './app.js';
 import { authorize, isUuid } from './auth.js';
@@ -541,7 +542,9 @@ function parseInvitationBody(body: unknown) {
     return null;
   }
 
-  return { tipo, expiresAt };
+  const link = payload.link === true;
+  const qrCode = payload.qrCode === true;
+  return { tipo, expiresAt, link: link || qrCode, qrCode };
 }
 
 function parseGuestIds(body: unknown) {
@@ -555,6 +558,34 @@ function parseGuestIds(body: unknown) {
   }
 
   return convidadoIds;
+}
+
+function parseRepresentations(body: unknown) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return { link: false, qrCode: false };
+  const payload = body as Record<string, unknown>;
+  const qrCode = payload.qrCode === true;
+  return { link: payload.link === true || qrCode, qrCode };
+}
+
+function invitationLink(baseUrl: string | undefined, token: string) {
+  if (!baseUrl) return null;
+  try {
+    const url = new URL(baseUrl);
+    if (url.protocol !== 'https:' || url.username || url.password || url.search || url.hash || !url.hostname) return null;
+    return `${url.toString().replace(/\/$/, '')}/portaria/convites/validar#token=${encodeURIComponent(token)}`;
+  } catch {
+    return null;
+  }
+}
+
+async function invitationRepresentations(token: string, requested: { link: boolean; qrCode: boolean }, baseUrl: string | undefined) {
+  if (!requested.link && !requested.qrCode) return {};
+  const link = invitationLink(baseUrl, token);
+  if (!link) return null;
+  return {
+    ...(requested.link ? { link } : {}),
+    ...(requested.qrCode ? { qrCode: await QRCode.toDataURL(link, { errorCorrectionLevel: 'M' }) } : {})
+  };
 }
 
 function parseValidationToken(body: unknown) {
@@ -587,7 +618,8 @@ export function registerConviteRoutes(
   db: ConvitesStore,
   store: InvitationStore | undefined,
   authenticator: Authenticator,
-  notifications: NotificationSender = createUnavailableNotificationSender()
+  notifications: NotificationSender = createUnavailableNotificationSender(),
+  publicValidationBaseUrl?: string
 ) {
   const singlePath = '/condominios/:condominioId/moradores/:moradorId/convidados/:convidadoId/convites';
   const batchPath = '/condominios/:condominioId/moradores/:moradorId/convites/multiplos';
@@ -651,6 +683,10 @@ export function registerConviteRoutes(
     if (!store) {
       return reply.status(503).send({ error: 'Invitation service unavailable' });
     }
+    if (body?.link || body?.qrCode) {
+      const representation = invitationLink(publicValidationBaseUrl, '000000');
+      if (!representation) return reply.status(503).send({ error: 'Invitation link configuration unavailable' });
+    }
 
     const [condominio, morador, convidado] = await Promise.all([
       db.condominio.findFirst({ where: { id: condominioId, deletedAt: null } }),
@@ -681,7 +717,12 @@ export function registerConviteRoutes(
       } catch {
         return reply.header('cache-control', 'no-store').status(502).send({ error: 'Invitation created but notification delivery failed', invitationId: result.convite.id });
       }
-      return reply.header('cache-control', 'no-store').status(201).send(invitationResponse(result.convite, result.token));
+      const representations = await invitationRepresentations(result.token, body, publicValidationBaseUrl);
+      if (!representations) return reply.status(503).send({ error: 'Invitation link configuration unavailable' });
+      return reply.header('cache-control', 'no-store').status(201).send({
+        ...invitationResponse(result.convite, result.token),
+        ...representations
+      });
     } catch (error) {
       if (error instanceof RangeError) {
         return reply.status(400).send({ error: 'Invitation expiration must be in the future' });
@@ -700,6 +741,7 @@ export function registerConviteRoutes(
     const condominioId = parseUuidParam(request.params, 'condominioId');
     const moradorId = parseUuidParam(request.params, 'moradorId');
     const convidadoIds = parseGuestIds(request.body);
+    const representations = parseRepresentations(request.body);
     if (!condominioId || !moradorId || !convidadoIds) {
       return reply.status(400).send({ error: 'Invalid batch invitation payload' });
     }
@@ -708,6 +750,11 @@ export function registerConviteRoutes(
     }
     if (!store) {
       return reply.status(503).send({ error: 'Invitation service unavailable' });
+    }
+    if (representations.link || representations.qrCode) {
+      if (!invitationLink(publicValidationBaseUrl, '000000')) {
+        return reply.status(503).send({ error: 'Invitation link configuration unavailable' });
+      }
     }
 
     const morador = await db.morador.findFirst({
@@ -742,14 +789,14 @@ export function registerConviteRoutes(
         return reply.status(404).send({ error: 'One or more guests are no longer active or owned by resident' });
       }
 
-      return reply.header('cache-control', 'no-store').status(201).send({
-        convites: results.map(({ convite, token }) => ({
-          id: convite.id,
-          convidadoId: convite.convidadoId,
-          token,
-          expiraEm: convite.expiresAt?.toISOString() ?? expiresAt.toISOString()
-        }))
-      });
+      const convites = await Promise.all(results.map(async ({ convite, token }) => ({
+        id: convite.id,
+        convidadoId: convite.convidadoId,
+        token,
+        expiraEm: convite.expiresAt?.toISOString() ?? expiresAt.toISOString(),
+        ...(await invitationRepresentations(token, representations, publicValidationBaseUrl) ?? {})
+      })));
+      return reply.header('cache-control', 'no-store').status(201).send({ convites });
     } catch (error) {
       if (error instanceof TokenGenerationExhaustedError) {
         return reply.status(503).send({ error: 'Invitation token unavailable' });
