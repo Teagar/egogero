@@ -20,13 +20,17 @@ model Condominio {
 }
 
 model Morador {
-  id            String    @id @default(uuid())
-  createdAt     DateTime  @default(now())
-  deletedAt     DateTime?
-  nome          String
-  condominioId  String
-  condominio    Condominio @relation(fields: [condominioId], references: [id], onDelete: Restrict)
-  convites      Convite[]
+  id                  String      @id @default(uuid())
+  createdAt           DateTime    @default(now())
+  deletedAt           DateTime?
+  nome                String
+  enderecoRua         String?
+  enderecoNumero      String?
+  enderecoBloco       String?
+  enderecoApartamento String?
+  condominioId        String
+  condominio          Condominio  @relation(fields: [condominioId], references: [id], onDelete: Restrict)
+  convites            Convite[]
 
   @@index([condominioId])
 }
