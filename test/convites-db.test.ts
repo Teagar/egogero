@@ -317,6 +317,46 @@ test('PostgreSQL gatehouse validation is tenant-scoped, one-use, and fail-closed
     assert.ok(persistedValid.usedAt);
     assert.equal(persistedValid.tokenDigest, null);
     assert.ok((await prisma.convidado.findUniqueOrThrow({ where: { id: guestIds[0]! } })).ultimoUsoEm);
+    assert.equal(await prisma.notificacao.count({ where: { conviteId: valid.convite.id, deletedAt: null } }), 1);
+    const residentNotifications = await app.inject({
+      method: 'GET',
+      url: `/condominios/${condominioId}/moradores/${moradorId}/notificacoes?unread=true`,
+      headers: {
+        'x-development-user-id': moradorId,
+        'x-development-user-role': 'morador',
+        'x-development-condominio-id': condominioId
+      }
+    });
+    assert.equal(residentNotifications.statusCode, 200);
+    assert.equal(residentNotifications.json().length, 1);
+    const notificationId = residentNotifications.json()[0].id as string;
+    assert.equal((await app.inject({
+      method: 'PATCH',
+      url: `/condominios/${condominioId}/moradores/${moradorId}/notificacoes/${notificationId}`,
+      headers: {
+        'x-development-user-id': moradorId,
+        'x-development-user-role': 'morador',
+        'x-development-condominio-id': condominioId
+      }
+    })).statusCode, 200);
+    assert.equal((await app.inject({
+      method: 'GET',
+      url: `/condominios/${condominioId}/moradores/${moradorId}/notificacoes?unread=true`,
+      headers: {
+        'x-development-user-id': moradorId,
+        'x-development-user-role': 'morador',
+        'x-development-condominio-id': condominioId
+      }
+    })).json().length, 0);
+    assert.equal((await app.inject({
+      method: 'GET',
+      url: `/condominios/${condominioId}/moradores/${otherMoradorId}/notificacoes`,
+      headers: {
+        'x-development-user-id': moradorId,
+        'x-development-user-role': 'morador',
+        'x-development-condominio-id': condominioId
+      }
+    })).statusCode, 403);
 
     assert.deepEqual((await validate(expired.token)).json(), denied);
     assert.deepEqual((await validate(revoked.token)).json(), denied);
@@ -326,6 +366,7 @@ test('PostgreSQL gatehouse validation is tenant-scoped, one-use, and fail-closed
 
     await prisma.morador.update({ where: { id: moradorId }, data: { deletedAt: new Date() } });
     assert.deepEqual((await validate(deletedResident.token)).json(), denied);
+    assert.equal(await prisma.notificacao.count({ where: { conviteId: deletedResident.convite.id } }), 0);
     await prisma.morador.update({ where: { id: moradorId }, data: { deletedAt: null } });
     await prisma.condominio.update({ where: { id: condominioId }, data: { deletedAt: new Date() } });
     assert.deepEqual((await validate(deletedCondominium.token)).json(), denied);

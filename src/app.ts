@@ -5,6 +5,8 @@ import type { Authenticator } from './auth.js';
 import { registerConvidadoRoutes } from './convidados.js';
 import { createPrismaInvitationStore, createUnavailableNotificationSender, registerConviteRoutes } from './convites.js';
 import type { InvitationStore, NotificationSender } from './convites.js';
+import { createPrismaNotificationStore, registerNotificationRoutes } from './notificacoes.js';
+import type { NotificationStore } from './notificacoes.js';
 import { prisma as defaultPrisma } from './lib/prisma.js';
 
 type CondominioRecord = {
@@ -119,7 +121,7 @@ export type AppStore = {
   };
 };
 
-export type AppDependencies = AppStore & { convite?: InvitationStore; notificationSender?: NotificationSender };
+export type AppDependencies = AppStore & { convite?: InvitationStore; notificacao?: NotificationStore; notificationSender?: NotificationSender };
 
 export type CondominioStore = AppStore;
 
@@ -390,7 +392,8 @@ export function createApp(
     ...defaultStore,
     convite: invitationTokenSecret
       ? createPrismaInvitationStore(defaultPrisma, invitationTokenSecret)
-      : undefined
+      : undefined,
+    notificacao: createPrismaNotificationStore(defaultPrisma)
   };
   const effectiveNotificationSender = notificationSender
     ?? suppliedDb?.notificationSender
@@ -651,6 +654,7 @@ export function createApp(
 
   registerConvidadoRoutes(app, db, authenticator);
   registerConviteRoutes(app, db, db.convite, authenticator, effectiveNotificationSender);
+  registerNotificationRoutes(app, db.notificacao, authenticator);
 
   return app;
 }

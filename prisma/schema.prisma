@@ -18,6 +18,7 @@ model Condominio {
   moradores   Morador[]
   convidados  Convidado[]
   convites    Convite[]
+  notificacoes Notificacao[]
 }
 
 model Morador {
@@ -34,6 +35,7 @@ model Morador {
   condominio          Condominio  @relation(fields: [condominioId], references: [id], onDelete: Restrict)
   convites            Convite[] @relation("ConviteMorador")
   convidados          Convidado[] @relation("ConvidadoMorador")
+  notificacoes        Notificacao[]
 
   @@index([condominioId])
   @@unique([id, condominioId])
@@ -53,6 +55,7 @@ model Convidado {
   condominio    Condominio @relation(fields: [condominioId], references: [id], onDelete: Restrict)
   morador       Morador?  @relation("ConvidadoMorador", fields: [moradorId, condominioId], references: [id, condominioId], onDelete: Restrict)
   convites      Convite[] @relation("ConviteConvidado")
+  notificacoes  Notificacao[]
 
   @@index([condominioId])
   @@index([moradorId, ultimoUsoEm])
@@ -74,6 +77,7 @@ model Convite {
   condominio   Condominio   @relation(fields: [condominioId], references: [id], onDelete: Restrict)
   morador      Morador?     @relation("ConviteMorador", fields: [moradorId, condominioId], references: [id, condominioId], onDelete: Restrict)
   convidado    Convidado?   @relation("ConviteConvidado", fields: [convidadoId, condominioId], references: [id, condominioId], onDelete: Restrict)
+  notificacao  Notificacao?
 
   @@index([condominioId])
   @@index([moradorId])
@@ -116,4 +120,25 @@ enum ResultadoAcesso {
 model SecurityKey {
   name        String @id
   fingerprint String @db.Char(64)
+}
+
+model Notificacao {
+  id            String    @id @default(uuid())
+  createdAt     DateTime  @default(now())
+  deletedAt     DateTime?
+  lidaEm        DateTime?
+  tipo          String
+  mensagem      String
+  nomeConvidado String
+  entrouEm      DateTime
+  condominioId  String
+  moradorId     String
+  convidadoId   String
+  conviteId     String    @unique
+  condominio    Condominio @relation(fields: [condominioId], references: [id], onDelete: Restrict)
+  morador       Morador   @relation(fields: [moradorId], references: [id], onDelete: Restrict)
+  convidado     Convidado @relation(fields: [convidadoId], references: [id], onDelete: Restrict)
+  convite       Convite   @relation(fields: [conviteId], references: [id], onDelete: Cascade)
+
+  @@index([condominioId, moradorId, deletedAt, createdAt])
 }

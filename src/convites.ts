@@ -6,6 +6,7 @@ import type { FastifyInstance } from 'fastify';
 import type { AppStore } from './app.js';
 import { authorize, isUuid } from './auth.js';
 import type { Authenticator } from './auth.js';
+import { insertEntryNotification } from './notificacoes.js';
 
 export const INVITATION_TYPES = ['visitante', 'prestador', 'entregador'] as const satisfies readonly TipoConvite[];
 export const ACCESS_TYPES = ['pedestre', 'veiculo'] as const;
@@ -465,6 +466,14 @@ export function createPrismaInvitationStore(client: PrismaClient, tokenSecret: s
       }
 
       await insertAudit('permitido', invitation, usedAt);
+      await insertEntryNotification(transaction, {
+        invitationId: invitation.id,
+        condominiumId: args.condominiumId,
+        residentId: invitation.moradorId,
+        guestId: invitation.convidadoId,
+        guestName: invitation.guestName,
+        enteredAt: usedAt
+      });
 
       return {
         allowed: true,

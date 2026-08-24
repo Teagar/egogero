@@ -581,7 +581,9 @@ test('route inventory keeps every business route in the RBAC matrix', async () =
       '│               │       └── /convites (POST)',
       '│               ├── /convites/multiplos (POST)',
       '│               ├── /convites/:conviteId (DELETE)',
-      '│               └── /auditorias-acesso (GET, HEAD)',
+      '│               ├── /auditorias-acesso (GET, HEAD)',
+      '│               └── /notificacoes (GET, HEAD)',
+      '│                   └── /:notificationId (PATCH)',
       '├── /moradores (POST)',
       '└── /portaria/convites/validar (POST)',
       ''
