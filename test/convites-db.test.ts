@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { createHmac } from 'node:crypto';
+import { createHmac, randomUUID } from 'node:crypto';
 import test from 'node:test';
 
 import { PrismaClient } from '@prisma/client';
@@ -236,6 +236,7 @@ test('PostgreSQL gatehouse validation is tenant-scoped, one-use, and fail-closed
   const moradorId = uuid(120);
   const otherMoradorId = uuid(121);
   const guestIds = Array.from({ length: 8 }, (_, index) => uuid(420 + index));
+  const deviceRunId = randomUUID();
   const future = new Date(Date.now() + 60 * 60 * 1000);
   const create = (guestId: string, token: string, tenant = condominioId, resident = moradorId) => createInvitation(
     store,
@@ -243,7 +244,7 @@ test('PostgreSQL gatehouse validation is tenant-scoped, one-use, and fail-closed
     { generateToken: () => token }
   );
   const headers = (tenant: string) => ({
-    'x-development-user-id': `gatehouse-${tenant}`,
+    'x-development-user-id': `gatehouse-${tenant}-${deviceRunId}`,
     'x-development-user-role': 'portaria',
     'x-development-condominio-id': tenant
   });
@@ -298,7 +299,7 @@ test('PostgreSQL gatehouse validation is tenant-scoped, one-use, and fail-closed
       method: 'POST',
       url: '/portaria/convites/validar',
       headers: headers(tenant),
-      payload: { token }
+      payload: { token, tipoAcesso: 'pedestre' }
     });
     const denied = { allowed: false, reason: 'invalid_or_unavailable' };
 
@@ -330,13 +331,44 @@ test('PostgreSQL gatehouse validation is tenant-scoped, one-use, and fail-closed
     assert.deepEqual((await validate(deletedCondominium.token)).json(), denied);
     await prisma.condominio.update({ where: { id: condominioId }, data: { deletedAt: null } });
 
-    for (const payload of [{ token: '12345' }, { token: 'abcdef' }, { token: '123456', extra: true }]) {
+    for (const payload of [
+      { token: '12345', tipoAcesso: 'pedestre' },
+      { token: 'abcdef', tipoAcesso: 'veiculo' },
+      { token: '123456', tipoAcesso: 'pedestre', extra: true }
+    ]) {
       assert.deepEqual((await app.inject({ method: 'POST', url: '/portaria/convites/validar', headers: headers(condominioId), payload })).json(), denied);
     }
 
     const simultaneous = await Promise.all([validate(concurrent.token), validate(concurrent.token)]);
     assert.equal(simultaneous.filter((response) => response.json().allowed === true).length, 1);
     assert.equal(simultaneous.filter((response) => response.json().allowed === false).length, 1);
+
+    const atomic = await create(guestIds[0]!, '909090');
+    assert.ok(atomic);
+    await prisma.$executeRawUnsafe(`
+      CREATE FUNCTION reject_permitted_audit_for_test() RETURNS trigger
+      LANGUAGE plpgsql AS $$
+      BEGIN
+        IF NEW.resultado = 'permitido' THEN
+          RAISE EXCEPTION 'forced audit failure';
+        END IF;
+        RETURN NEW;
+      END;
+      $$
+    `);
+    await prisma.$executeRawUnsafe(`
+      CREATE TRIGGER reject_permitted_audit_for_test
+      BEFORE INSERT ON "AuditoriaAcesso"
+      FOR EACH ROW EXECUTE FUNCTION reject_permitted_audit_for_test()
+    `);
+    const auditFailure = await validate(atomic.token);
+    assert.equal(auditFailure.statusCode, 500);
+    const afterAuditFailure = await prisma.convite.findUniqueOrThrow({ where: { id: atomic.convite.id } });
+    assert.equal(afterAuditFailure.usedAt, null, 'audit failure must roll back token consumption');
+    assert.ok(afterAuditFailure.tokenDigest, 'audit failure must leave the token reusable');
+    await prisma.$executeRawUnsafe('DROP TRIGGER reject_permitted_audit_for_test ON "AuditoriaAcesso"');
+    await prisma.$executeRawUnsafe('DROP FUNCTION reject_permitted_audit_for_test()');
+    assert.equal((await validate(atomic.token)).json().allowed, true);
 
     const mismatchedSecretApp = createApp({
       authenticator: createDevelopmentHeaderAuthenticator(true),
@@ -346,11 +378,100 @@ test('PostgreSQL gatehouse validation is tenant-scoped, one-use, and fail-closed
       method: 'POST',
       url: '/portaria/convites/validar',
       headers: headers(otherCondominioId),
-      payload: { token: wrongTenant.token }
+      payload: { token: wrongTenant.token, tipoAcesso: 'pedestre' }
     });
     assert.equal(mismatch.statusCode, 503);
     assert.deepEqual(mismatch.json(), { allowed: false, reason: 'service_unavailable' });
     assert.equal((await prisma.convite.findUniqueOrThrow({ where: { id: wrongTenant.convite.id } })).usedAt, null);
+
+    const mainDeviceId = headers(condominioId)['x-development-user-id'];
+    const audits = await prisma.auditoriaAcesso.findMany({
+      where: { dispositivoId: mainDeviceId },
+      orderBy: { createdAt: 'asc' }
+    });
+    assert.equal(audits.length, 14, 'every completed validation attempt creates exactly one audit row');
+    assert.equal(audits.filter((audit) => audit.resultado === 'permitido').length, 3);
+    assert.equal(audits.filter((audit) => audit.resultado === 'negado').length, 11);
+    assert.ok(audits.every((audit) => ['pedestre', 'veiculo'].includes(audit.tipoAcesso)));
+    assert.ok(audits.every((audit) => audit.condominioId === condominioId));
+    assert.ok(audits.every((audit) => audit.dispositivoId === mainDeviceId));
+    const serializedAudits = JSON.stringify(audits).toLowerCase();
+    for (const forbidden of ['token', 'digest', 'nome', 'email', 'telefone', valid.token, wrongTenant.token]) {
+      assert.equal(serializedAudits.includes(forbidden.toLowerCase()), false, `audit leaked ${forbidden}`);
+    }
+
+    const allowedAudit = audits.find((audit) => audit.conviteId === valid.convite.id);
+    assert.equal(allowedAudit?.resultado, 'permitido');
+    assert.equal(allowedAudit?.moradorId, moradorId);
+    assert.equal(allowedAudit?.convidadoId, guestIds[0]);
+    const crossTenantAudit = audits.find((audit) => audit.resultado === 'negado' && audit.conviteId === null);
+    assert.equal(crossTenantAudit?.resultado, 'negado');
+    assert.equal(crossTenantAudit?.condominioId, condominioId, 'the authenticated device tenant is preserved');
+    assert.equal(
+      audits.some((audit) => audit.conviteId === wrongTenant.convite.id),
+      false,
+      'cross-tenant attempts never attach foreign invitation ownership'
+    );
+
+    await assert.rejects(
+      prisma.auditoriaAcesso.update({ where: { id: audits[0]!.id }, data: { resultado: 'negado' } }),
+      /immutable/
+    );
+    await assert.rejects(prisma.auditoriaAcesso.delete({ where: { id: audits[0]!.id } }), /immutable/);
+
+    const residentHeaders = {
+      'x-development-user-id': moradorId,
+      'x-development-user-role': 'morador',
+      'x-development-condominio-id': condominioId
+    };
+    const residentAuditResponse = await app.inject({
+      method: 'GET',
+      url: `/condominios/${condominioId}/moradores/${moradorId}/auditorias-acesso`,
+      headers: residentHeaders
+    });
+    assert.equal(residentAuditResponse.statusCode, 200);
+    assert.equal(residentAuditResponse.headers['cache-control'], 'no-store');
+    const residentAudits = (residentAuditResponse.json() as Array<Record<string, unknown>>)
+      .filter((audit) => audit.dispositivoId === mainDeviceId);
+    assert.equal(residentAudits.length, 7, 'resident sees only attempts tied to invitations they own');
+    assert.equal(JSON.stringify(residentAudits).includes(valid.token), false);
+
+    const otherResidentResponse = await app.inject({
+      method: 'GET',
+      url: `/condominios/${otherCondominioId}/moradores/${otherMoradorId}/auditorias-acesso`,
+      headers: {
+        'x-development-user-id': otherMoradorId,
+        'x-development-user-role': 'morador',
+        'x-development-condominio-id': otherCondominioId
+      }
+    });
+    assert.equal(otherResidentResponse.statusCode, 200);
+    const otherResidentAudits = (otherResidentResponse.json() as Array<Record<string, unknown>>)
+      .filter((audit) => audit.dispositivoId === mainDeviceId);
+    assert.equal(otherResidentAudits.length, 0, 'a foreign tenant cannot inject rows into the owner feed');
+
+    for (const role of ['provedor', 'sindico'] as const) {
+      const forbiddenQuery = await app.inject({
+        method: 'GET',
+        url: `/condominios/${condominioId}/moradores/${moradorId}/auditorias-acesso`,
+        headers: {
+          'x-development-user-id': `${role}-audit-reader`,
+          'x-development-user-role': role,
+          'x-development-condominio-id': role === 'provedor' ? '*' : condominioId
+        }
+      });
+      assert.equal(forbiddenQuery.statusCode, 403);
+    }
+
+    await prisma.morador.update({ where: { id: moradorId }, data: { deletedAt: new Date() } });
+    const inactiveParentQuery = await app.inject({
+      method: 'GET',
+      url: `/condominios/${condominioId}/moradores/${moradorId}/auditorias-acesso`,
+      headers: residentHeaders
+    });
+    assert.equal(inactiveParentQuery.statusCode, 404, 'API keeps active-parent semantics');
+    assert.equal(await prisma.auditoriaAcesso.count({ where: { dispositivoId: mainDeviceId } }), 14);
+    await prisma.morador.update({ where: { id: moradorId }, data: { deletedAt: null } });
 
     await mismatchedSecretApp.close();
     await app.close();

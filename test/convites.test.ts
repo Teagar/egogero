@@ -61,11 +61,13 @@ function record(input: InvitationAllocation, index = 0): InvitationRecord {
 
 function uniqueMemoryStore(initialTokens: string[] = []): InvitationStore & {
   activeTokens: Set<string>;
+  audits: Array<{ result: 'permitido' | 'negado'; accessType: 'pedestre' | 'veiculo'; deviceId: string }>;
   batchCalls: number;
 } {
   const activeTokens = new Set(initialTokens);
   const store = {
     activeTokens,
+    audits: [] as Array<{ result: 'permitido' | 'negado'; accessType: 'pedestre' | 'veiculo'; deviceId: string }>,
     batchCalls: 0,
     async createBatchActive(inputs: readonly InvitationAllocation[]) {
       store.batchCalls += 1;
@@ -88,10 +90,17 @@ function uniqueMemoryStore(initialTokens: string[] = []): InvitationStore & {
     async consumeActive(token: string) {
       return activeTokens.delete(token);
     },
-    async validateActive({ token, condominiumId }: { token: string; condominiumId: string }) {
-      if (condominiumId !== CONDOMINIO_ID || !activeTokens.delete(token)) {
+    async validateActive({ token, condominiumId, deviceId, accessType }: {
+      token: string | null;
+      condominiumId: string;
+      deviceId: string;
+      accessType: 'pedestre' | 'veiculo';
+    }) {
+      if (!token || condominiumId !== CONDOMINIO_ID || !activeTokens.delete(token)) {
+        store.audits.push({ result: 'negado', accessType, deviceId });
         return { allowed: false as const, reason: 'invalid_or_unavailable' as const };
       }
+      store.audits.push({ result: 'permitido', accessType, deviceId });
       return {
         allowed: true as const,
         guest: { name: 'Guest' },
@@ -105,6 +114,9 @@ function uniqueMemoryStore(initialTokens: string[] = []): InvitationStore & {
           usedAt: NOW
         }
       };
+    },
+    async listOwnedAudits() {
+      return [];
     },
     async revokeActive() {
       return 'revoked' as const;
@@ -250,6 +262,7 @@ test('revocation route is scoped, idempotent for revoked invitations, and fails 
     async createBatchActive() { throw new Error('Unexpected create'); },
     async consumeActive() { throw new Error('Unexpected consume'); },
     async validateActive() { throw new Error('Unexpected validate'); },
+    async listOwnedAudits() { throw new Error('Unexpected audit query'); },
     async revokeActive(args) {
       calls.push(args);
       return outcomes.shift() ?? 'unavailable';
@@ -315,7 +328,7 @@ test('gatehouse validation is portaria-only, tenant-scoped, non-oracular, and mi
     method: 'POST',
     url: '/portaria/convites/validar',
     headers: portariaHeaders,
-    payload: { token }
+    payload: { token, tipoAcesso: 'pedestre' }
   });
   assert.equal(allowed.statusCode, 200);
   assert.equal(allowed.headers['cache-control'], 'no-store');
@@ -327,7 +340,12 @@ test('gatehouse validation is portaria-only, tenant-scoped, non-oracular, and mi
   });
   assert.equal(allowed.body.includes(token), false);
 
-  for (const payload of [{ token }, { token: '12345' }, { token: 'abcdef' }, { token, extra: true }, {}]) {
+  for (const payload of [
+    { token, tipoAcesso: 'pedestre' },
+    { token: '12345', tipoAcesso: 'veiculo' },
+    { token: 'abcdef', tipoAcesso: 'pedestre' },
+    { token, tipoAcesso: 'pedestre', extra: true }
+  ]) {
     const denied = await app.inject({ method: 'POST', url: '/portaria/convites/validar', headers: portariaHeaders, payload });
     assert.equal(denied.statusCode, 200);
     assert.deepEqual(denied.json(), { allowed: false, reason: 'invalid_or_unavailable' });
@@ -337,7 +355,7 @@ test('gatehouse validation is portaria-only, tenant-scoped, non-oracular, and mi
     method: 'POST',
     url: '/portaria/convites/validar',
     headers: { ...portariaHeaders, 'x-development-condominio-id': OTHER_CONDOMINIO_ID },
-    payload: { token: '654321' }
+    payload: { token: '654321', tipoAcesso: 'veiculo' }
   });
   assert.deepEqual(wrongTenant.json(), { allowed: false, reason: 'invalid_or_unavailable' });
 
@@ -350,10 +368,24 @@ test('gatehouse validation is portaria-only, tenant-scoped, non-oracular, and mi
         'x-development-user-role': role,
         'x-development-condominio-id': role === 'provedor' ? '*' : CONDOMINIO_ID
       },
-      payload: { token: '654321' }
+      payload: { token: '654321', tipoAcesso: 'pedestre' }
     });
     assert.equal(response.statusCode, 403);
   }
+  const unauthenticated = await app.inject({
+    method: 'POST',
+    url: '/portaria/convites/validar',
+    payload: { token: '654321', tipoAcesso: 'pedestre' }
+  });
+  assert.equal(unauthenticated.statusCode, 401);
+  const invalidAccessType = await app.inject({
+    method: 'POST',
+    url: '/portaria/convites/validar',
+    headers: portariaHeaders,
+    payload: { token: '654321' }
+  });
+  assert.equal(invalidAccessType.statusCode, 400);
+  assert.equal(store.audits.length, 6, 'contract and RBAC rejections are not validation attempts');
   await app.close();
 });
 
@@ -370,7 +402,7 @@ test('gatehouse validation never logs or returns the bearer token', async () => 
       'x-development-user-role': 'portaria',
       'x-development-condominio-id': CONDOMINIO_ID
     },
-    payload: { token }
+    payload: { token, tipoAcesso: 'pedestre' }
   });
 
   assert.equal(response.body.includes(token), false);
