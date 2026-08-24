@@ -13,10 +13,9 @@ export const ROLE_PERMISSIONS = {
   portaria: []
 } as const satisfies Record<Role, readonly Permission[]>;
 
-export type AuthenticatedIdentity = {
-  id: string;
-  role: Role;
-};
+export type AuthenticatedIdentity =
+  | { id: string; role: 'provedor'; condominioIds: null }
+  | { id: string; role: Exclude<Role, 'provedor'>; condominioIds: readonly string[] };
 
 export interface Authenticator {
   authenticate(request: FastifyRequest): Promise<AuthenticatedIdentity | null>;
@@ -24,6 +23,18 @@ export interface Authenticator {
 
 const DEVELOPMENT_ID_HEADER = 'x-development-user-id';
 const DEVELOPMENT_ROLE_HEADER = 'x-development-user-role';
+const DEVELOPMENT_CONDOMINIO_HEADER = 'x-development-condominio-id';
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+export function isUuid(value: unknown): value is string {
+  return typeof value === 'string' && UUID_PATTERN.test(value);
+}
+
+export const unauthenticatedAuthenticator: Authenticator = {
+  async authenticate() {
+    return null;
+  }
+};
 
 function readSingleHeader(request: FastifyRequest, name: string) {
   const value = request.headers[name];
@@ -34,26 +45,39 @@ function isRole(value: string): value is Role {
   return ROLES.some((role) => role === value);
 }
 
-export function createDevelopmentHeaderAuthenticator(environment = process.env.NODE_ENV): Authenticator {
-  if (environment !== 'development' && environment !== 'test') {
-    throw new Error('Development header authentication is disabled outside development and test');
+export function createDevelopmentHeaderAuthenticator(enabled: boolean): Authenticator {
+  if (!enabled) {
+    throw new Error('Development header authentication requires explicit opt-in');
   }
 
   return {
     async authenticate(request) {
       const id = readSingleHeader(request, DEVELOPMENT_ID_HEADER)?.trim();
       const role = readSingleHeader(request, DEVELOPMENT_ROLE_HEADER);
+      const condominioId = readSingleHeader(request, DEVELOPMENT_CONDOMINIO_HEADER);
 
-      if (!id || !role || !isRole(role)) {
+      if (!id || !role || !isRole(role) || !condominioId) {
         return null;
       }
 
-      return { id, role };
+      if (role === 'provedor') {
+        return condominioId === '*' ? { id, role, condominioIds: null } : null;
+      }
+
+      if (!isUuid(condominioId)) {
+        return null;
+      }
+
+      return { id, role, condominioIds: [condominioId] };
     }
   };
 }
 
-export function authorize(authenticator: Authenticator, permission: Permission) {
+export function authorize(
+  authenticator: Authenticator,
+  permission: Permission,
+  getCondominioId?: (request: FastifyRequest) => string | null
+) {
   return async function authorizationHook(request: FastifyRequest, reply: FastifyReply) {
     const identity = await authenticator.authenticate(request);
 
@@ -64,6 +88,13 @@ export function authorize(authenticator: Authenticator, permission: Permission) 
     const permissions: readonly Permission[] = ROLE_PERMISSIONS[identity.role];
 
     if (!permissions.includes(permission)) {
+      return reply.status(403).send({ error: 'Forbidden' });
+    }
+
+    const condominioId = getCondominioId?.(request);
+    const globallyAuthorized = identity.role === 'provedor' && identity.condominioIds === null;
+
+    if (condominioId && !globallyAuthorized && !identity.condominioIds?.includes(condominioId)) {
       return reply.status(403).send({ error: 'Forbidden' });
     }
   };

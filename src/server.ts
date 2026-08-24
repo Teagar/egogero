@@ -1,13 +1,25 @@
+import { pathToFileURL } from 'node:url';
+
 import { createApp } from './app.js';
-import { createDevelopmentHeaderAuthenticator } from './auth.js';
+import { createDevelopmentHeaderAuthenticator, unauthenticatedAuthenticator } from './auth.js';
 import { getEnv } from './env.js';
 
-const env = getEnv();
-const app = createApp({ authenticator: createDevelopmentHeaderAuthenticator(process.env.NODE_ENV) });
+export async function startServer(environment: NodeJS.ProcessEnv = process.env) {
+  const env = getEnv(environment);
+  const authenticator = env.localDevelopmentAuth
+    ? createDevelopmentHeaderAuthenticator(true)
+    : unauthenticatedAuthenticator;
+  const app = createApp({ authenticator });
 
-try {
-  await app.listen({ host: '0.0.0.0', port: env.port });
-} catch (error) {
-  app.log.error(error);
-  process.exit(1);
+  await app.listen({ host: env.host, port: env.port });
+  return app;
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  try {
+    await startServer();
+  } catch (error) {
+    console.error(error);
+    process.exitCode = 1;
+  }
 }

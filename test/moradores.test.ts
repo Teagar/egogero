@@ -5,13 +5,25 @@ import { createApp } from '../src/app.js';
 import type { AppStore } from '../src/app.js';
 import { createDevelopmentHeaderAuthenticator } from '../src/auth.js';
 
-const authenticator = createDevelopmentHeaderAuthenticator('test');
-const providerHeaders = { 'x-development-user-id': 'provider-1', 'x-development-user-role': 'provedor' };
-const sindicoHeaders = { 'x-development-user-id': 'manager-1', 'x-development-user-role': 'sindico' };
-const moradorHeaders = { 'x-development-user-id': 'resident-1', 'x-development-user-role': 'morador' };
+const authenticator = createDevelopmentHeaderAuthenticator(true);
+const providerHeaders = {
+  'x-development-user-id': 'provider-1',
+  'x-development-user-role': 'provedor',
+  'x-development-condominio-id': '*'
+};
+const sindicoHeaders = {
+  'x-development-user-id': 'manager-1',
+  'x-development-user-role': 'sindico',
+  'x-development-condominio-id': '00000000-0000-4000-8000-000000000001'
+};
+const moradorHeaders = {
+  'x-development-user-id': 'resident-1',
+  'x-development-user-role': 'morador',
+  'x-development-condominio-id': '00000000-0000-4000-8000-000000000001'
+};
 
 type StoredCondominio = Awaited<ReturnType<AppStore['condominio']['create']>>;
-type StoredMorador = Awaited<ReturnType<AppStore['morador']['create']>>;
+type StoredMorador = NonNullable<Awaited<ReturnType<AppStore['morador']['create']>>>;
 
 function cloneCondominio(condominio: StoredCondominio) {
   return {
@@ -84,6 +96,12 @@ function createFakeStore() {
     },
     morador: {
       async create({ data }) {
+        const condominio = condominios.get(data.condominioId);
+
+        if (!condominio || condominio.deletedAt !== null) {
+          return null;
+        }
+
         const row = {
           id: uuid(nextMoradorId),
           createdAt: new Date(Date.UTC(2026, 0, nextMoradorId - 100)),
@@ -100,14 +118,23 @@ function createFakeStore() {
         assert.equal(orderBy.createdAt, 'desc');
 
         return Array.from(moradores.values())
-          .filter((row) => row.condominioId === where.condominioId && row.deletedAt === null)
+          .filter(
+            (row) =>
+              row.condominioId === where.condominioId &&
+              row.deletedAt === null &&
+              condominios.get(row.condominioId)?.deletedAt === null
+          )
           .sort((left, right) => right.createdAt.getTime() - left.createdAt.getTime())
           .map(cloneMorador);
       },
       async findFirst({ where }) {
         const row = moradores.get(where.id);
 
-        if (!row || row.deletedAt !== where.deletedAt) {
+        if (
+          !row ||
+          row.deletedAt !== where.deletedAt ||
+          condominios.get(row.condominioId)?.deletedAt !== null
+        ) {
           return null;
         }
 
@@ -120,7 +147,12 @@ function createFakeStore() {
       async updateMany({ where, data }) {
         const row = moradores.get(where.id);
 
-        if (!row || row.deletedAt !== where.deletedAt || row.condominioId !== where.condominioId) {
+        if (
+          !row ||
+          row.deletedAt !== where.deletedAt ||
+          row.condominioId !== where.condominioId ||
+          condominios.get(row.condominioId)?.deletedAt !== null
+        ) {
           return { count: 0 };
         }
 

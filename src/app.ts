@@ -1,6 +1,6 @@
 import Fastify from 'fastify';
 
-import { authorize } from './auth.js';
+import { authorize, isUuid, unauthenticatedAuthenticator } from './auth.js';
 import type { Authenticator } from './auth.js';
 import { prisma as defaultPrisma } from './lib/prisma.js';
 
@@ -60,16 +60,16 @@ export type AppStore = {
     updateMany(args: { where: { id: string; deletedAt: null }; data: CondominioUpdateData }): Promise<{ count: number }>;
   };
   morador: {
-    create(args: { data: MoradorCreateData }): Promise<MoradorRecord>;
+    create(args: { data: MoradorCreateData }): Promise<MoradorRecord | null>;
     findMany(args: {
-      where: { condominioId: string; deletedAt: null };
+      where: { condominioId: string; deletedAt: null; condominio: { deletedAt: null } };
       orderBy: { createdAt: 'desc' };
     }): Promise<MoradorRecord[]>;
     findFirst(args: {
-      where: { id: string; condominioId?: string; deletedAt: null };
+      where: { id: string; condominioId: string; deletedAt: null; condominio: { deletedAt: null } };
     }): Promise<MoradorRecord | null>;
     updateMany(args: {
-      where: { id: string; condominioId: string; deletedAt: null };
+      where: { id: string; condominioId: string; deletedAt: null; condominio: { deletedAt: null } };
       data: MoradorUpdateData;
     }): Promise<{ count: number }>;
   };
@@ -80,8 +80,6 @@ export type CondominioStore = AppStore;
 type CondominioBody = Partial<Record<keyof CondominioCreateData, unknown>>;
 type MoradorBody = Partial<Record<'nome' | 'condominioId' | 'endereco', unknown>>;
 type EnderecoBody = Partial<Record<'rua' | 'numero' | 'bloco' | 'apartamento', unknown>>;
-
-const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 function readRequiredString(body: Partial<Record<string, unknown>>, field: string) {
   const value = body[field];
@@ -144,7 +142,7 @@ function parseUuidParam(params: unknown, field: string) {
   }
 
   const value = (params as Record<string, unknown>)[field];
-  return typeof value === 'string' && UUID_PATTERN.test(value) ? value : null;
+  return isUuid(value) ? value : null;
 }
 
 function parseEndereco(value: unknown): MoradorEnderecoData | null {
@@ -203,7 +201,7 @@ function parseMoradorCreateBody(body: unknown) {
 
   const payload = body as MoradorBody;
   const nome = readRequiredString(payload, 'nome');
-  const condominioId = typeof payload.condominioId === 'string' && UUID_PATTERN.test(payload.condominioId) ? payload.condominioId : null;
+  const condominioId = isUuid(payload.condominioId) ? payload.condominioId : null;
   const endereco = parseEndereco(payload.endereco);
 
   if (!nome || !condominioId || !endereco) {
@@ -268,22 +266,57 @@ function toMoradorResponse(morador: MoradorRecord) {
   };
 }
 
-async function ensureActiveCondominio(db: AppStore, condominioId: string) {
-  return db.condominio.findFirst({ where: { id: condominioId, deletedAt: null } });
-}
+const activeCondominio = { deletedAt: null } as const;
 
-const unauthenticated: Authenticator = {
-  async authenticate() {
-    return null;
+const defaultStore: AppStore = {
+  condominio: defaultPrisma.condominio,
+  morador: {
+    async create({ data }) {
+      return defaultPrisma.$transaction(async (transaction) => {
+        // Hold the parent row through insertion so soft deletion cannot race the active check.
+        const activeCondominios = await transaction.$queryRaw<Array<{ id: string }>>`
+          SELECT id
+          FROM "Condominio"
+          WHERE id = ${data.condominioId} AND "deletedAt" IS NULL
+          FOR UPDATE
+        `;
+
+        if (activeCondominios.length === 0) {
+          return null;
+        }
+
+        return transaction.morador.create({ data });
+      });
+    },
+    findMany: (args) => defaultPrisma.morador.findMany(args),
+    findFirst: (args) => defaultPrisma.morador.findFirst(args),
+    updateMany: (args) => defaultPrisma.morador.updateMany(args)
   }
 };
 
 export function createApp(
-  { db = defaultPrisma, authenticator = unauthenticated }: { db?: AppStore; authenticator?: Authenticator } = {}
+  {
+    db = defaultStore,
+    authenticator = unauthenticatedAuthenticator
+  }: { db?: AppStore; authenticator?: Authenticator } = {}
 ) {
   const app = Fastify({ logger: false });
   const condominioManagement = { preHandler: authorize(authenticator, 'condominios:manage') };
-  const moradorManagement = { preHandler: authorize(authenticator, 'moradores:manage') };
+  const createMoradorManagement = {
+    preHandler: authorize(authenticator, 'moradores:manage', (request) => {
+      if (!request.body || typeof request.body !== 'object' || Array.isArray(request.body)) {
+        return null;
+      }
+
+      const condominioId = (request.body as MoradorBody).condominioId;
+      return isUuid(condominioId) ? condominioId : null;
+    })
+  };
+  const nestedMoradorManagement = {
+    preHandler: authorize(authenticator, 'moradores:manage', (request) =>
+      parseUuidParam(request.params, 'condominioId')
+    )
+  };
 
   app.get('/health', async () => ({ status: 'ok' }));
 
@@ -370,45 +403,38 @@ export function createApp(
     return reply.status(204).send();
   });
 
-  app.post('/moradores', moradorManagement, async (request, reply) => {
+  app.post('/moradores', createMoradorManagement, async (request, reply) => {
     const data = parseMoradorCreateBody(request.body);
 
     if (!data) {
       return reply.status(400).send({ error: 'Invalid resident payload' });
     }
 
-    const condominio = await ensureActiveCondominio(db, data.condominioId);
+    const morador = await db.morador.create({ data });
 
-    if (!condominio) {
+    if (!morador) {
       return reply.status(404).send({ error: 'Condominium not found' });
     }
 
-    const morador = await db.morador.create({ data });
     return reply.status(201).send(toMoradorResponse(morador));
   });
 
-  app.get('/condominios/:condominioId/moradores', moradorManagement, async (request, reply) => {
+  app.get('/condominios/:condominioId/moradores', nestedMoradorManagement, async (request, reply) => {
     const condominioId = parseUuidParam(request.params, 'condominioId');
 
     if (!condominioId) {
       return reply.status(400).send({ error: 'Invalid condominium id' });
     }
 
-    const condominio = await ensureActiveCondominio(db, condominioId);
-
-    if (!condominio) {
-      return reply.status(404).send({ error: 'Condominium not found' });
-    }
-
     const moradores = await db.morador.findMany({
-      where: { condominioId, deletedAt: null },
+      where: { condominioId, deletedAt: null, condominio: activeCondominio },
       orderBy: { createdAt: 'desc' }
     });
 
     return moradores.map(toMoradorResponse);
   });
 
-  app.get('/condominios/:condominioId/moradores/:id', moradorManagement, async (request, reply) => {
+  app.get('/condominios/:condominioId/moradores/:id', nestedMoradorManagement, async (request, reply) => {
     const condominioId = parseUuidParam(request.params, 'condominioId');
     const id = parseId(request.params);
 
@@ -420,13 +446,9 @@ export function createApp(
       return reply.status(400).send({ error: 'Invalid resident id' });
     }
 
-    const condominio = await ensureActiveCondominio(db, condominioId);
-
-    if (!condominio) {
-      return reply.status(404).send({ error: 'Condominium not found' });
-    }
-
-    const morador = await db.morador.findFirst({ where: { id, condominioId, deletedAt: null } });
+    const morador = await db.morador.findFirst({
+      where: { id, condominioId, deletedAt: null, condominio: activeCondominio }
+    });
 
     if (!morador) {
       return reply.status(404).send({ error: 'Resident not found' });
@@ -435,7 +457,7 @@ export function createApp(
     return toMoradorResponse(morador);
   });
 
-  app.patch('/condominios/:condominioId/moradores/:id', moradorManagement, async (request, reply) => {
+  app.patch('/condominios/:condominioId/moradores/:id', nestedMoradorManagement, async (request, reply) => {
     const condominioId = parseUuidParam(request.params, 'condominioId');
     const id = parseId(request.params);
 
@@ -445,12 +467,6 @@ export function createApp(
 
     if (!id) {
       return reply.status(400).send({ error: 'Invalid resident id' });
-    }
-
-    const condominio = await ensureActiveCondominio(db, condominioId);
-
-    if (!condominio) {
-      return reply.status(404).send({ error: 'Condominium not found' });
     }
 
     const data = parseMoradorUpdateBody(request.body);
@@ -459,13 +475,18 @@ export function createApp(
       return reply.status(400).send({ error: 'Invalid resident payload' });
     }
 
-    const result = await db.morador.updateMany({ where: { id, condominioId, deletedAt: null }, data });
+    const result = await db.morador.updateMany({
+      where: { id, condominioId, deletedAt: null, condominio: activeCondominio },
+      data
+    });
 
     if (result.count === 0) {
       return reply.status(404).send({ error: 'Resident not found' });
     }
 
-    const morador = await db.morador.findFirst({ where: { id, condominioId, deletedAt: null } });
+    const morador = await db.morador.findFirst({
+      where: { id, condominioId, deletedAt: null, condominio: activeCondominio }
+    });
 
     if (!morador) {
       return reply.status(404).send({ error: 'Resident not found' });
@@ -474,7 +495,7 @@ export function createApp(
     return toMoradorResponse(morador);
   });
 
-  app.delete('/condominios/:condominioId/moradores/:id', moradorManagement, async (request, reply) => {
+  app.delete('/condominios/:condominioId/moradores/:id', nestedMoradorManagement, async (request, reply) => {
     const condominioId = parseUuidParam(request.params, 'condominioId');
     const id = parseId(request.params);
 
@@ -486,14 +507,8 @@ export function createApp(
       return reply.status(400).send({ error: 'Invalid resident id' });
     }
 
-    const condominio = await ensureActiveCondominio(db, condominioId);
-
-    if (!condominio) {
-      return reply.status(404).send({ error: 'Condominium not found' });
-    }
-
     const result = await db.morador.updateMany({
-      where: { id, condominioId, deletedAt: null },
+      where: { id, condominioId, deletedAt: null, condominio: activeCondominio },
       data: { deletedAt: new Date() }
     });
 
