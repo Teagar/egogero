@@ -1,0 +1,58 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Condominio {
+  id         String     @id @default(uuid())
+  createdAt  DateTime   @default(now())
+  deletedAt  DateTime?
+  nome       String
+  moradores  Morador[]
+  convidados Convidado[]
+  convites   Convite[]
+}
+
+model Morador {
+  id            String    @id @default(uuid())
+  createdAt     DateTime  @default(now())
+  deletedAt     DateTime?
+  nome          String
+  condominioId  String
+  condominio    Condominio @relation(fields: [condominioId], references: [id], onDelete: Restrict)
+  convites      Convite[]
+
+  @@index([condominioId])
+}
+
+model Convidado {
+  id            String    @id @default(uuid())
+  createdAt     DateTime  @default(now())
+  deletedAt     DateTime?
+  nome          String
+  condominioId  String
+  condominio    Condominio @relation(fields: [condominioId], references: [id], onDelete: Restrict)
+  convites      Convite[]
+
+  @@index([condominioId])
+}
+
+model Convite {
+  id           String     @id @default(uuid())
+  createdAt    DateTime   @default(now())
+  deletedAt    DateTime?
+  condominioId String
+  moradorId    String?
+  convidadoId  String?
+  condominio   Condominio @relation(fields: [condominioId], references: [id], onDelete: Restrict)
+  morador      Morador?   @relation(fields: [moradorId], references: [id], onDelete: SetNull)
+  convidado    Convidado? @relation(fields: [convidadoId], references: [id], onDelete: SetNull)
+
+  @@index([condominioId])
+  @@index([moradorId])
+  @@index([convidadoId])
+}
