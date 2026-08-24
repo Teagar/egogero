@@ -93,16 +93,18 @@ Trust boundaries:
 3. The Egogero application is trusted to validate OIDC responses, issue and
    verify sessions, enforce CSRF, and map local authorization.
 4. PostgreSQL is a restricted trust zone containing account, membership,
-   session metadata, and audit records. It never stores raw session or CSRF
-   tokens.
+   session metadata, and audit records. It never stores a raw session token or
+   a plaintext CSRF token/PKCE verifier. Recoverable CSRF tokens and PKCE
+   verifiers use authenticated ciphertext with explicit key versions; their
+   encryption keys remain outside PostgreSQL.
 5. The managed OIDC provider is trusted only for human authentication facts. It
    is not trusted to assign an Egogero tenant or role.
 6. Devices are untrusted network clients with a distinct credential domain.
    Their Bearer API keys never cross into the browser-session path.
 
-Protected assets are session tokens, OIDC authorization responses, account and
-membership state, recovery operations, tenant data, device API keys, audit
-evidence, and signing/client secrets.
+Protected assets are session and CSRF tokens, PKCE verifiers, OIDC authorization
+responses, account and membership state, recovery operations, tenant data,
+device API keys, audit evidence, and signing/client/encryption secrets.
 
 ## Browser Contract
 
@@ -112,12 +114,23 @@ evidence, and signing/client secrets.
   PKCE using a fresh 256-bit state, nonce, and PKCE verifier.
 - `returnTo` must be an allowlisted same-origin relative path. Invalid values
   become `/`; absolute and protocol-relative URLs are rejected.
-- A one-time `OidcLoginTransaction` stores hashes of state, nonce, and PKCE
-  verifier plus `returnTo`, creation time, and ten-minute expiry. It is consumed
-  atomically at callback and cannot be replayed.
-- `GET /auth/callback` validates exact issuer, audience/client ID, signature,
-  state, nonce, PKCE, authorization-code single use, and provider time claims.
-  Clock skew allowance is 60 seconds.
+- A one-time `OidcLoginTransaction` stores SHA-256 digests of state and nonce.
+  It stores the recoverable PKCE verifier using authenticated encryption with
+  an explicit key version, random nonce, authentication tag, and AAD binding it
+  to the transaction ID, issuer, client ID, and redirect URI. It also stores
+  `returnTo`, creation time, and ten-minute expiry. The callback consumes the
+  transaction atomically so it cannot be replayed.
+- `GET /auth/callback` first hashes the presented state for constant-time
+  comparison, atomically consumes the matching transaction, and decrypts the
+  PKCE verifier server-side. Missing/inactive key versions, changed AAD,
+  authentication-tag failure, or malformed plaintext perform no token exchange,
+  create no session, and emit a generic audited failure. Egogero then exchanges
+  the code with the recovered verifier. Only after that exchange does it
+  validate the ID token's exact issuer, audience/client ID, signature, provider
+  time claims, and nonce by hashing the returned nonce for constant-time digest
+  comparison. PKCE/code reuse or any token/nonce failure discards all returned
+  tokens, creates no session, and emits the same generic failure. Clock skew
+  allowance is 60 seconds.
 - The callback never accepts an access token or ID token supplied by application
   JavaScript. Provider tokens are used server-side only and discarded once the
   required identity claims are read.
@@ -145,11 +158,31 @@ cross-site unsafe requests. It is defense in depth, not the sole CSRF control.
 
 ### CSRF
 
-Each session receives a separate 32-byte random CSRF secret. Only its SHA-256
-digest is stored. `GET /auth/session` returns the raw CSRF value in a
-`Cache-Control: no-store` JSON response after authenticating the HttpOnly
-session. The frontend keeps it in memory, not local storage, and sends it as
-`X-CSRF-Token` on `POST`, `PUT`, `PATCH`, and `DELETE`.
+Each newly authenticated browser session family receives a separate 32-byte
+random CSRF secret. PostgreSQL stores both its SHA-256 digest and an
+authenticated encrypted copy: AES-256-GCM ciphertext, random 96-bit nonce,
+authentication tag, and key version. AAD binds the ciphertext to
+`BrowserSession.id`, `accountId`, and the `egogero-csrf-v1` purpose. The key is
+loaded from the secret manager and never stored with the row.
+
+`GET /auth/session` authenticates the HttpOnly session, decrypts the CSRF value,
+verifies the tag and a constant-time SHA-256 digest match, and returns the raw
+value in a `Cache-Control: no-store` JSON response. An unavailable/inactive key,
+tag failure, malformed plaintext, or digest mismatch returns no token, fails
+closed, and emits a security event. The frontend keeps the returned value in
+memory, not local storage, and sends it as `X-CSRF-Token` on `POST`, `PUT`,
+`PATCH`, and `DELETE`.
+
+Routine `GET /auth/session` calls and inactivity extensions never rotate the
+CSRF secret. Session-cookie rotation for tenant/role selection,
+reauthentication, or privilege elevation carries the same CSRF secret into the
+replacement row by decrypting and re-encrypting it with fresh nonce/AAD; the
+digest remains unchanged. This keeps already-open tabs valid after the shared
+cookie changes. A new login after logout, logout-all, recovery, expiry, or
+suspected CSRF disclosure creates a new session family and secret. Encryption
+key rotation re-encrypts the same CSRF secret and does not change the browser
+value. Thus there is no routine current/previous-token acceptance window to
+weaken verification or unexpectedly invalidate concurrent tabs.
 
 For every unsafe cookie-authenticated request the application requires all of:
 
@@ -233,8 +266,12 @@ active membership.
 | Field | Contract |
 | --- | --- |
 | `id` | UUID primary key for administration and audit, never sent as credential. |
+| `familyId` | UUID stable across routine cookie rotations; changes at the new-session boundaries defined below. |
 | `tokenDigest` | Unique 32-byte SHA-256 digest of the opaque cookie. |
-| `csrfDigest` | 32-byte SHA-256 digest of the CSRF token. |
+| `csrfDigest` | 32-byte SHA-256 digest used for constant-time request verification and post-decryption consistency checking. |
+| `csrfCiphertext` | AES-256-GCM ciphertext of the recoverable 32-byte CSRF token; never plaintext. |
+| `csrfNonce`, `csrfAuthTag` | Random 96-bit GCM nonce and authentication tag. Nonce is fresh for every encryption. |
+| `csrfKeyVersion` | Secret-manager key version required to decrypt; inactive/missing versions fail closed. |
 | `accountId` | Required account foreign key. |
 | `accountSessionVersion` | Snapshot checked against `HumanAccount.sessionVersion`. |
 | `activeMembershipId` | Required active membership for tenant-scoped users; provider membership for provider users. |
@@ -252,9 +289,13 @@ under the audit retention policy.
 
 ### `OidcLoginTransaction`
 
-Contains unique state digest, nonce digest, encrypted PKCE verifier, return path,
-created time, expiry, and consumed time. Encryption uses an application key from
-the secret manager. Expired or consumed rows are deleted after 24 hours.
+Contains transaction ID, unique state digest, nonce digest,
+`pkceVerifierCiphertext`, random 96-bit `pkceVerifierNonce`,
+`pkceVerifierAuthTag`, `pkceKeyVersion`, exact issuer/client ID/redirect URI used
+as AAD, return path, created time, expiry, and consumed time. AES-256-GCM uses a
+purpose-specific application key from the secret manager. Decryption accepts
+only active key versions and validates the tag before the verifier is used.
+Expired or consumed rows are deleted after 24 hours.
 
 ### `AuthenticationAuditEvent`
 
@@ -328,6 +369,15 @@ the old session before issuing the new token. Rotation occurs after login,
 tenant/role switch, privilege elevation, account recovery, identity-link change,
 and reauthentication. Concurrent rotations allow only one winner.
 
+Initial login creates a new `familyId` and CSRF secret. Tenant/role switch,
+privilege elevation, identity-link change, and ordinary reauthentication preserve
+the family and CSRF secret while re-encrypting that secret against the new
+session row; only the opaque session cookie changes. Recovery, logout,
+logout-all, expiry, or suspected token disclosure ends the family, so a later
+login creates both a new session token and a new CSRF secret. A losing concurrent
+rotation returns a stale-session response; after the winning `Set-Cookie` is
+visible, any tab may retry with its unchanged in-memory CSRF value.
+
 ### Expiration
 
 - Absolute lifetime: 12 hours from issuance.
@@ -385,7 +435,9 @@ Migration uses a phased write-through design:
    concurrency.
 4. PostgreSQL retains durable session metadata, account session versions, and
    audit events. Redis stores only expiring active-session projections, with TTL
-   no later than absolute expiry.
+   no later than absolute expiry. A projection may contain the CSRF digest and
+   authenticated ciphertext/key metadata but never the plaintext CSRF value or
+   raw session token.
 
 Rollback disables Redis reads and returns to PostgreSQL. Because PostgreSQL
 remains durable and every Redis value is reconstructible, rollback loses no
@@ -468,28 +520,40 @@ The application emits immutable success and failure events for:
 - account invited, activated, suspended, disabled, or restored;
 - external identity linked/unlinked;
 - membership created, role changed, disabled, or tenant switched;
-- MFA policy rejection; and
-- OIDC configuration or key-set validation failure.
+- MFA policy rejection;
+- OIDC configuration or key-set validation failure; and
+- PKCE or CSRF authenticated-decryption/key-version failure.
 
 Events use reason codes and correlation IDs. They never include authorization
-codes, provider tokens, session/CSRF values or digests, client secrets, device
-API keys, or complete recovery data. Security alerts cover repeated callback
-failure, cross-tenant membership denial, provider configuration drift,
-revocation SLO breach, and unusual session creation.
+codes, provider tokens, session/CSRF values, digests, ciphertexts, nonces, or
+authentication tags, client secrets, device API keys, or complete recovery
+data. Security alerts cover repeated callback failure, cross-tenant membership
+denial, provider configuration drift, revocation SLO breach, and unusual session
+creation.
 
 ## Secret and Key Rotation
 
 - OIDC discovery and JWKS are fetched only from the configured exact HTTPS
   issuer. JWKS is cached according to response policy, refreshed on unknown
   `kid` with a cooldown, and fails closed if a valid signing key is unavailable.
-- OIDC client secrets and login-transaction encryption keys live in the secret
-  manager, never environment files committed to Git or PostgreSQL plaintext.
-- Rotation keeps current and previous client/encryption keys during a 24-hour
-  overlap. New writes use the current key; reads identify key version and accept
-  only active versions. Rotation is rehearsed every 90 days and performed
-  immediately after suspected disclosure.
-- Opaque session tokens and CSRF tokens need no signing key. Their random values
-  are one-way digested before storage; rotation means issuing a new session.
+- OIDC client secrets and purpose-separated PKCE/CSRF authenticated-encryption
+  keys live in the secret manager, never environment files committed to Git or
+  PostgreSQL plaintext. Ciphertext rows carry the exact key version.
+- Rotation keeps current and previous client/encryption keys active during a
+  24-hour overlap, which exceeds the ten-minute login-transaction and 12-hour
+  session lifetimes. New encryptions use the current key. A background pass
+  decrypts with the row version, verifies the AEAD tag and CSRF digest where
+  applicable, and re-encrypts active CSRF secrets with a fresh nonce and current
+  version without changing their plaintext. Rows that cannot be authenticated
+  fail closed and alert; they are never silently replaced. Rotation is
+  rehearsed every 90 days and performed immediately after suspected disclosure.
+- The 24-hour overlap applies only to planned rotation. Suspected disclosure of
+  a PKCE key consumes affected login transactions; suspected disclosure of a
+  CSRF key revokes affected session families and requires fresh login. A
+  compromised version is never kept active merely to preserve overlap.
+- Opaque session tokens remain non-recoverable: they have no signing or
+  encryption key, and PostgreSQL stores only `SHA-256(token)`. Encryption-key
+  rotation therefore cannot weaken or replace session-token hashing.
 - Existing device API-key HMAC secret management remains a separate key domain.
   Human-key rotation cannot change device credential verification and vice
   versa.
@@ -500,7 +564,7 @@ revocation SLO breach, and unusual session creation.
 | --- | --- |
 | Session theft | TLS, `__Host-` HttpOnly Secure cookie, no token logging, short idle/absolute expiry, rotation, revocation. Stolen active tokens remain possible until expiry/revocation, so sensitive actions require recent auth. |
 | Session fixation | Ignore unknown pre-login cookies; atomically revoke supplied valid session and issue a fresh random token after callback or privilege change. |
-| CSRF | SameSite Lax plus synchronizer token, exact Origin/Referer validation, JSON content type, and no unsafe GET. Failure is `403` with no mutation. |
+| CSRF | SameSite Lax plus an AEAD-recoverable, digest-verified synchronizer token, exact Origin/Referer validation, JSON content type, and no unsafe GET. Failure is `403` with no mutation; token-recovery failure returns no token and alerts. |
 | XSS | HttpOnly session, CSRF token only in memory, strict CSP in frontend work, contextual output encoding, no provider token in browser. XSS can act as the user, so CSP and dependency controls remain mandatory. |
 | Brute force and enumeration | Managed-provider controls, generic responses, application distributed limits, exponential backoff, and audit alerts. |
 | OIDC mix-up or forged token | Exact issuer/audience, state, nonce, PKCE, signature, time, and redirect URI checks; no dynamic issuer from request input. |
@@ -511,7 +575,7 @@ revocation SLO breach, and unusual session creation.
 | Revocation race | Atomic session-version increment, row revocation, transaction/outbox cache invalidation, and five-second propagation SLO. |
 | Key compromise or rotation drift | Secret manager versions, overlap window, rehearsed rotation, JWKS `kid` validation, configuration alerts, and fail-closed verification. |
 | Credential confusion | Discriminated principal type, strict cookie-versus-device routing, reject both credentials, never accept human OIDC Bearer tokens. |
-| Database disclosure | Store only high-entropy token digests, encrypt PKCE verifier, least-privilege roles, immutable audit permissions, backups encrypted. |
+| Database disclosure | Store only the digest of the high-entropy session token; store PKCE verifiers and CSRF tokens only as purpose-bound authenticated ciphertext with external versioned keys, plus CSRF digest; enforce least-privilege roles, immutable audit permissions, and encrypted backups. |
 | Malicious proxy headers | Trust forwarding headers only from allowlisted proxies; otherwise use direct connection data. |
 
 ## Production and Development Behavior
@@ -545,16 +609,17 @@ an `Authenticator` directly and do not claim to test browser cookie security.
 ```text
 Browser (untrusted)      Egogero              PostgreSQL           OIDC provider
        | GET /auth/login    |                       |                    |
-       |------------------->| hash state/nonce/PKCE |                    |
-       |                    |---------------------->| store, 10m expiry  |
-       | 302 + state/PKCE   |                       |                    |
+       |------------------->| hash state/nonce; AEAD-encrypt verifier    |
+       |                    |---------------------->| digests + AEAD, 10m|
+       | 302 + state + PKCE challenge               |                    |
        |<-------------------|                       |                    |
-       | [TB] authorize + PKCE ---------------------------------------->|
+       | [TB] authorize + PKCE challenge ------------------------------>|
        |<-------------------------------- [TB] code + state ------------|
        | GET callback       |                       |                    |
-       |------------------->| consume transaction  |                    |
-       |                    |---------------------->| atomic one-time    |
-       |                    | [TB] exchange code, validate issuer/JWKS ->|
+       |------------------->| hash state; lock/consume transaction       |
+       |                    |---------------------->| decrypt verifier,  |
+       |                    |<----------------------| verify AEAD/AAD     |
+       |                    | [TB] exchange code + recovered verifier -->|
        |                    |<---------------- verified subject/MFA ----|
        |                    | map subject to active local membership     |
        |                    |---------------------->| create session     |
@@ -582,6 +647,13 @@ Browser                 Egogero authenticator     PostgreSQL       RBAC/handler
 Unsafe requests fail before the handler when CSRF or origin validation fails.
 Expired, revoked, stale-version, or disabled state returns `401`; authenticated
 but unauthorized tenant/role returns `403`.
+
+For `GET /auth/session`, the PostgreSQL response also carries CSRF ciphertext,
+nonce, tag, digest, and key version. Egogero decrypts it with purpose-bound AAD,
+verifies the tag and digest, and only then crosses the browser trust boundary
+with the plaintext token. For unsafe requests, Egogero hashes the submitted
+header and compares it to `csrfDigest` in constant time; plaintext and
+ciphertext are never logged. Routine bootstrap does not rotate the value.
 
 ### Current and Global Revocation
 
@@ -652,9 +724,9 @@ the prior application release.
 | Card scope | Depends on | Entry and completion contract |
 | --- | --- | --- |
 | A. Human auth schema and audit ledger | PC-20 | Add account, external identity, membership, login transaction, session, and immutable audit schema with all constraints and migration tests. |
-| B. OIDC client and login transaction | A | Implement discovery/JWKS, Authorization Code + PKCE, state/nonce single use, callback validation, and mock-provider contract tests. |
+| B. OIDC client and login transaction | A | Implement discovery/JWKS, Authorization Code + PKCE, state/nonce digest comparison, versioned AEAD verifier recovery with AAD, fail-closed key/tag handling, callback validation, and mock-provider contract tests. |
 | C. PostgreSQL browser session authenticator | A, B | Issue/rotate/verify opaque sessions, map live membership to the discriminated identity, and preserve device authenticator behavior. |
-| D. CSRF, session, logout, and revocation API | C | Implement browser contract, expiry, logout-all versioning, origin checks, and race/security tests. |
+| D. CSRF, session, logout, and revocation API | C | Implement versioned AEAD CSRF recovery plus digest verification, stable family semantics across routine rotations/concurrent tabs, expiry, logout-all versioning, origin checks, key/tag failure tests, and race/security tests. |
 | E. Provisioning, membership, MFA, and recovery | B, C, D | Implement invitation binding, lifecycle administration, provider recovery/reauthentication, MFA claim policy, and audit events. |
 | F. Distributed auth rate limits and alerts | B, C, D | Implement the stated limits, proxy trust, metrics, redaction, and security alerts. |
 | G. Authenticated frontend shell | C, D, E | Implement login/session/tenant/logout UI, in-memory CSRF handling, strict CSP, and no browser provider-token storage. |
