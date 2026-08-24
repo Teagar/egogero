@@ -65,7 +65,8 @@ const convite = {
   expiresAt: new Date('2099-01-01T00:00:00.000Z'),
   usedAt: null,
   revokedAt: null,
-  tokenDigest: null
+  tokenDigest: null,
+  timeZone: 'America/Sao_Paulo'
 };
 
 function createAuthorizationStore(): AppDependencies {

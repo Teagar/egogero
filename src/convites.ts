@@ -18,6 +18,7 @@ import type { Authenticator } from './auth.js';
 import { createMemoryDeviceRateLimiter, DEVICE_RATE_LIMIT } from './dispositivos.js';
 import type { DeviceRateLimiter } from './dispositivos.js';
 import { insertEntryNotification } from './notificacoes.js';
+import { isValidTimeZone } from './timezones.js';
 
 export const INVITATION_TYPES = ['visitante', 'prestador', 'entregador'] as const satisfies readonly TipoConvite[];
 export const ACCESS_TYPES = ['pedestre', 'veiculo'] as const;
@@ -80,6 +81,7 @@ export type InvitationRecord = {
   usedAt: Date | null;
   revokedAt: Date | null;
   tokenDigest: string | null;
+  timeZone: string;
 };
 
 export type InvitationCreateData = {
@@ -218,6 +220,18 @@ export function canonicalRequestHash(body: unknown) {
   return createHash('sha256').update(canonicalJson(body)).digest('hex');
 }
 
+export class InvalidCondominiumTimeZoneError extends Error {
+  constructor() {
+    super('Condominium timezone is unavailable');
+  }
+}
+
+type InvitationStoreOptions = {
+  readDatabaseTime?: (transaction: Prisma.TransactionClient) => Promise<Date>;
+  idempotencySecret?: string;
+  idempotencyTtlMs?: number;
+};
+
 export function generateSixDigitToken() {
   return randomInt(TOKEN_LIMIT).toString().padStart(6, '0');
 }
@@ -289,8 +303,7 @@ function isTokenCollision(error: unknown) {
 export function createPrismaInvitationStore(
   client: PrismaClient,
   tokenSecret: string,
-  idempotencySecret?: string,
-  idempotencyTtlMs = 24 * 60 * 60 * 1000
+  options: InvitationStoreOptions = {}
 ): InvitationStore {
   if (Buffer.byteLength(tokenSecret) < 32) {
     throw new Error('Invitation token secret must be at least 32 bytes');
@@ -298,6 +311,7 @@ export function createPrismaInvitationStore(
 
   const digestToken = (token: string) => createHmac('sha256', tokenSecret).update(token).digest('hex');
   const secretFingerprint = createHash('sha256').update(tokenSecret).digest('hex');
+  const { idempotencySecret, idempotencyTtlMs = 24 * 60 * 60 * 1000 } = options;
   const idempotencyKey = idempotencySecret ? createHash('sha256').update(idempotencySecret).digest() : null;
   const idempotencyFingerprint = idempotencySecret
     ? createHash('sha256').update(`idempotency-cache:${idempotencySecret}`).digest('hex')
@@ -309,6 +323,12 @@ export function createPrismaInvitationStore(
   if (!Number.isSafeInteger(idempotencyTtlMs) || idempotencyTtlMs <= 0) {
     throw new Error('Idempotency TTL must be a positive integer');
   }
+  const readDatabaseTime = options.readDatabaseTime ?? (async (transaction: Prisma.TransactionClient) => {
+    const [{ now }] = await transaction.$queryRaw<Array<{ now: Date }>>`
+      SELECT clock_timestamp() AS now
+    `;
+    return now;
+  });
 
   async function verifyTokenSecret(transaction: Prisma.TransactionClient) {
     await transaction.$executeRaw`
@@ -412,13 +432,19 @@ export function createPrismaInvitationStore(
         AND convidado."anonymizedAt" IS NULL
         AND morador."deletedAt" IS NULL
         AND condominio."deletedAt" IS NULL
-        AND ${earliestExpiration} > clock_timestamp()
       ORDER BY convidado.id
       FOR UPDATE OF convidado, morador, condominio
     `);
 
     if (activeGuests.length !== allocations.length) {
       return null;
+    }
+
+    const timeZone = activeGuests[0]!.timezone;
+    if (!isValidTimeZone(timeZone)) throw new InvalidCondominiumTimeZoneError();
+    const issuanceTime = await readDatabaseTime(transaction);
+    if (earliestExpiration.getTime() <= issuanceTime.getTime()) {
+      throw new RangeError('Invitation expiration must be in the future');
     }
 
     // The resident and condominium locks above serialize all issuance for this resident.
@@ -431,8 +457,8 @@ export function createPrismaInvitationStore(
         WHERE "condominioId" = ${first.condominioId}
           AND "moradorId" = ${first.moradorId}
           AND "deletedAt" IS NULL
-          AND "createdAt" >= (((clock_timestamp() AT TIME ZONE ${activeGuests[0]!.timezone})::date)::timestamp AT TIME ZONE ${activeGuests[0]!.timezone})
-          AND "createdAt" < ((((clock_timestamp() AT TIME ZONE ${activeGuests[0]!.timezone})::date + 1)::timestamp) AT TIME ZONE ${activeGuests[0]!.timezone})
+          AND "createdAt" >= (((${issuanceTime} AT TIME ZONE ${timeZone})::date)::timestamp AT TIME ZONE ${timeZone})
+          AND "createdAt" < ((((${issuanceTime} AT TIME ZONE ${timeZone})::date + 1)::timestamp) AT TIME ZONE ${timeZone})
       `;
       if (count + BigInt(allocations.length) > BigInt(limit)) {
         throw new DailyInvitationLimitError();
@@ -441,16 +467,18 @@ export function createPrismaInvitationStore(
 
     const convites: InvitationRecord[] = [];
     for (const allocation of withDigests) {
-      convites.push(await transaction.convite.create({
+      const convite = await transaction.convite.create({
         data: {
           condominioId: allocation.condominioId,
           moradorId: allocation.moradorId,
           convidadoId: allocation.convidadoId,
           tipo: allocation.tipo,
+          createdAt: issuanceTime,
           expiresAt: allocation.expiresAt,
           tokenDigest: allocation.tokenDigest
         }
-      }));
+      });
+      convites.push({ ...convite, timeZone });
     }
     return convites;
   }
@@ -1241,6 +1269,9 @@ export function registerConviteRoutes(
       if (error instanceof IdempotencySecretMismatchError) {
         return reply.status(503).send({ error: 'Invitation service unavailable' });
       }
+      if (error instanceof InvalidCondominiumTimeZoneError) {
+        return reply.status(503).send({ error: 'Condominium timezone unavailable' });
+      }
       throw error;
     }
   });
@@ -1307,6 +1338,9 @@ export function registerConviteRoutes(
         .status(result.statusCode)
         .send(result.responseText);
     } catch (error) {
+      if (error instanceof RangeError) {
+        return reply.status(400).send({ error: 'Invitation expiration must be in the future' });
+      }
       if (error instanceof TokenGenerationExhaustedError) {
         return reply.status(503).send({ error: 'Invitation token unavailable' });
       }
@@ -1318,6 +1352,9 @@ export function registerConviteRoutes(
       }
       if (error instanceof IdempotencySecretMismatchError) {
         return reply.status(503).send({ error: 'Invitation service unavailable' });
+      }
+      if (error instanceof InvalidCondominiumTimeZoneError) {
+        return reply.status(503).send({ error: 'Condominium timezone unavailable' });
       }
       throw error;
     }

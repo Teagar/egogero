@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { createHmac, randomUUID } from 'node:crypto';
+import { createDecipheriv, createHash, createHmac, randomUUID } from 'node:crypto';
 import test from 'node:test';
 
 import { PrismaClient } from '@prisma/client';
@@ -10,8 +10,10 @@ import {
   DailyInvitationLimitError,
   createInvitation,
   createInvitations,
-  createPrismaInvitationStore
+  createPrismaInvitationStore,
+  invitationMessage
 } from '../src/convites.js';
+import type { NotificationSender } from '../src/convites.js';
 
 const runDatabaseTests = process.env.RUN_DATABASE_TESTS === 'true';
 const secret = 'database-e2e-invitation-secret-32-bytes-minimum';
@@ -675,6 +677,191 @@ test('PostgreSQL daily limits use condominium civil days and serialized batch is
     }
     assert.equal(await prisma.convite.count(), 12, 'null at both levels represents an unlimited default');
   } finally {
+    await prisma.$disconnect();
+  }
+});
+
+test('PostgreSQL quota uses one explicit issuance instant across 23 and 25 hour local days', { skip: !runDatabaseTests }, async () => {
+  const prisma = new PrismaClient();
+  const condominioId = uuid(50);
+  const moradorId = uuid(150);
+  const guestIds = [uuid(550), uuid(551), uuid(552)];
+  const timeZone = 'America/New_York';
+
+  try {
+    await prisma.convite.deleteMany();
+    await prisma.convidado.deleteMany();
+    await prisma.morador.deleteMany();
+    await prisma.condominio.deleteMany();
+    await prisma.condominio.create({
+      data: { id: condominioId, nome: 'DST', responsavel: 'Owner', tipo: 'residencial', timezone: timeZone, dailyInvitationLimit: 1 }
+    });
+    await prisma.morador.create({ data: { id: moradorId, nome: 'Resident', condominioId } });
+    await prisma.convidado.createMany({ data: guestIds.map((id) => ({ id, nome: id, condominioId, moradorId })) });
+
+    for (const [index, expectedHours, issuanceTime] of [
+      [0, 23, new Date('2026-03-08T16:00:00.000Z')],
+      [1, 25, new Date('2026-11-01T17:00:00.000Z')]
+    ] as const) {
+      await prisma.convite.deleteMany();
+      const [{ localStart, localEnd }] = await prisma.$queryRaw<Array<{ localStart: Date; localEnd: Date }>>`
+        SELECT
+          (((${issuanceTime} AT TIME ZONE ${timeZone})::date)::timestamp AT TIME ZONE ${timeZone}) AS "localStart",
+          ((((${issuanceTime} AT TIME ZONE ${timeZone})::date + 1)::timestamp) AT TIME ZONE ${timeZone}) AS "localEnd"
+      `;
+      assert.equal((localEnd.getTime() - localStart.getTime()) / 3_600_000, expectedHours);
+
+      const transactionStart = new Date(localStart.getTime() - 1);
+      await prisma.$executeRawUnsafe(
+        `ALTER TABLE "Convite" ALTER COLUMN "createdAt" SET DEFAULT '${transactionStart.toISOString()}'::timestamptz`
+      );
+      await prisma.convite.create({
+        data: {
+          condominioId,
+          moradorId,
+          convidadoId: guestIds[0]!,
+          createdAt: transactionStart
+        }
+      });
+      const store = createPrismaInvitationStore(prisma, secret, {
+        async readDatabaseTime(transaction) {
+          const [{ now }] = await transaction.$queryRaw<Array<{ now: Date }>>`SELECT ${issuanceTime}::timestamptz AS now`;
+          return now;
+        }
+      });
+      const data = (convidadoId: string) => ({
+        condominioId,
+        moradorId,
+        convidadoId,
+        tipo: 'visitante' as const,
+        expiresAt: new Date(issuanceTime.getTime() + 366 * 24 * 60 * 60 * 1000)
+      });
+      const issued = await createInvitation(store, data(guestIds[1]!), {
+        now: () => issuanceTime,
+        generateToken: () => `80000${index}`
+      });
+      assert.equal(issued?.convite.createdAt.toISOString(), issuanceTime.toISOString());
+      await assert.rejects(
+        createInvitation(store, data(guestIds[2]!), { now: () => issuanceTime, generateToken: () => `81000${index}` }),
+        DailyInvitationLimitError
+      );
+      assert.equal(await prisma.convite.count(), 2, 'the pre-midnight default does not hide the explicit post-midnight issuance');
+    }
+  } finally {
+    await prisma.$executeRawUnsafe('ALTER TABLE "Convite" ALTER COLUMN "createdAt" SET DEFAULT CURRENT_TIMESTAMP').catch(() => undefined);
+    await prisma.$disconnect();
+  }
+});
+
+test('issuance returns the timezone snapshot acquired under the condominium lock', { skip: !runDatabaseTests }, async () => {
+  const prisma = new PrismaClient();
+  const condominioId = uuid(60);
+  const moradorId = uuid(160);
+  const convidadoId = uuid(560);
+  const expiresAt = new Date(Date.now() + 60 * 60 * 1000);
+  const sent: string[] = [];
+  const notifications: NotificationSender = {
+    email: { async send(_to, message) { sent.push(message.body); } },
+    sms: { async send() {} }
+  };
+  let reportLocked!: () => void;
+  let releaseLock!: () => void;
+  const locked = new Promise<void>((resolve) => { reportLocked = resolve; });
+  const release = new Promise<void>((resolve) => { releaseLock = resolve; });
+
+  try {
+    await prisma.convite.deleteMany();
+    await prisma.convidado.deleteMany();
+    await prisma.morador.deleteMany();
+    await prisma.condominio.deleteMany();
+    await prisma.condominio.create({
+      data: { id: condominioId, nome: 'Race', responsavel: 'Owner', tipo: 'residencial', timezone: 'America/Sao_Paulo' }
+    });
+    await prisma.morador.create({ data: { id: moradorId, nome: 'Resident', condominioId } });
+    await prisma.convidado.create({
+      data: { id: convidadoId, nome: 'Guest', email: 'guest@example.com', condominioId, moradorId }
+    });
+    const holder = prisma.$transaction(async (transaction) => {
+      await transaction.$queryRaw`SELECT id FROM "Condominio" WHERE id = ${condominioId} FOR UPDATE`;
+      reportLocked();
+      await release;
+      await transaction.condominio.update({ where: { id: condominioId }, data: { timezone: 'America/Manaus' } });
+    });
+    await locked;
+
+    const app = createApp({
+      authenticator: createDevelopmentHeaderAuthenticator(true),
+      invitationTokenSecret: secret,
+      idempotencyCacheSecret: idempotencySecret,
+      notificationSender: notifications
+    });
+    const responsePromise = app.inject({
+      method: 'POST',
+      url: `/condominios/${condominioId}/moradores/${moradorId}/convidados/${convidadoId}/convites`,
+      headers: {
+        'x-development-user-id': moradorId,
+        'x-development-user-role': 'morador',
+        'x-development-condominio-id': condominioId,
+        'idempotency-key': 'timezone-snapshot-request-01'
+      },
+      payload: { tipo: 'visitante', expiresAt: expiresAt.toISOString() }
+    });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    releaseLock();
+    await holder;
+    const response = await responsePromise;
+    assert.equal(response.statusCode, 201);
+    const result = response.json() as { id: string; createdAt: string; token: string };
+    assert.equal(sent.length, 0, 'transactional issuance must not call delivery providers');
+    const intent = await prisma.deliveryIntent.findFirstOrThrow({
+      where: { conviteId: result.id, channel: 'email' }
+    });
+    const decipher = createDecipheriv(
+      'aes-256-gcm',
+      createHash('sha256').update(idempotencySecret).digest(),
+      Buffer.from(intent.payloadIv)
+    );
+    decipher.setAAD(Buffer.from(`delivery:${intent.id}:${intent.conviteId}:${intent.channel}:v${intent.keyVersion}`));
+    decipher.setAuthTag(Buffer.from(intent.payloadAuthTag));
+    const payload = JSON.parse(Buffer.concat([
+      decipher.update(Buffer.from(intent.payloadCiphertext)),
+      decipher.final()
+    ]).toString('utf8')) as { body: string };
+    assert.equal(payload.body, invitationMessage({
+      condominiumName: 'Race',
+      residentName: 'Resident',
+      generatedAt: new Date(result.createdAt),
+      expiresAt,
+      token: result.token,
+      timeZone: 'America/Manaus'
+    }).body);
+    await app.close();
+
+    await prisma.condominio.update({ where: { id: condominioId }, data: { timezone: 'Factory' } });
+    const before = await prisma.convite.count();
+    const unavailableApp = createApp({
+      authenticator: createDevelopmentHeaderAuthenticator(true),
+      invitationTokenSecret: secret,
+      idempotencyCacheSecret: idempotencySecret,
+      notificationSender: notifications
+    });
+    const unavailable = await unavailableApp.inject({
+      method: 'POST',
+      url: `/condominios/${condominioId}/moradores/${moradorId}/convidados/${convidadoId}/convites`,
+      headers: {
+        'x-development-user-id': moradorId,
+        'x-development-user-role': 'morador',
+        'x-development-condominio-id': condominioId,
+        'idempotency-key': 'timezone-unavailable-request-01'
+      },
+      payload: { tipo: 'visitante', expiresAt: expiresAt.toISOString() }
+    });
+    assert.equal(unavailable.statusCode, 503);
+    assert.deepEqual(unavailable.json(), { error: 'Condominium timezone unavailable' });
+    assert.equal(await prisma.convite.count(), before);
+    await unavailableApp.close();
+  } finally {
+    releaseLock();
     await prisma.$disconnect();
   }
 });

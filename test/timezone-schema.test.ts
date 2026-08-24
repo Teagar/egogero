@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
-const migrationPath = new URL('../prisma/migrations/0016_add_condominium_timezone_and_timestamptz/migration.sql', import.meta.url);
+const migrationPath = new URL('../prisma/migrations/0014_add_condominium_timezone_and_timestamptz/migration.sql', import.meta.url);
 const schemaPath = new URL('../prisma/schema.prisma', import.meta.url);
 
 test('timezone migration backfills condominiums and converts every persisted instant explicitly from UTC', async () => {

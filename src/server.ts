@@ -17,8 +17,7 @@ export async function startServer(environment: NodeJS.ProcessEnv = process.env) 
   const invitationStore = createPrismaInvitationStore(
     prisma,
     env.invitationTokenSecret,
-    env.idempotencyCacheSecret,
-    env.idempotencyTtlMs
+    { idempotencySecret: env.idempotencyCacheSecret, idempotencyTtlMs: env.idempotencyTtlMs }
   );
   await invitationStore.verifyIdempotencyConfiguration!();
   const deviceAuthenticator = createDeviceAuthenticator(deviceStore);

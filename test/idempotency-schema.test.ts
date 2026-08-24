@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
-const migrationPath = new URL('../prisma/migrations/0017_add_invitation_idempotency_outbox/migration.sql', import.meta.url);
+const migrationPath = new URL('../prisma/migrations/0015_add_invitation_idempotency_outbox/migration.sql', import.meta.url);
 const schemaPath = new URL('../prisma/schema.prisma', import.meta.url);
 
 test('idempotency and outbox schema enforce transactional uniqueness without plaintext payloads', async () => {

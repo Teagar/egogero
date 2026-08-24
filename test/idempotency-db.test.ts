@@ -113,7 +113,7 @@ test('PostgreSQL serializes idempotent invitation issuance, rollback, replay, ou
     assert.equal(await prisma.convite.count(), 3);
     await mismatchApp.close();
 
-    const rollbackStore = createPrismaInvitationStore(prisma, tokenSecret, cacheSecret);
+    const rollbackStore = createPrismaInvitationStore(prisma, tokenSecret, { idempotencySecret: cacheSecret });
     let releaseWinner!: () => void;
     let winnerEntered!: () => void;
     const entered = new Promise<void>((resolve) => { winnerEntered = resolve; });
@@ -155,7 +155,10 @@ test('PostgreSQL serializes idempotent invitation issuance, rollback, replay, ou
     assert.equal(afterCleanup.statusCode, 201);
     assert.equal(await prisma.convite.count(), 5);
 
-    const shortTtlStore = createPrismaInvitationStore(prisma, tokenSecret, cacheSecret, 60_000);
+    const shortTtlStore = createPrismaInvitationStore(prisma, tokenSecret, {
+      idempotencySecret: cacheSecret,
+      idempotencyTtlMs: 60_000
+    });
     const shortTtl = await shortTtlStore.issueIdempotent!({
       ...rollbackArgs,
       key: 'configured-short-ttl-key-01',

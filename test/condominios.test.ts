@@ -237,6 +237,13 @@ test('condominium timezone is required and invalid values never mutate storage',
   const list = await app.inject({ method: 'GET', url: '/condominios', headers: providerHeaders });
   assert.deepEqual(list.json(), []);
 
+  const slashless = await app.inject({
+    method: 'POST', url: '/condominios', headers: providerHeaders,
+    payload: { nome: 'UTC', responsavel: 'B', tipo: 'C', timezone: 'UTC' }
+  });
+  assert.equal(slashless.statusCode, 201);
+  assert.equal(slashless.json().timezone, 'UTC');
+
   const valid = await app.inject({
     method: 'POST', url: '/condominios', headers: providerHeaders,
     payload: { nome: 'A', responsavel: 'B', tipo: 'C', timezone: 'America/Recife' }
@@ -251,5 +258,20 @@ test('condominium timezone is required and invalid values never mutate storage',
     method: 'GET', url: `/condominios/${valid.json().id}`, headers: providerHeaders
   });
   assert.equal(unchanged.json().timezone, 'America/Recife');
+  await app.close();
+});
+
+test('database timezone rejection is mapped to a stable client error', async () => {
+  const db = createFakeStore();
+  db.condominio.create = async () => {
+    throw new Error('invalid condominium timezone');
+  };
+  const app = createApp({ db, authenticator });
+  const response = await app.inject({
+    method: 'POST', url: '/condominios', headers: providerHeaders,
+    payload: { nome: 'A', responsavel: 'B', tipo: 'C', timezone: 'UTC' }
+  });
+  assert.equal(response.statusCode, 400);
+  assert.deepEqual(response.json(), { error: 'Invalid condominium timezone' });
   await app.close();
 });
