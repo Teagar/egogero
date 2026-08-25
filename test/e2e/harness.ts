@@ -1,6 +1,6 @@
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { createHash, generateKeyPairSync, randomBytes } from 'node:crypto';
-import { mkdir, readdir, rm, writeFile } from 'node:fs/promises';
+import { readFile, readdir, writeFile } from 'node:fs/promises';
 import { request as httpRequest } from 'node:http';
 import { createServer as createHttpsServer, type Server as HttpsServer } from 'node:https';
 import { once } from 'node:events';
@@ -29,7 +29,7 @@ const IDS = {
   invitation: '31000000-0000-4000-8000-000000000009'
 } as const;
 
-type AttackMode = 'none' | 'state' | 'nonce' | 'pkce' | 'issuer';
+type AttackMode = 'none' | 'state' | 'nonce' | 'pkce' | 'issuer' | 'signature' | 'audience' | 'time';
 type ProviderState = {
   attack: AttackMode;
   subject: string;
@@ -58,12 +58,12 @@ async function ensureDatabaseExists() {
   maintenance.pathname = '/postgres';
   maintenance.search = '';
   const client = new Client({ connectionString: maintenance.toString() });
-  await client.connect();
   try {
+    await client.connect();
     const existing = await client.query('SELECT 1 FROM pg_database WHERE datname = $1', [target.pathname.slice(1)]);
     if (existing.rowCount === 0) await client.query('CREATE DATABASE office_pc31_e2e');
   } finally {
-    await client.end();
+    await client.end().catch(() => undefined);
   }
 }
 
@@ -72,8 +72,11 @@ async function resetDatabase() {
   await ensureDatabaseExists();
   const migrationRoot = path.resolve('prisma/migrations');
   const migrations = (await readdir(migrationRoot, { withFileTypes: true }))
-    .filter((entry) => entry.isDirectory() && /^\d{4}_/.test(entry.name));
-  if (migrations.length !== 24) throw new Error(`Expected 24 base migrations, found ${migrations.length}`);
+    .filter((entry) => entry.isDirectory() && /^\d{4}_/.test(entry.name))
+    .map((entry) => Number(entry.name.slice(0, 4))).sort((left, right) => left - right);
+  if (migrations.length === 0 || migrations.some((number, index) => number !== index + 1)) {
+    throw new Error('Migration sequence must be non-empty, unique, and contiguous from 0001');
+  }
   const reset = spawnSync('npx', ['prisma', 'migrate', 'reset', '--force', '--skip-generate'], {
     cwd: process.cwd(), env: { ...process.env, DATABASE_URL }, encoding: 'utf8'
   });
@@ -126,28 +129,19 @@ function redact(value: string) {
     .replace(/([?&](?:code|state|nonce|token|code_verifier)=)[^&\s]+/gi, '$1[REDACTED]');
 }
 
-async function createCertificate(tempRoot: string) {
-  const keyPath = path.join(tempRoot, 'localhost-key.pem');
-  const certPath = path.join(tempRoot, 'localhost-cert.pem');
-  const generated = spawnSync('openssl', [
-    'req', '-x509', '-newkey', 'rsa:2048', '-sha256', '-nodes', '-days', '1',
-    '-subj', '/CN=localhost', '-addext', 'subjectAltName=DNS:localhost,IP:127.0.0.1',
-    '-addext', 'basicConstraints=critical,CA:TRUE', '-keyout', keyPath, '-out', certPath
-  ], { encoding: 'utf8' });
-  if (generated.status !== 0) throw new Error(`Certificate generation failed: ${redact(generated.stderr)}`);
-  return { keyPath, certPath };
-}
-
 async function readBody(request: import('node:http').IncomingMessage) {
   const chunks: Buffer[] = [];
   for await (const chunk of request) chunks.push(Buffer.from(chunk));
   return Buffer.concat(chunks).toString('utf8');
 }
 
-async function startOidcProvider(key: Buffer, cert: Buffer) {
+async function startOidcProvider(key: Buffer, cert: Buffer, observedAlerts: Set<string>) {
   const { privateKey, publicKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
+  const { privateKey: forgedPrivateKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
   const jwk = { ...await exportJWK(publicKey), kid: 'pc31-key', alg: 'RS256', use: 'sig' };
   const codes = new Map<string, AuthorizationCode>();
+  let tokenExchanges = 0;
+  let rejectedCodeReplays = 0;
   let state: ProviderState = {
     attack: 'none', subject: REGULAR_SUBJECT, email: 'pc31@example.test', amr: ['otp'], acr: 'resident'
   };
@@ -188,6 +182,9 @@ async function startOidcProvider(key: Buffer, cert: Buffer) {
       });
     }
     if (request.method === 'GET' && url.pathname === '/jwks') return json(response, 200, { keys: [jwk] });
+    if (request.method === 'GET' && url.pathname === '/__stats') {
+      return json(response, 200, { tokenExchanges, rejectedCodeReplays, alerts: [...observedAlerts].sort() });
+    }
     if (request.method === 'GET' && (url.pathname === '/authorize' || url.pathname === '/recovery')) return authorize(url, response);
     if (request.method === 'POST' && url.pathname === '/__control') {
       const body = JSON.parse(await readBody(request)) as Partial<ProviderState>;
@@ -202,8 +199,10 @@ async function startOidcProvider(key: Buffer, cert: Buffer) {
       const form = new URLSearchParams(await readBody(request));
       const code = form.get('code');
       const saved = code ? codes.get(code) : undefined;
+      tokenExchanges += 1;
       if (request.headers.authorization !== expectedBasic || form.get('grant_type') !== 'authorization_code'
         || form.get('client_id') !== CLIENT_ID || !saved || form.get('redirect_uri') !== saved.redirectUri) {
+        if (code && !saved) rejectedCodeReplays += 1;
         return json(response, 400, { error: 'invalid_grant' });
       }
       codes.delete(code!);
@@ -211,18 +210,22 @@ async function startOidcProvider(key: Buffer, cert: Buffer) {
       const challenge = createHash('sha256').update(verifier).digest('base64url');
       if (challenge !== saved.challenge) return json(response, 400, { error: 'invalid_grant' });
       const now = Math.floor(Date.now() / 1000);
+      const tokenTime = saved.state.attack === 'time' ? now - 3_600 : now;
       const idToken = await new SignJWT({
         nonce: saved.state.attack === 'nonce' ? `${saved.nonce}x` : saved.nonce,
-        email: saved.state.email, email_verified: true, auth_time: now,
+        email: saved.state.email, email_verified: true, auth_time: tokenTime,
         amr: saved.state.amr, acr: saved.state.acr
       }).setProtectedHeader({ alg: 'RS256', kid: 'pc31-key' }).setIssuer(OIDC_ORIGIN)
-        .setAudience(CLIENT_ID).setSubject(saved.state.subject).setIssuedAt(now).setExpirationTime(now + 300).sign(privateKey);
+        .setAudience(saved.state.attack === 'audience' ? 'forged-audience' : CLIENT_ID)
+        .setSubject(saved.state.subject).setIssuedAt(tokenTime).setExpirationTime(tokenTime + 300)
+        .sign(saved.state.attack === 'signature' ? forgedPrivateKey : privateKey);
       return json(response, 200, { access_token: 'local-access-token', token_type: 'Bearer', expires_in: 300, id_token: idToken });
     }
     json(response, 404, { error: 'not_found' });
   });
   server.listen(3444, '127.0.0.1');
-  await once(server, 'listening');
+  try { await once(server, 'listening'); }
+  catch (error) { await closeServer(server); throw error; }
   return server;
 }
 
@@ -256,60 +259,111 @@ function startTlsProxy(key: Buffer, cert: Buffer) {
 
 async function closeServer(server: HttpsServer) {
   if (!server.listening) return;
-  await new Promise<void>((resolve) => server.close(() => resolve()));
+  server.closeAllConnections();
+  await Promise.race([
+    new Promise<void>((resolve) => server.close(() => resolve())),
+    new Promise<void>((resolve) => setTimeout(resolve, 2_000))
+  ]);
 }
 
 async function main() {
   const tempRoot = path.resolve('.e2e-tmp');
-  await rm(tempRoot, { recursive: true, force: true });
-  await mkdir(tempRoot, { recursive: true, mode: 0o700 });
-  const { keyPath, certPath } = await createCertificate(tempRoot);
-  const { readFile } = await import('node:fs/promises');
-  const [key, cert] = await Promise.all([readFile(keyPath), readFile(certPath)]);
-  const invitationToken = randomBytes(32).toString('base64url');
-  await writeFile(path.join(tempRoot, 'invitation-token'), invitationToken, { mode: 0o600 });
-  await resetDatabase();
-  await seedDatabase(invitationToken);
-  const provider = await startOidcProvider(key, cert);
-  const application = spawn(process.execPath, ['--import', 'tsx', 'src/server.ts'], {
-    cwd: process.cwd(), stdio: ['ignore', 'pipe', 'pipe'],
-    env: {
-      ...process.env, NODE_ENV: 'production', NODE_EXTRA_CA_CERTS: certPath, DATABASE_URL,
-      HOST: '127.0.0.1', PORT: '3442', HUMAN_AUTH_ENABLED: 'true', PUBLIC_APPLICATION_ORIGIN: APP_ORIGIN,
-      PUBLIC_VALIDATION_BASE_URL: APP_ORIGIN, INVITATION_TOKEN_SECRET: 'pc31-invitation-secret-at-least-32-bytes',
-      DEVICE_API_KEY_SECRET: 'pc31-device-secret-at-least-32-bytes', IDEMPOTENCY_CACHE_SECRET: 'pc31-idempotency-secret-at-least-32-bytes',
-      OIDC_ISSUER: OIDC_ORIGIN, OIDC_AUTHORIZATION_ENDPOINT: `${OIDC_ORIGIN}/authorize`,
-      OIDC_TOKEN_ENDPOINT: `${OIDC_ORIGIN}/token`, OIDC_JWKS_URI: `${OIDC_ORIGIN}/jwks`,
-      OIDC_CLIENT_ID: CLIENT_ID, OIDC_CLIENT_SECRET: CLIENT_SECRET, OIDC_REDIRECT_URI: `${APP_ORIGIN}/auth/callback`,
-      OIDC_ID_TOKEN_SIGNING_ALG: 'RS256', OIDC_PKCE_KEYS: JSON.stringify({ 1: randomBytes(32).toString('base64url') }),
-      OIDC_PKCE_CURRENT_KEY_VERSION: '1', OIDC_RETURN_TO_PREFIXES: '/,/app,/logout-all/continue',
-      SESSION_CSRF_KEYS: JSON.stringify({ 1: randomBytes(32).toString('base64url') }), SESSION_CSRF_CURRENT_KEY_VERSION: '1',
-      OIDC_RECOVERY_URL: `${OIDC_ORIGIN}/recovery`, RECOVERY_WEBHOOK_ISSUERS: OIDC_ORIGIN,
-      RECOVERY_WEBHOOK_SECRET: 'pc31-recovery-webhook-secret-at-least-32-bytes',
-      HUMAN_MFA_ROLE_POLICY: JSON.stringify({
-        provedor: { amr: ['webauthn'], acr: ['strong'] }, sindico: { amr: ['webauthn'], acr: ['strong'] },
-        morador: { amr: ['otp', 'webauthn'], acr: [] }, portaria: { amr: ['webauthn'], acr: ['strong'] }
-      })
+  const certPath = path.join(tempRoot, 'trusted-cert.pem');
+  const [key, cert, untrustedKey, untrustedCert] = await Promise.all([
+    readFile(path.join(tempRoot, 'trusted-key.pem')), readFile(certPath),
+    readFile(path.join(tempRoot, 'untrusted-key.pem')), readFile(path.join(tempRoot, 'untrusted-cert.pem'))
+  ]);
+  let provider: HttpsServer | undefined;
+  let proxy: HttpsServer | undefined;
+  let untrusted: HttpsServer | undefined;
+  let application: ChildProcess | undefined;
+  let resolveStop: (() => void) | undefined;
+  const stopped = new Promise<void>((resolve) => { resolveStop = resolve; });
+  const requestStop = () => resolveStop?.();
+  process.once('SIGTERM', requestStop);
+  process.once('SIGINT', requestStop);
+  try {
+    const invitationToken = randomBytes(32).toString('base64url');
+    const observedAlerts = new Set<string>();
+    await writeFile(path.join(tempRoot, 'invitation-token'), invitationToken, { mode: 0o600 });
+    await resetDatabase();
+    await seedDatabase(invitationToken);
+    provider = await startOidcProvider(key, cert, observedAlerts);
+    application = spawn(process.execPath, ['--import', 'tsx', 'src/server.ts'], {
+      cwd: process.cwd(), stdio: ['ignore', 'pipe', 'pipe'],
+      env: {
+        ...process.env, NODE_ENV: 'production', NODE_EXTRA_CA_CERTS: certPath, DATABASE_URL,
+        HOST: '127.0.0.1', PORT: '3442', HUMAN_AUTH_ENABLED: 'true', PUBLIC_APPLICATION_ORIGIN: APP_ORIGIN,
+        PUBLIC_VALIDATION_BASE_URL: APP_ORIGIN, INVITATION_TOKEN_SECRET: 'pc31-invitation-secret-at-least-32-bytes',
+        DEVICE_API_KEY_SECRET: 'pc31-device-secret-at-least-32-bytes', IDEMPOTENCY_CACHE_SECRET: 'pc31-idempotency-secret-at-least-32-bytes',
+        OIDC_ISSUER: OIDC_ORIGIN, OIDC_AUTHORIZATION_ENDPOINT: `${OIDC_ORIGIN}/authorize`,
+        OIDC_TOKEN_ENDPOINT: `${OIDC_ORIGIN}/token`, OIDC_JWKS_URI: `${OIDC_ORIGIN}/jwks`,
+        OIDC_CLIENT_ID: CLIENT_ID, OIDC_CLIENT_SECRET: CLIENT_SECRET, OIDC_REDIRECT_URI: `${APP_ORIGIN}/auth/callback`,
+        OIDC_ID_TOKEN_SIGNING_ALG: 'RS256', OIDC_PKCE_KEYS: JSON.stringify({ 1: randomBytes(32).toString('base64url') }),
+        OIDC_PKCE_CURRENT_KEY_VERSION: '1', OIDC_RETURN_TO_PREFIXES: '/,/app,/logout-all/continue',
+        SESSION_CSRF_KEYS: JSON.stringify({ 1: randomBytes(32).toString('base64url') }), SESSION_CSRF_CURRENT_KEY_VERSION: '1',
+        OIDC_RECOVERY_URL: `${OIDC_ORIGIN}/recovery`, RECOVERY_WEBHOOK_ISSUERS: OIDC_ORIGIN,
+        RECOVERY_WEBHOOK_SECRET: 'pc31-recovery-webhook-secret-at-least-32-bytes',
+        HUMAN_MFA_ROLE_POLICY: JSON.stringify({
+          provedor: { amr: ['webauthn'], acr: ['strong'] }, sindico: { amr: ['webauthn'], acr: ['strong'] },
+          morador: { amr: ['otp', 'webauthn'], acr: [] }, portaria: { amr: ['webauthn'], acr: ['strong'] }
+        })
+      }
+    });
+    for (const stream of [application.stdout, application.stderr]) {
+      pipeSanitized(stream, process.stderr, (line) => observeAlert(line, observedAlerts));
+    }
+    application.once('exit', requestStop);
+    await waitForApp(application);
+    proxy = startTlsProxy(key, cert);
+    await once(proxy, 'listening');
+    untrusted = createHttpsServer({ key: untrustedKey, cert: untrustedCert }, (_request, response) => response.end('untrusted'));
+    untrusted.listen(3445, '127.0.0.1');
+    await once(untrusted, 'listening');
+    process.stdout.write('PC31 E2E HTTPS harness ready\n');
+    await stopped;
+  } finally {
+    process.removeListener('SIGTERM', requestStop);
+    process.removeListener('SIGINT', requestStop);
+    await Promise.all([provider, proxy, untrusted].filter((server): server is HttpsServer => Boolean(server)).map(closeServer));
+    if (application) await terminateChild(application);
+  }
+}
+
+async function terminateChild(child: ChildProcess) {
+  if (child.exitCode !== null) return;
+  child.kill('SIGTERM');
+  const exited = new Promise<void>((resolve) => child.once('exit', () => resolve()));
+  const graceful = await Promise.race([exited.then(() => true), new Promise<false>((resolve) => setTimeout(() => resolve(false), 3_000))]);
+  if (!graceful && child.exitCode === null) {
+    child.kill('SIGKILL');
+    await new Promise<void>((resolve) => child.once('exit', () => resolve()));
+  }
+}
+
+function pipeSanitized(input: NodeJS.ReadableStream | null, output: NodeJS.WritableStream, observe?: (line: string) => void) {
+  if (!input) return;
+  let pending = '';
+  input.setEncoding('utf8');
+  input.on('data', (chunk: string) => {
+    pending += chunk;
+    const lines = pending.split('\n');
+    pending = lines.pop() ?? '';
+    for (const line of lines) {
+      observe?.(line);
+      output.write(`${redact(line)}\n`);
     }
   });
-  for (const stream of [application.stdout, application.stderr]) stream?.on('data', (chunk) => process.stderr.write(redact(String(chunk))));
-  await waitForApp(application);
-  const proxy = startTlsProxy(key, cert);
-  await once(proxy, 'listening');
-  process.stdout.write('PC31 E2E HTTPS harness ready\n');
+  input.on('end', () => { if (pending) output.write(redact(pending)); });
+}
 
-  let stopping = false;
-  const stop = async () => {
-    if (stopping) return;
-    stopping = true;
-    application.kill('SIGTERM');
-    await Promise.all([closeServer(proxy), closeServer(provider)]);
-    await rm(tempRoot, { recursive: true, force: true });
-    process.exit(0);
-  };
-  process.on('SIGTERM', () => void stop());
-  process.on('SIGINT', () => void stop());
-  application.once('exit', (code) => { if (!stopping) { process.stderr.write(`Application stopped (${code})\n`); void stop(); } });
+function observeAlert(line: string, alerts: Set<string>) {
+  try {
+    const event = JSON.parse(line) as { event?: unknown; type?: unknown };
+    if (event.event === 'auth_alert' && typeof event.type === 'string' && /^[a-z_]{1,100}$/.test(event.type)) {
+      alerts.add(event.type);
+    }
+  } catch { /* non-JSON application output */ }
 }
 
 main().catch((error) => {

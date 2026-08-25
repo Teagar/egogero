@@ -55,11 +55,16 @@ jobs:
       - name: Browser E2E
         run: npm run test:e2e
 
+      - name: Fail-closed browser artifact scan
+        id: artifact_scan
+        if: always()
+        run: npm run test:e2e:sanitize
+
       - name: Build
         run: npm run build
 
       - name: Upload sanitized browser failures
-        if: failure()
+        if: failure() && steps.artifact_scan.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: pc31-browser-failures

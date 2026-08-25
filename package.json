@@ -12,6 +12,7 @@
     "test": "node --test --test-concurrency=1 --import tsx test/*.test.ts && vitest run --config web/vite.config.ts",
     "test:e2e": "node --import tsx test/e2e/run.ts",
     "test:e2e:install": "playwright install chromium",
+    "test:e2e:sanitize": "node --import tsx test/e2e/sanitize-artifacts.ts",
     "db:migrate:deploy": "prisma migrate deploy",
     "db:generate": "prisma generate",
     "privacy:anonymize": "node dist/src/jobs/anonymize-old-guests.js",
