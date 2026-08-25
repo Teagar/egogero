@@ -1356,7 +1356,7 @@ export function createBrowserSessionAuthenticator(store: BrowserSessionStore, ra
       const ipPrefix = requestIpPrefix(request);
       const hasSession = hasBrowserSessionCookie(request.headers.cookie);
       if (!hasSession) return null;
-      const reservation = await rateLimiter?.reserveFailure('authentication_failure_ip', ipPrefix);
+      const reservation = await rateLimiter?.reserve('authentication_failure_ip', ipPrefix);
       if (reservation && !reservation.allowed) {
         throw new AuthenticationError(429, 'authentication_temporarily_unavailable', {
           'cache-control': 'no-store', 'retry-after': String(reservation.retryAfterSeconds)
@@ -1367,7 +1367,7 @@ export function createBrowserSessionAuthenticator(store: BrowserSessionStore, ra
       const finalize = async (outcome: 'success' | 'failure') => {
         if (reservationId && !reservationFinalized) {
           reservationFinalized = true;
-          await rateLimiter?.finalizeFailure(reservationId, outcome);
+          await rateLimiter?.finalize(reservationId, outcome === 'failure' ? 'consume' : 'release');
         }
       };
       const rejectAuthenticationFailure = async (

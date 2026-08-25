@@ -85,9 +85,9 @@ test('PostgreSQL rollout serializes changes, fails closed, isolates tenants, and
       rolloutGate: service,
       rateLimiter: {
         async check() { return { allowed: true, retryAfterSeconds: 0, repeatedExcess: false }; },
-        async reserveFailure() { return { allowed: true, retryAfterSeconds: 0, repeatedExcess: false,
+        async reserve() { return { allowed: true, retryAfterSeconds: 0, repeatedExcess: false,
           reservationId: randomUUID() }; },
-        async finalizeFailure() {}
+        async finalize() {}
       }
     });
     try {

@@ -498,22 +498,34 @@ must meet a five-second revocation SLO when Redis is later enabled.
 
 ## Rate Limiting and Abuse Controls
 
-Initial distributed counters live in PostgreSQL; the Redis migration may move
-only counters while preserving keys and limits. Limits are evaluated on
-normalized proxy-derived client IP plus action-specific dimensions:
+`AUTH_RATE_LIMIT_POLICIES` in `src/auth-rate-limits.ts` is the normative source
+for limits, dimensions, windows, and behavior. A parity test rejects drift in
+this ADR and the operations document. Initial distributed counters live in
+PostgreSQL; the Redis migration may move only counters while preserving keys
+and limits. Limits are evaluated on normalized proxy-derived IP prefixes plus
+the action-specific dimensions below.
 
-| Action | Limit | Response |
-| --- | --- | --- |
-| Start login | 20 per IP per 5 minutes | `429` with bounded `Retry-After`. |
-| OIDC callback failures | 30 per IP per 10 minutes | Consume transaction; `429` after limit. |
-| Session creation | 10 per account per 15 minutes | Require reauthentication and alert on repeat. |
-| Recovery redirect | 20 per IP per hour | Generic `429`; no account signal. |
-| Invitation acceptance | 10 per IP and 5 per invitation per hour | Exponential backoff, then consume at expiry. |
-| CSRF/authentication failures | 60 per IP per minute | `429`; security event on sustained abuse. |
+<!-- auth-rate-limits:start -->
+| Operation | Dimension | Limit | External behavior |
+| --- | --- | --- | --- |
+| Login initiation | IP prefix | 5 per 10 minutes | Generic 429; bounded Retry-After |
+| Failed OIDC callback | IP prefix | 10 per 15 minutes | Consume state before provider exchange; reserve failure budget |
+| Session creation or rotation | Account | 10 per 15 minutes | Deny; progressive backoff; repeated-excess alert |
+| Recovery initiation | IP prefix | 3 per 30 minutes | Generic 429; no account signal |
+| Reauthentication initiation | Account | 5 per 10 minutes | Generic 429 after authenticated validation |
+| Administrative invitation acceptance | IP prefix | 10 per 1 hour | Generic denial; exponential backoff; repeated-excess alert |
+| Administrative invitation acceptance | Invitation digest | 5 per 1 hour | Generic denial; exponential backoff; repeated-excess alert |
+| Human gate validation | Account | 20 per 1 minute | Generic 429 after authenticated validation |
+| CSRF or authentication failure | IP prefix | 60 per 1 minute | Generic 429 on sustained abuse |
+<!-- auth-rate-limits:end -->
 
 Provider-side brute-force and recovery limits are also mandatory. Application
-limits do not replace them. Counters exclude raw emails, subjects, cookies, and
-API keys. A global emergency limiter protects the callback and session store.
+limits do not replace them. Invitation acceptance reserves both dimensions
+before any OIDC transaction is created and consumes each accepted reservation
+exactly once. Denial, persistence failure, invalidity, expiry, and replay create
+no session. Subjects contain only normalized IP prefixes or invitation digests,
+never raw IP addresses, invitations, emails, subjects, cookies, or API keys.
+A global emergency limiter protects the callback and session store.
 
 ## Audit Events
 

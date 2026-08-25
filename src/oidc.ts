@@ -875,7 +875,7 @@ export async function createOidcService(
     metrics.increment('auth_oidc_callback_total', { outcome: 'failure', reason: reasonClass(reasonCode) });
     if (reasonCode === 'invalid_state') alerts.emit('oidc_replay_or_state_miss', { reason: 'state_miss' });
     if (reasonCode === 'issuer_mixup') alerts.emit('oidc_issuer_mixup', { reason: 'issuer_mismatch' });
-    if (reservationId) await dependencies.rateLimiter?.finalizeFailure(reservationId, 'failure');
+    if (reservationId) await dependencies.rateLimiter?.finalize(reservationId, 'consume');
   }
 
   function reasonClass(reason: string) {
@@ -952,7 +952,7 @@ export async function createOidcService(
     },
 
     async completeCallback({ callbackUrl, requestCorrelationId, ipPrefix = 'unknown' }) {
-      const reservation = await dependencies.rateLimiter?.reserveFailure('callback_failure_ip', ipPrefix);
+      const reservation = await dependencies.rateLimiter?.reserve('callback_failure_ip', ipPrefix);
       if (reservation && !reservation.allowed) throw new AuthRateLimitError(reservation.retryAfterSeconds);
       const reservationId = reservation?.reservationId;
       const states = callbackUrl.searchParams.getAll('state');
@@ -1054,7 +1054,7 @@ export async function createOidcService(
           }
         });
         if (!identity) throw new AuditedOidcCallbackError();
-        if (reservationId) await dependencies.rateLimiter?.finalizeFailure(reservationId, 'success');
+        if (reservationId) await dependencies.rateLimiter?.finalize(reservationId, 'release');
         metrics.increment('auth_oidc_callback_total', { outcome: 'success', reason: 'none' });
         return { returnTo: transaction.returnTo, identity, handoffToken };
       } catch (error) {
@@ -1136,6 +1136,22 @@ export function registerOidcRoutes(
       return reply.status(400).send({ error: 'invalid_request' });
     }
     try {
+      const ipReservation = await rateLimiter?.reserve('invitation_acceptance_ip', requestIpPrefix(request));
+      if (ipReservation && !ipReservation.allowed) {
+        return reply.header('Retry-After', ipReservation.retryAfterSeconds).status(429)
+          .send({ error: 'authentication_temporarily_unavailable' });
+      }
+      const invitationDigest = digestSecret(body.token);
+      const invitationReservation = await rateLimiter?.reserve(
+        'invitation_acceptance_digest', invitationDigest.toString('hex')
+      );
+      if (invitationReservation && !invitationReservation.allowed) {
+        if (ipReservation?.reservationId) await rateLimiter?.finalize(ipReservation.reservationId, 'consume');
+        return reply.header('Retry-After', invitationReservation.retryAfterSeconds).status(429)
+          .send({ error: 'authentication_temporarily_unavailable' });
+      }
+      if (ipReservation?.reservationId) await rateLimiter?.finalize(ipReservation.reservationId, 'consume');
+      if (invitationReservation?.reservationId) await rateLimiter?.finalize(invitationReservation.reservationId, 'consume');
       const authorizationUrl = await service.startLogin({ invitationToken: body.token,
         returnTo: body.returnTo as string | undefined, requestCorrelationId: request.id });
       return { navigateTo: authorizationUrl.toString() };
