@@ -30,6 +30,7 @@ export async function startServer(environment: NodeJS.ProcessEnv = process.env) 
     env.invitationTokenSecret,
     { idempotencySecret: env.idempotencyCacheSecret, idempotencyTtlMs: env.idempotencyTtlMs }
   );
+  await deviceStore.verifyConfiguration();
   await invitationStore.verifyIdempotencyConfiguration!();
   const deviceAuthenticator = createDeviceAuthenticator(deviceStore);
   const developmentAuthenticator = env.localDevelopmentAuth
@@ -64,6 +65,10 @@ export async function startServer(environment: NodeJS.ProcessEnv = process.env) 
   const browserSessionService = browserSessionStore
     ? createBrowserSessionService(browserSessionStore)
     : undefined;
+  const humanServicesComposed = !env.humanAuthEnabled || Boolean(
+    oidcService && browserSessionService && browserSessionStore && humanAdministrationService && authRateLimiter
+  );
+  if (!humanServicesComposed) throw new Error('Human authentication services are incomplete');
   const authenticator = browserSessionStore
     ? createCredentialRouter(browserSessionStore, deviceAuthenticator, developmentAuthenticator, authRateLimiter)
     : developmentAuthenticator
@@ -84,7 +89,16 @@ export async function startServer(environment: NodeJS.ProcessEnv = process.env) 
     humanAdministrationService,
     humanAuthRolloutService,
     authRateLimiter,
-    frontendRoot: path.resolve(process.cwd(), 'web/dist')
+    frontendRoot: path.resolve(process.cwd(), 'web/dist'),
+    readiness: {
+      deviceSecretValidated: true,
+      humanAuthEnabled: env.humanAuthEnabled,
+      oidcMetadataValidated: !env.humanAuthEnabled || Boolean(oidcService),
+      requiredServicesComposed: humanServicesComposed,
+      async checkDatabase() {
+        await prisma.$queryRaw`SELECT 1`;
+      }
+    }
   });
   registerAuthTelemetryLifecycle(app, authTelemetry);
 
@@ -95,8 +109,8 @@ export async function startServer(environment: NodeJS.ProcessEnv = process.env) 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   try {
     await startServer();
-  } catch (error) {
-    console.error(error);
+  } catch {
+    console.error('Startup failed');
     process.exitCode = 1;
   }
 }

@@ -28,6 +28,11 @@ export interface DeviceStore {
   list(args: { condominiumId: string }): Promise<readonly DeviceRecord[]>;
   revoke(args: { id: string; condominiumId: string }): Promise<'revoked' | 'already-revoked' | 'unavailable'>;
   authenticate(apiKey: string, now: Date): Promise<{ id: string; condominiumId: string } | null>;
+  verifyConfiguration?(): Promise<void>;
+}
+
+export interface DeviceSecretConfiguration {
+  verifyConfiguration(): Promise<void>;
 }
 
 export type RateLimitResult =
@@ -53,7 +58,10 @@ function isDigestCollision(error: unknown) {
   return String(error.meta?.target).toLowerCase().includes('apikeydigest');
 }
 
-export function createPrismaDeviceStore(client: PrismaClient, secret: string): DeviceStore {
+export function createPrismaDeviceStore(
+  client: PrismaClient,
+  secret: string
+): DeviceStore & DeviceSecretConfiguration {
   if (Buffer.byteLength(secret) < 32) throw new Error('Device API key secret must be at least 32 bytes');
   const digestKey = (key: string) => createHmac('sha256', secret).update('device-api-key\0').update(key).digest('hex');
   const fingerprint = createHash('sha256').update('device-api-key\0').update(secret).digest('hex');
@@ -71,6 +79,10 @@ export function createPrismaDeviceStore(client: PrismaClient, secret: string): D
   }
 
   return {
+    async verifyConfiguration() {
+      await client.$transaction((transaction) => verifySecret(transaction));
+    },
+
     async create({ condominiumId, name }) {
       for (let attempt = 0; attempt < MAX_KEY_ATTEMPTS; attempt += 1) {
         const apiKey = generateDeviceApiKey();

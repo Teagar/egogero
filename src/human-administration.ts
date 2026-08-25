@@ -72,16 +72,22 @@ function parseMfaPolicy(value: string): RoleMfaPolicy {
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
     throw new Error('HUMAN_MFA_ROLE_POLICY must define every role');
   }
+  const roles = ['provedor', 'sindico', 'morador', 'portaria'] as const;
+  if (Object.keys(parsed).length !== roles.length || Object.keys(parsed).some((role) => !roles.includes(role as Role))) {
+    throw new Error('HUMAN_MFA_ROLE_POLICY must define exactly every role');
+  }
   const result = {} as Record<Role, { amr: string[]; acr: string[] }>;
-  for (const role of ['provedor', 'sindico', 'morador', 'portaria'] as const) {
+  for (const role of roles) {
     const entry = (parsed as Record<string, unknown>)[role];
     if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
       throw new Error('HUMAN_MFA_ROLE_POLICY must define every role');
     }
     const amr = (entry as Record<string, unknown>).amr;
     const acr = (entry as Record<string, unknown>).acr;
-    if (!Array.isArray(amr) || amr.length === 0 || !amr.every((item) => typeof item === 'string' && item.length > 0)
-      || !Array.isArray(acr) || !acr.every((item) => typeof item === 'string' && item.length > 0)) {
+    if (!Array.isArray(amr) || amr.length === 0 || amr.length > 16
+      || !amr.every((item) => typeof item === 'string' && item.length > 0 && item.length <= 100)
+      || !Array.isArray(acr) || acr.length > 16
+      || !acr.every((item) => typeof item === 'string' && item.length > 0 && item.length <= 255)) {
       throw new Error('HUMAN_MFA_ROLE_POLICY entries require non-empty amr and valid acr arrays');
     }
     const phishingResistant = new Set(['webauthn', 'fido', 'fido2', 'hwk']);
@@ -112,7 +118,10 @@ export function humanAdministrationConfigFromEnvironment(
   }
   const rawSecret = required(environment, 'RECOVERY_WEBHOOK_SECRET');
   const recoveryWebhookSecret = Buffer.from(rawSecret, 'utf8');
-  if (recoveryWebhookSecret.length < 32) throw new Error('RECOVERY_WEBHOOK_SECRET must be at least 32 bytes');
+  if (recoveryWebhookSecret.length < 32 || new Set(rawSecret).size < 12
+    || /(change[-_ ]?me|placeholder|example|secret){2,}/i.test(rawSecret)) {
+    throw new Error('RECOVERY_WEBHOOK_SECRET must be at least 32 bytes and have adequate entropy');
+  }
   return {
     publicApplicationOrigin: new URL(origin).origin,
     recoveryUrl,
@@ -130,6 +139,27 @@ export function evidenceSatisfiesRole(policy: RoleMfaPolicy, role: Role, evidenc
   const contextAccepted = requirement.acr.length === 0
     || (evidence.acr !== null && requirement.acr.includes(evidence.acr));
   return methodAccepted && contextAccepted;
+}
+
+export function verifyRecoveryWebhookSignature(
+  config: Pick<HumanAdministrationConfig, 'recoveryWebhookIssuers' | 'recoveryWebhookSecret'>,
+  input: { eventId: string; issuer: string; subject: string; timestamp: number; signature: string },
+  now = Date.now()
+) {
+  const canonical = canonicalRecoveryWebhookEvent(input);
+  const supplied = /^[a-f0-9]{64}$/i.test(input.signature) ? Buffer.from(input.signature, 'hex') : Buffer.alloc(0);
+  const expected = createHmac('sha256', config.recoveryWebhookSecret).update(canonical).digest();
+  const valid = supplied.length === expected.length && timingSafeEqual(supplied, expected)
+    && Number.isSafeInteger(input.timestamp) && Math.abs(now - input.timestamp * 1000) <= WEBHOOK_CLOCK_SKEW_MS
+    && input.eventId.length > 0 && input.eventId.length <= 255 && input.subject.length > 0 && input.subject.length <= 255
+    && config.recoveryWebhookIssuers.has(input.issuer);
+  expected.fill(0);
+  supplied.fill(0);
+  return valid;
+}
+
+function canonicalRecoveryWebhookEvent(input: { timestamp: number; eventId: string; issuer: string; subject: string }) {
+  return `${input.timestamp}.${input.eventId}.${input.issuer}.${input.subject}`;
 }
 
 async function insertAudit(transaction: Prisma.TransactionClient, input: AuditInput) {
@@ -286,21 +316,14 @@ export function createHumanAdministrationService(client: PrismaClient, config: H
     },
 
     async processRecoveryWebhook(input: { eventId: string; issuer: string; subject: string; timestamp: number; signature: string; requestCorrelationId: string }) {
-      const canonical = `${input.timestamp}.${input.eventId}.${input.issuer}.${input.subject}`;
-      const supplied = /^[a-f0-9]{64}$/i.test(input.signature) ? Buffer.from(input.signature, 'hex') : Buffer.alloc(0);
-      const expected = createHmac('sha256', config.recoveryWebhookSecret).update(canonical).digest();
-      const valid = supplied.length === expected.length && timingSafeEqual(supplied, expected)
-        && Number.isSafeInteger(input.timestamp) && Math.abs(Date.now() - input.timestamp * 1000) <= WEBHOOK_CLOCK_SKEW_MS
-        && input.eventId.length > 0 && input.eventId.length <= 255 && input.subject.length > 0 && input.subject.length <= 255
-        && config.recoveryWebhookIssuers.has(input.issuer);
-      expected.fill(0); supplied.fill(0);
+      const valid = verifyRecoveryWebhookSignature(config, input);
       if (!valid) {
         await client.$transaction((transaction) => insertAudit(transaction, { eventType: 'recovery_webhook_denied', outcome: 'denied',
           actorType: 'anonymous', requestCorrelationId: input.requestCorrelationId, reasonCode: 'invalid_webhook' }));
         return false;
       }
       return client.$transaction(async (transaction) => {
-        const eventDigest = digestSecret(canonical);
+        const eventDigest = digestSecret(canonicalRecoveryWebhookEvent(input));
         const inserted = await transaction.$queryRaw<Array<{ id: string }>>(Prisma.sql`
           INSERT INTO "RecoveryWebhookEvent" (id, "eventId", "eventDigest", issuer, subject, "processedAt")
           VALUES (${randomUUID()}::uuid, ${input.eventId}, ${eventDigest}, ${input.issuer}, ${input.subject}, clock_timestamp())

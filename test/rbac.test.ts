@@ -660,6 +660,7 @@ test('route inventory keeps every business route in the RBAC matrix', async () =
     app.printRoutes({ commonPrefix: false }),
     [
       '├── /health (GET, HEAD)',
+      '├── /ready (GET, HEAD)',
       '├── /condominios (POST, GET, HEAD)',
       '│   └── /:id|:condominioId (GET, HEAD, PATCH, DELETE)',
       '│       ├── /limite-diario-convites (PATCH)',

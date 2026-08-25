@@ -20,6 +20,7 @@ import { noopAuthAlerts, noopAuthMetrics, safeAuthAlerts, safeAuthMetrics } from
 import type { AuthAlertSink, AuthMetrics } from './auth-observability.js';
 import { requestIpPrefix } from './client-ip.js';
 import type { HumanAuthRolloutGate } from './human-auth-rollout.js';
+import { validateDecodedEncryptionKey } from './secret-material.js';
 
 export type { HumanSessionIdentity } from './auth.js';
 
@@ -217,6 +218,10 @@ function parseCsrfKeys(environment: NodeJS.ProcessEnv) {
     if (key.length !== 32 || key.toString('base64url') !== rawKey || keys.has(version)) {
       throw new Error('SESSION_CSRF_KEYS contains an invalid version or key');
     }
+    validateDecodedEncryptionKey(key, 'SESSION_CSRF_KEYS');
+    if ([...keys.values()].some((existing) => existing.equals(key))) {
+      throw new Error('SESSION_CSRF_KEYS must not reuse key bytes across versions');
+    }
     keys.set(version, key);
   }
   if (keys.size === 0) throw new Error('SESSION_CSRF_KEYS must contain at least one active key');
@@ -233,6 +238,10 @@ export function sessionConfigFromEnvironment(environment: NodeJS.ProcessEnv): Se
   if (!Number.isSafeInteger(currentCsrfKeyVersion) || rawCurrentVersion !== String(currentCsrfKeyVersion)
     || !csrfKeys.has(currentCsrfKeyVersion)) {
     throw new Error('SESSION_CSRF_CURRENT_KEY_VERSION must identify an active key');
+  }
+  const allowedVersions = new Set([currentCsrfKeyVersion, ...(currentCsrfKeyVersion > 1 ? [currentCsrfKeyVersion - 1] : [])]);
+  if (csrfKeys.size > 2 || [...csrfKeys.keys()].some((version) => !allowedVersions.has(version))) {
+    throw new Error('SESSION_CSRF_KEYS may contain only the current and immediately previous key versions');
   }
   const rawOrigin = requireEnvironment(environment, 'PUBLIC_APPLICATION_ORIGIN');
   let origin: URL;

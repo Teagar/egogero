@@ -26,6 +26,7 @@ import { noopAuthAlerts, noopAuthMetrics, safeAuthAlerts, safeAuthMetrics } from
 import type { AuthAlertSink, AuthMetrics } from './auth-observability.js';
 import { requestIpPrefix } from './client-ip.js';
 import type { HumanAuthRolloutGate } from './human-auth-rollout.js';
+import { validateDecodedEncryptionKey } from './secret-material.js';
 
 const LOGIN_TRANSACTION_TTL_MS = 10 * 60 * 1000;
 const OIDC_CLOCK_TOLERANCE_SECONDS = 60;
@@ -226,17 +227,34 @@ function parsePkceKeys(environment: NodeJS.ProcessEnv) {
   const keys = new Map<number, Buffer>();
   for (const [rawVersion, rawKey] of Object.entries(parsed)) {
     const version = Number(rawVersion);
-    if (!Number.isSafeInteger(version) || version <= 0 || typeof rawKey !== 'string' || !/^[A-Za-z0-9_-]+$/.test(rawKey)) {
+    if (!Number.isSafeInteger(version) || version <= 0 || rawVersion !== String(version)
+      || typeof rawKey !== 'string' || !/^[A-Za-z0-9_-]+$/.test(rawKey)) {
       throw new Error('OIDC_PKCE_KEYS contains an invalid version or key');
     }
     const key = Buffer.from(rawKey, 'base64url');
     if (key.length !== 32 || key.toString('base64url') !== rawKey || keys.has(version)) {
       throw new Error('OIDC_PKCE_KEYS contains an invalid version or key');
     }
+    validateDecodedEncryptionKey(key, 'OIDC_PKCE_KEYS');
+    if ([...keys.values()].some((existing) => existing.equals(key))) {
+      throw new Error('OIDC_PKCE_KEYS must not reuse key bytes across versions');
+    }
     keys.set(version, key);
   }
   if (keys.size === 0) throw new Error('OIDC_PKCE_KEYS must contain at least one active key');
   return keys;
+}
+
+function validateKeyOverlap(keys: ReadonlyMap<number, Buffer>, currentVersion: number, name: string) {
+  const expected = new Set([currentVersion, ...(currentVersion > 1 ? [currentVersion - 1] : [])]);
+  if (keys.size > 2 || [...keys.keys()].some((version) => !expected.has(version))) {
+    throw new Error(`${name} may contain only the current and immediately previous key versions`);
+  }
+}
+
+function hasAdequateSecretStrength(value: string) {
+  return Buffer.byteLength(value) >= 32 && new Set(value).size >= 12
+    && !/(change[-_ ]?me|placeholder|example|secret){2,}/i.test(value);
 }
 
 export function oidcConfigFromEnvironment(environment: NodeJS.ProcessEnv): OidcRuntimeConfig | undefined {
@@ -266,7 +284,9 @@ export function oidcConfigFromEnvironment(environment: NodeJS.ProcessEnv): OidcR
   const clientId = requireEnvironment(environment, 'OIDC_CLIENT_ID');
   if (clientId.length > 255) throw new Error('OIDC_CLIENT_ID is invalid');
   const clientSecret = requireEnvironment(environment, 'OIDC_CLIENT_SECRET');
-  if (Buffer.byteLength(clientSecret) < 32) throw new Error('OIDC_CLIENT_SECRET must be at least 32 bytes');
+  if (!hasAdequateSecretStrength(clientSecret)) {
+    throw new Error('OIDC_CLIENT_SECRET must be at least 32 bytes and have adequate entropy');
+  }
 
   const idTokenSigningAlgorithm = requireEnvironment(environment, 'OIDC_ID_TOKEN_SIGNING_ALG');
   if (!SAFE_ID_TOKEN_ALGORITHMS.has(idTokenSigningAlgorithm)) {
@@ -278,6 +298,7 @@ export function oidcConfigFromEnvironment(environment: NodeJS.ProcessEnv): OidcR
   if (!Number.isSafeInteger(currentPkceKeyVersion) || !pkceKeys.has(currentPkceKeyVersion)) {
     throw new Error('OIDC_PKCE_CURRENT_KEY_VERSION must identify an active key');
   }
+  validateKeyOverlap(pkceKeys, currentPkceKeyVersion, 'OIDC_PKCE_KEYS');
 
   const rawPrefixes = environment.OIDC_RETURN_TO_PREFIXES?.split(',').map((value) => value.trim()) ?? ['/'];
   if (

@@ -20,7 +20,7 @@ function digest(value: string) {
 }
 
 test(
-  'PostgreSQL sessions consume handoffs once, map live roles, rotate atomically, and revoke without persisting secrets',
+  'rotation rehearsal persists CSRF material, overlaps, retires, replaces compromise, and preserves sessions',
   { skip: !runDatabaseTests },
   async () => {
     const prisma = new PrismaClient();
@@ -229,6 +229,18 @@ test(
         }
       });
 
+      const retirementCandidate = await issue(await createHandoff(undefined, otherAccountId, otherExternalIdentityId));
+      assert.ok(retirementCandidate);
+      const retiredKeyStore = createPrismaBrowserSessionStore(prisma, {
+        currentCsrfKeyVersion: 2,
+        csrfKeys: new Map([[2, nextCsrfKey]]),
+        publicApplicationOrigin: 'https://app.example.test'
+      }, { rateLimiter: permissiveRateLimiter, rolloutGate: TEST_ONLY_ALLOW_ALL_HUMAN_AUTH_ROLLOUT });
+      assert.equal(await retiredKeyStore.inspect({
+        sessionToken: retirementCandidate.sessionToken,
+        requestCorrelationId: 'csrf-retired-key'
+      }), null);
+
       const rotatedKeyStore = createPrismaBrowserSessionStore(prisma, {
         currentCsrfKeyVersion: 2,
         csrfKeys: new Map([[1, csrfKey], [2, nextCsrfKey]]),
@@ -250,6 +262,28 @@ test(
         2,
         'an old process must not downgrade a newer row'
       );
+      assert.equal((await rotatedKeyStore.inspect({
+        sessionToken: retirementCandidate.sessionToken,
+        requestCorrelationId: 'csrf-overlap-read'
+      }))?.csrfToken, retirementCandidate.csrfToken);
+
+      const replacementCsrfKey = randomBytes(32);
+      const replacementKeyStore = createPrismaBrowserSessionStore(prisma, {
+        currentCsrfKeyVersion: 3,
+        csrfKeys: new Map([[3, replacementCsrfKey]]),
+        publicApplicationOrigin: 'https://app.example.test'
+      }, { rateLimiter: permissiveRateLimiter, rolloutGate: TEST_ONLY_ALLOW_ALL_HUMAN_AUTH_ROLLOUT });
+      assert.equal(await replacementKeyStore.inspect({
+        sessionToken: first.sessionToken,
+        requestCorrelationId: 'csrf-compromised-key-removed'
+      }), null);
+      const replacementSession = await issue(
+        await createHandoff(undefined, otherAccountId, otherExternalIdentityId), undefined, replacementKeyStore
+      );
+      assert.ok(replacementSession);
+      assert.equal((await prisma.browserSession.findUniqueOrThrow({
+        where: { id: replacementSession.identity.sessionId }
+      })).csrfKeyVersion, 3);
 
       assert.deepEqual(await store.authenticate(first.sessionToken, 'authenticate-provider'), first.identity);
       const otherSession = await issue(await createHandoff(undefined, otherAccountId, otherExternalIdentityId));

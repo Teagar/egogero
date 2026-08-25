@@ -18,6 +18,10 @@ function fingerprint(value: string) {
   return createHash('sha256').update(value).digest('hex');
 }
 
+function deviceFingerprint(value: string) {
+  return createHash('sha256').update('device-api-key\0').update(value).digest('hex');
+}
+
 async function reservePort() {
   const server = createServer();
   server.listen(0, '127.0.0.1');
@@ -48,6 +52,7 @@ async function startRuntime(
       IDEMPOTENCY_CACHE_SECRET,
       HOST: '127.0.0.1',
       LOCAL_DEVELOPMENT_AUTH: localDevelopmentAuth ? 'true' : '',
+      HUMAN_AUTH_ENABLED: 'false',
       NODE_ENV: nodeEnvironment,
       PORT: String(port)
     },
@@ -130,7 +135,7 @@ test('NODE_ENV alone never enables development header authentication', { skip: !
 });
 
 test('explicit local development mode starts with scoped header authentication', { skip: !runDatabaseTests }, async () => {
-  const runtime = await startRuntime('production', true);
+  const runtime = await startRuntime('development', true);
 
   try {
     const response = await fetch(`${runtime.url}/condominios`, {
@@ -205,7 +210,7 @@ test('startup fails before listen on an idempotency fingerprint mismatch', { ski
       create: { name: 'idempotency-cache-v1', fingerprint: '0'.repeat(64) },
       update: { fingerprint: '0'.repeat(64) }
     });
-    await assert.rejects(startRuntime('production', false), /does not match database configuration/);
+    await assert.rejects(startRuntime('production', false), /Server exited during startup: Startup failed/);
   } finally {
     await prisma.securityKey.update({
       where: { name: 'idempotency-cache-v1' },
@@ -215,10 +220,29 @@ test('startup fails before listen on an idempotency fingerprint mismatch', { ski
   }
 });
 
+test('startup and cached readiness fail closed on a device secret fingerprint mismatch', { skip: !runDatabaseTests }, async () => {
+  const prisma = new PrismaClient();
+  try {
+    await prisma.securityKey.upsert({
+      where: { name: 'device-api-key' },
+      create: { name: 'device-api-key', fingerprint: '0'.repeat(64) },
+      update: { fingerprint: '0'.repeat(64) }
+    });
+    await assert.rejects(startRuntime('production', false), /Server exited during startup: Startup failed/);
+  } finally {
+    await prisma.securityKey.upsert({
+      where: { name: 'device-api-key' },
+      create: { name: 'device-api-key', fingerprint: deviceFingerprint(DEVICE_API_KEY_SECRET) },
+      update: { fingerprint: deviceFingerprint(DEVICE_API_KEY_SECRET) }
+    });
+    await prisma.$disconnect();
+  }
+});
+
 test('startup fails before listen when PostgreSQL is unavailable', async () => {
   await assert.rejects(
     startRuntime('production', false, 'postgresql://unused:unused@127.0.0.1:1/unused'),
-    /Can't reach database server|connect ECONNREFUSED/
+    /Server exited during startup: Startup failed/
   );
 });
 
@@ -271,5 +295,5 @@ test('bootstrap configuration failures exit cleanly through the startup handler'
   const [code] = (await once(child, 'exit')) as [number, NodeJS.Signals | null];
 
   assert.equal(code, 1);
-  assert.match(stderr, /PORT must be a positive integer/);
+  assert.equal(stderr.trim(), 'Startup failed');
 });
