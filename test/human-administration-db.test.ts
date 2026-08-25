@@ -8,6 +8,7 @@ import { Client } from 'pg';
 import { createHumanAdministrationService } from '../src/human-administration.js';
 import { createPrismaOidcLoginStore } from '../src/oidc.js';
 import { createPrismaBrowserSessionStore, generateSessionToken } from '../src/sessions.js';
+import { TEST_ONLY_ALLOW_ALL_HUMAN_AUTH_ROLLOUT } from '../src/human-auth-rollout.js';
 
 const run = process.env.RUN_DATABASE_TESTS === 'true' && Boolean(process.env.DATABASE_URL);
 const issuer = 'https://identity.example.test';
@@ -22,7 +23,7 @@ test('PostgreSQL invitation binding is one-time, email-exact, concurrent, tenant
     publicApplicationOrigin: 'https://app.example.test', recoveryUrl: `${issuer}/recovery`,
     recoveryWebhookIssuers: new Set([issuer]), recoveryWebhookSecret: randomBytes(32), mfaPolicy: policy
   });
-  const oidc = createPrismaOidcLoginStore(prisma);
+  const oidc = createPrismaOidcLoginStore(prisma, TEST_ONLY_ALLOW_ALL_HUMAN_AUTH_ROLLOUT);
   const providerId = randomUUID();
   const condominiumId = randomUUID();
   const actor = { principalType: 'human', authMethod: 'oidc-session', id: providerId, accountId: providerId,
@@ -198,7 +199,7 @@ test('concurrent condominium disable waits for session issue and revokes the ins
   const store = createPrismaBrowserSessionStore(issuePrisma, {
     currentCsrfKeyVersion: 1, csrfKeys: new Map([[1, randomBytes(32)]]),
     publicApplicationOrigin: 'https://app.example.test', mfaPolicy: policy
-  });
+  }, { rolloutGate: TEST_ONLY_ALLOW_ALL_HUMAN_AUTH_ROLLOUT });
   const accountId = randomUUID();
   const identityId = randomUUID();
   const condominiumId = randomUUID();
@@ -287,7 +288,7 @@ test('MFA evidence fails closed and trusted reauthentication is required before 
   const store = createPrismaBrowserSessionStore(prisma, {
     currentCsrfKeyVersion: 1, csrfKeys: new Map([[1, randomBytes(32)]]),
     publicApplicationOrigin: 'https://app.example.test', mfaPolicy: policy
-  });
+  }, { rolloutGate: TEST_ONLY_ALLOW_ALL_HUMAN_AUTH_ROLLOUT });
   const accountId = randomUUID();
   const externalIdentityId = randomUUID();
   const condominiumId = randomUUID();

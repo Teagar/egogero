@@ -20,6 +20,7 @@ import {
 import { createHumanAdministrationService } from './human-administration.js';
 import { createPrismaAuthRateLimiter } from './auth-rate-limits.js';
 import { createStructuredAuthTelemetry, registerAuthTelemetryLifecycle } from './auth-observability.js';
+import { createHumanAuthRolloutService } from './human-auth-rollout.js';
 
 export async function startServer(environment: NodeJS.ProcessEnv = process.env) {
   const env = getEnv(environment);
@@ -39,11 +40,15 @@ export async function startServer(environment: NodeJS.ProcessEnv = process.env) 
     : createUnavailableNotificationSender();
   const authTelemetry = createStructuredAuthTelemetry();
   const authRateLimiter = createPrismaAuthRateLimiter(prisma, authTelemetry.metrics, authTelemetry.alerts);
+  const humanAuthRolloutService = env.oidc || env.sessions
+    ? createHumanAuthRolloutService(prisma)
+    : undefined;
   const oidcService = env.oidc
-    ? await createOidcService(env.oidc, createPrismaOidcLoginStore(prisma), fetch, {
+    ? await createOidcService(env.oidc, createPrismaOidcLoginStore(prisma, humanAuthRolloutService!), fetch, {
         rateLimiter: authRateLimiter,
         metrics: authTelemetry.metrics,
-        alerts: authTelemetry.alerts
+        alerts: authTelemetry.alerts,
+        rolloutGate: humanAuthRolloutService!
       })
     : undefined;
   const humanAdministrationService = env.humanAdministration
@@ -53,7 +58,8 @@ export async function startServer(environment: NodeJS.ProcessEnv = process.env) 
     ? createPrismaBrowserSessionStore(prisma, {
         ...env.sessions,
         mfaPolicy: env.humanAdministration?.mfaPolicy
-      }, { rateLimiter: authRateLimiter, metrics: authTelemetry.metrics, alerts: authTelemetry.alerts })
+      }, { rateLimiter: authRateLimiter, metrics: authTelemetry.metrics, alerts: authTelemetry.alerts,
+        rolloutGate: humanAuthRolloutService! })
     : undefined;
   const browserSessionService = browserSessionStore
     ? createBrowserSessionService(browserSessionStore)
@@ -76,6 +82,7 @@ export async function startServer(environment: NodeJS.ProcessEnv = process.env) 
     browserSessionService,
     browserSessionStore,
     humanAdministrationService,
+    humanAuthRolloutService,
     authRateLimiter,
     frontendRoot: path.resolve(process.cwd(), 'web/dist')
   });

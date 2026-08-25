@@ -167,12 +167,14 @@ test('GET /auth/session shares its exact failure threshold across application in
   const firstApp = createApp({
     browserSessionStore: store,
     browserSessionService: createBrowserSessionService(store),
-    authRateLimiter: createPrismaAuthRateLimiter(firstClient)
+    authRateLimiter: createPrismaAuthRateLimiter(firstClient),
+    testOnlyBypassHumanAuthRollout: true
   });
   const secondApp = createApp({
     browserSessionStore: store,
     browserSessionService: createBrowserSessionService(store),
-    authRateLimiter: createPrismaAuthRateLimiter(secondClient)
+    authRateLimiter: createPrismaAuthRateLimiter(secondClient),
+    testOnlyBypassHumanAuthRollout: true
   });
   try {
     await firstClient.authenticationRateLimit.deleteMany({

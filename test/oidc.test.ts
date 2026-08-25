@@ -7,7 +7,7 @@ import { PrismaClient } from '@prisma/client';
 
 import { createApp } from '../src/app.js';
 import {
-  createOidcService,
+  createOidcService as createProductionOidcService,
   OidcCallbackError,
   oidcConfigFromEnvironment
 } from '../src/oidc.js';
@@ -18,6 +18,7 @@ import { createAuthTestCollectors } from '../src/auth-observability.js';
 import { AuthRateLimitError } from '../src/oidc.js';
 import type { AuthRateLimiter } from '../src/auth-rate-limits.js';
 import { createPrismaAuthRateLimiter } from '../src/auth-rate-limits.js';
+import { TEST_ONLY_ALLOW_ALL_HUMAN_AUTH_ROLLOUT } from '../src/human-auth-rollout.js';
 
 type StoredTransaction = Parameters<OidcLoginStore['createTransaction']>[0] & { createdAt: Date; consumed: boolean };
 const runDatabaseTests = process.env.RUN_DATABASE_TESTS === 'true' && Boolean(process.env.DATABASE_URL);
@@ -27,6 +28,18 @@ const permissiveAuthRateLimiter = {
   async reserveFailure() { return { allowed: true, retryAfterSeconds: 0, repeatedExcess: false, reservationId: randomUUID() }; },
   async finalizeFailure() {}
 } satisfies AuthRateLimiter;
+
+function createOidcService(
+  config: Parameters<typeof createProductionOidcService>[0],
+  store: Parameters<typeof createProductionOidcService>[1],
+  fetchImplementation: Parameters<typeof createProductionOidcService>[2],
+  dependencies: Omit<Parameters<typeof createProductionOidcService>[3], 'rolloutGate'> = {}
+) {
+  return createProductionOidcService(config, store, fetchImplementation, {
+    ...dependencies,
+    rolloutGate: TEST_ONLY_ALLOW_ALL_HUMAN_AUTH_ROLLOUT
+  });
+}
 
 function configuration(overrides: Partial<OidcRuntimeConfig> = {}): OidcRuntimeConfig {
   const keyOne = Buffer.alloc(32, 1);
@@ -283,7 +296,8 @@ test('OIDC login stores only digests and AEAD material, validates a callback onc
   assert.equal('nonce' in stored, false);
   assert.equal('pkceVerifier' in stored, false);
 
-  const app = createApp({ oidcService: service, authRateLimiter: permissiveAuthRateLimiter });
+  const app = createApp({ oidcService: service, authRateLimiter: permissiveAuthRateLimiter,
+    testOnlyBypassHumanAuthRollout: true });
   const successful = await app.inject({
     method: 'GET',
     url: `/auth/callback?code=authorization-code-canary&state=${encodeURIComponent(authorization.searchParams.get('state')!)}`
@@ -707,6 +721,7 @@ test('OIDC callback converts its one-time handoff into the final browser session
     oidcService,
     browserSessionService: createBrowserSessionService(sessionStore),
     browserSessionStore: sessionStore,
+    testOnlyBypassHumanAuthRollout: true,
     authRateLimiter: permissiveAuthRateLimiter
   });
   const ambiguous = await app.inject({

@@ -30,6 +30,8 @@ import { prisma as defaultPrisma } from './lib/prisma.js';
 import { isDatabaseTimeZoneRejection, isValidTimeZone } from './timezones.js';
 import type { AuthRateLimiter } from './auth-rate-limits.js';
 import { registerFrontend } from './frontend.js';
+import { registerHumanAuthRolloutRoutes } from './human-auth-rollout.js';
+import type { HumanAuthRolloutService } from './human-auth-rollout.js';
 
 type CondominioRecord = {
   id: string;
@@ -439,6 +441,8 @@ export function createApp(
     browserSessionService,
     browserSessionStore,
     humanAdministrationService,
+    humanAuthRolloutService,
+    testOnlyBypassHumanAuthRollout = false,
     authRateLimiter,
     frontendRoot
   }: {
@@ -460,12 +464,18 @@ export function createApp(
     browserSessionService?: BrowserSessionService;
     browserSessionStore?: BrowserSessionStore;
     humanAdministrationService?: HumanAdministrationService;
+    humanAuthRolloutService?: HumanAuthRolloutService;
+    testOnlyBypassHumanAuthRollout?: boolean;
     authRateLimiter?: AuthRateLimiter;
     frontendRoot?: string;
   } = {}
 ) {
   if (!authRateLimiter && (oidcService || browserSessionService || browserSessionStore || humanAdministrationService)) {
     throw new Error('Human authentication routes require an AuthRateLimiter');
+  }
+  if ((oidcService || browserSessionService || browserSessionStore)
+    && !humanAuthRolloutService && !testOnlyBypassHumanAuthRollout) {
+    throw new Error('Human OIDC and session components require a HumanAuthRolloutService');
   }
   const db: AppDependencies = suppliedDb ?? {
     ...defaultStore,
@@ -799,6 +809,7 @@ export function createApp(
   );
   registerBrowserAuthRoutes(app, browserSessionStore, browserSessionService, oidcService, authRateLimiter);
   registerHumanAdministrationRoutes(app, authenticator, humanAdministrationService);
+  registerHumanAuthRolloutRoutes(app, authenticator, humanAuthRolloutService);
 
   return app;
 }

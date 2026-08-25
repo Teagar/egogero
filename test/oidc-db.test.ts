@@ -6,6 +6,7 @@ import { PrismaClient } from '@prisma/client';
 
 import { createPrismaOidcLoginStore } from '../src/oidc.js';
 import type { OidcLoginStore } from '../src/oidc.js';
+import { TEST_ONLY_ALLOW_ALL_HUMAN_AUTH_ROLLOUT } from '../src/human-auth-rollout.js';
 
 const runDatabaseTests = process.env.RUN_DATABASE_TESTS === 'true';
 
@@ -14,7 +15,7 @@ test(
   { skip: !runDatabaseTests },
   async () => {
     const prisma = new PrismaClient();
-    const store = createPrismaOidcLoginStore(prisma);
+    const store = createPrismaOidcLoginStore(prisma, TEST_ONLY_ALLOW_ALL_HUMAN_AUTH_ROLLOUT);
     const accountId = randomUUID();
     const externalIdentityId = randomUUID();
     const transactionId = randomUUID();

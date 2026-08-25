@@ -25,6 +25,7 @@ import type { AuthRateLimiter } from './auth-rate-limits.js';
 import { noopAuthAlerts, noopAuthMetrics, safeAuthAlerts, safeAuthMetrics } from './auth-observability.js';
 import type { AuthAlertSink, AuthMetrics } from './auth-observability.js';
 import { requestIpPrefix } from './client-ip.js';
+import type { HumanAuthRolloutGate } from './human-auth-rollout.js';
 
 const LOGIN_TRANSACTION_TTL_MS = 10 * 60 * 1000;
 const OIDC_CLOCK_TOLERANCE_SECONDS = 60;
@@ -383,7 +384,8 @@ async function insertAudit(transaction: Prisma.TransactionClient, input: AuditIn
   `;
 }
 
-export function createPrismaOidcLoginStore(client: PrismaClient): OidcLoginStore {
+export function createPrismaOidcLoginStore(client: PrismaClient, rolloutGate: HumanAuthRolloutGate): OidcLoginStore {
+  if (!rolloutGate) throw new Error('OidcLoginStore requires a HumanAuthRolloutGate');
   return {
     async createTransaction(input) {
       await client.$transaction(async (transaction) => {
@@ -448,6 +450,18 @@ export function createPrismaOidcLoginStore(client: PrismaClient): OidcLoginStore
               outcome: 'denied', reasonCode: 'invitation_validation_failed' });
             return null;
           }
+          const invitationMembership = await transaction.$queryRaw<Array<{ condominioId: string | null; role: string }>>`
+            SELECT "condominioId", role::text FROM "HumanMembership" WHERE id = ${invitation.membershipId}::uuid
+          `;
+          const invitationGate = invitationMembership[0]
+            ? await rolloutGate.gateScope(transaction, invitationMembership[0].condominioId,
+                invitationMembership[0].role === 'provedor')
+            : { allowed: false, reason: 'rollout_unavailable' };
+          if (!invitationGate.allowed) {
+            await insertAudit(transaction, { ...input.audit, eventType: 'account_invitation_accept_failed',
+              outcome: 'denied', reasonCode: 'rollout_disabled' });
+            return null;
+          }
           const identityId = randomUUID();
           const inserted = await transaction.$executeRaw`
             INSERT INTO "ExternalIdentity" (id, "accountId", issuer, subject, email, "emailVerified", "lastLoginAt")
@@ -501,6 +515,12 @@ export function createPrismaOidcLoginStore(client: PrismaClient): OidcLoginStore
             outcome: 'denied',
             reasonCode: 'access_not_provisioned'
           });
+          return null;
+        }
+        const decision = await rolloutGate.gateIdentity(transaction, identity.accountId);
+        if (!decision.allowed) {
+          await insertAudit(transaction, { ...input.audit, eventType: 'oidc_callback_failed',
+            outcome: 'denied', reasonCode: 'rollout_disabled' });
           return null;
         }
 
@@ -738,9 +758,11 @@ async function exchangeAuthorizationCode(
 export async function createOidcService(
   config: OidcRuntimeConfig,
   store: OidcLoginStore,
-  fetchImplementation: typeof fetch = fetch,
-  dependencies: { rateLimiter?: AuthRateLimiter; metrics?: AuthMetrics; alerts?: AuthAlertSink } = {}
+  fetchImplementation: typeof fetch,
+  dependencies: { rolloutGate: HumanAuthRolloutGate; rateLimiter?: AuthRateLimiter; metrics?: AuthMetrics;
+    alerts?: AuthAlertSink }
 ): Promise<OidcService> {
+  if (!dependencies?.rolloutGate) throw new Error('OidcService requires a HumanAuthRolloutGate');
   const metrics = safeAuthMetrics(dependencies.metrics ?? noopAuthMetrics);
   const alerts = safeAuthAlerts(dependencies.alerts ?? noopAuthAlerts);
   const exactFetch = createExactOidcFetch(config, fetchImplementation);
@@ -856,6 +878,10 @@ export async function createOidcService(
       if (invitationToken !== undefined && !/^[A-Za-z0-9_-]{43}$/.test(invitationToken)) {
         throw new Error('Invalid invitation');
       }
+      const decision = invitationToken
+        ? await dependencies.rolloutGate.preflightInvitation(digestSecret(invitationToken))
+        : await dependencies.rolloutGate.preflightGlobal();
+      if (!decision.allowed) throw new Error('Human authentication rollout denied');
       const normalizedReturnTo = normalizeSafeRelativePath(returnTo, '/', config.returnToPrefixes);
       const id = randomUUID();
       const state = oidc.randomState();
