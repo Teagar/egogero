@@ -31,8 +31,11 @@ After a global `disabled` rollback, use the operational command because all brow
 are denied. The command requires `HUMAN_AUTH_ROLLOUT_AUTHORIZATION_TOKEN`, a single-use random token from a
 `HumanAuthDeploymentAuthorization` row created by a separately authenticated approval job. The row binds the exact
 active externally bound provider actor, scope, state, cohort, approval reference, and an expiry no more than ten
-minutes after creation. The application database role can only select and consume these rows, not mint them; token
-digests, use time, and request correlation provide replay-safe immutable binding. The token must be injected as a
+minutes after creation. The application database role cannot read or mint these rows and cannot mutate policy or
+history directly; it can only execute the hardened rollout function. That `SECURITY DEFINER` function owns the
+policy tables, validates and consumes the exact authorization atomically, and persists its ID, operator, approval
+reference, use time, and request correlation in immutable history. Token digests provide replay resistance without
+persisting the raw token. The token must be injected as a
 masked secret and never passed on the command line or retained in evidence. Tenant scopes use `tenant:<uuid>` and
 pilot additionally requires `--cohort 10`, `50`, or `100`. Unknown, duplicate, or inapplicable arguments fail without
 changing policy.

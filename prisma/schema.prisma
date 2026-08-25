@@ -53,6 +53,9 @@ model HumanAuthRolloutHistory {
   requestCorrelationId     String
   rollback                 Boolean
   revokedSessions          Int                   @default(0)
+  deploymentAuthorizationId String?               @db.Uuid
+  deploymentOperatorIdentifier String?
+  deploymentApprovalReference String?
 
   @@index([scope, createdAt, id])
 }
@@ -67,6 +70,7 @@ model HumanAuthDeploymentAuthorization {
   scope                 String
   state                 HumanAuthRolloutState
   cohortPercentage     Int?
+  operatorIdentifier   String
   approvalReference    String
   requestCorrelationId String?
 }

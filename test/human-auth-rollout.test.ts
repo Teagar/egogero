@@ -69,7 +69,7 @@ test('rollout admin endpoint is provider-only and validates an exact secret-free
       payload: { condominioId: null, state: 'disabled' } });
     assert.equal(stale.statusCode, 403);
     assert.deepEqual(stale.json(), { error: 'reauthentication_required' });
-    assert.equal(calls.length, 1);
+    assert.equal(calls.length, 2);
     await staleApp.close();
   } finally { await app.close(); }
 });

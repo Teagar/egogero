@@ -1,3 +1,5 @@
+import { randomUUID } from 'node:crypto';
+
 import { isUuid } from '../auth.js';
 import {
   createHumanAuthRolloutService,
@@ -42,7 +44,7 @@ try {
   const input = parseArguments(process.argv.slice(2));
   const result = await createHumanAuthRolloutService(prisma).setPolicy({
     ...input,
-    requestCorrelationId: `cli-${process.pid}`
+    requestCorrelationId: `cli-${randomUUID()}`
   });
   if (!result) throw new Error('provider or scope not found');
   process.stdout.write(`${JSON.stringify(result)}\n`);
