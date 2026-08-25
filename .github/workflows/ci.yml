@@ -13,18 +13,18 @@ jobs:
       postgres:
         image: postgres:16-alpine
         env:
-          POSTGRES_DB: office
+          POSTGRES_DB: office_pc31_e2e
           POSTGRES_USER: office
           POSTGRES_PASSWORD: office
         ports:
           - 5432:5432
         options: >-
-          --health-cmd "pg_isready -U office -d office"
+          --health-cmd "pg_isready -U office -d office_pc31_e2e"
           --health-interval 5s
           --health-timeout 3s
           --health-retries 10
     env:
-      DATABASE_URL: postgresql://office:office@127.0.0.1:5432/office?schema=public
+      DATABASE_URL: postgresql://office:office@127.0.0.1:5432/office_pc31_e2e?schema=public
       RUN_DATABASE_TESTS: "true"
 
     steps:
@@ -40,6 +40,9 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Install deterministic browser
+        run: npx playwright install --with-deps chromium
+
       - name: Lint
         run: npm run lint
 
@@ -49,5 +52,19 @@ jobs:
       - name: Test
         run: npm run db:migrate:deploy && npm test
 
+      - name: Browser E2E
+        run: npm run test:e2e
+
       - name: Build
         run: npm run build
+
+      - name: Upload sanitized browser failures
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pc31-browser-failures
+          path: |
+            test-results/
+            playwright-report/
+          if-no-files-found: ignore
+          retention-days: 7

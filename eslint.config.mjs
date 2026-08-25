@@ -3,7 +3,7 @@ import tseslint from 'typescript-eslint';
 
 export default tseslint.config(
   {
-    ignores: ['dist/**', 'web/dist/**', 'node_modules/**', 'prisma/migrations/**']
+    ignores: ['dist/**', 'web/dist/**', 'node_modules/**', 'prisma/migrations/**', '.e2e-tmp/**', 'playwright-report/**', 'test-results/**']
   },
   js.configs.recommended,
   ...tseslint.configs.recommended,
