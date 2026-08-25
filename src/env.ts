@@ -49,6 +49,37 @@ function validateDeploymentSecret(value: string | undefined, name: string) {
   return value;
 }
 
+const DEFAULT_AUTH_ALERT_TIMEOUT_MS = 5_000;
+
+export type AuthAlertEnvironmentConfig =
+  | { adapter: 'stdout'; timeoutMs: number }
+  | { adapter: 'https_webhook'; timeoutMs: number; url: string };
+
+export function authAlertConfigFromEnvironment(environment: NodeJS.ProcessEnv): AuthAlertEnvironmentConfig {
+  const adapter = environment.AUTH_ALERT_ADAPTER ?? 'stdout';
+  const timeoutMs = Number(environment.AUTH_ALERT_TIMEOUT_MS ?? DEFAULT_AUTH_ALERT_TIMEOUT_MS);
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 100 || timeoutMs > 10_000) {
+    throw new Error('AUTH_ALERT_TIMEOUT_MS must be an integer between 100 and 10000');
+  }
+  if (adapter === 'stdout') {
+    if (environment.AUTH_ALERT_WEBHOOK_URL !== undefined) {
+      throw new Error('AUTH_ALERT_WEBHOOK_URL is only valid with AUTH_ALERT_ADAPTER=https_webhook');
+    }
+    return { adapter, timeoutMs };
+  }
+  if (adapter !== 'https_webhook') {
+    throw new Error('AUTH_ALERT_ADAPTER must be stdout or https_webhook');
+  }
+  const rawUrl = environment.AUTH_ALERT_WEBHOOK_URL;
+  if (!rawUrl) throw new Error('AUTH_ALERT_WEBHOOK_URL is required for https_webhook');
+  let url: URL;
+  try { url = new URL(rawUrl); } catch { throw new Error('AUTH_ALERT_WEBHOOK_URL must be an absolute HTTPS URL'); }
+  if (url.protocol !== 'https:' || !url.hostname || url.username || url.password || url.search || url.hash) {
+    throw new Error('AUTH_ALERT_WEBHOOK_URL must be HTTPS without credentials, query, or fragment');
+  }
+  return { adapter, timeoutMs, url: url.toString() };
+}
+
 export function normalizePublicValidationBaseUrl(value: string) {
   let url: URL;
   try {
@@ -163,6 +194,7 @@ export function getEnv(environment: NodeJS.ProcessEnv = process.env) {
     host: environment.HOST ?? (environment.LOCAL_DEVELOPMENT_AUTH === 'true' ? '127.0.0.1' : '0.0.0.0'),
     localDevelopmentAuth: environment.LOCAL_DEVELOPMENT_AUTH === 'true',
     secureValidationTransport: deployed,
+    authAlerts: authAlertConfigFromEnvironment(environment),
     trustProxy,
     oidc,
     sessions,

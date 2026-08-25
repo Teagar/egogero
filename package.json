@@ -16,7 +16,8 @@
     "idempotency:cleanup": "node dist/src/jobs/cleanup-idempotency.js",
     "delivery:worker": "node dist/src/jobs/deliver-invitations.js",
     "auth:rollout": "tsx src/jobs/set-human-auth-rollout.ts",
-    "auth:rotation:rehearse": "node scripts/rehearse-auth-key-rotation.mjs"
+    "auth:rotation:rehearse": "node scripts/rehearse-auth-key-rotation.mjs",
+    "auth:rollout:evaluate": "tsx src/auth-rollout.ts"
   },
   "dependencies": {
     "@fastify/static": "^10.1.3",

@@ -314,11 +314,12 @@ test(
         requestCorrelationId: 'reauth-start-expired-create'
       });
       assert.ok(expiredIntent);
+      const expiredAt = new Date(Date.now() - 5 * 60_000);
       await prisma.reauthenticationStartIntent.update({
         where: { tokenDigest: digest(expiredIntent) },
         data: {
-          createdAt: new Date(Date.now() - 10 * 60_000),
-          expiresAt: new Date(Date.now() - 5 * 60_000)
+          createdAt: new Date(expiredAt.getTime() - 5 * 60_000),
+          expiresAt: expiredAt
         }
       });
       assert.equal(await store.consumeReauthenticationStartIntent!({

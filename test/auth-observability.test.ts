@@ -10,7 +10,7 @@ import {
   registerAuthTelemetryLifecycle,
   safeAuthAlerts,
   safeAuthMetrics,
-  type StructuredAuthTelemetryRecord
+  type AuthSnapshotSink
 } from '../src/auth-observability.js';
 import { normalizeIpPrefix, trustedProxyFromEnvironment } from '../src/client-ip.js';
 import { createApp } from '../src/app.js';
@@ -153,8 +153,8 @@ test('aggregate observer emits callback and session SLO alerts with bounded deta
 });
 
 test('structured telemetry periodically evaluates bounded aggregates and stops with Fastify', async () => {
-  const records: StructuredAuthTelemetryRecord[] = [];
-  const telemetry = createStructuredAuthTelemetry((record) => records.push(record));
+  const records: Parameters<AuthSnapshotSink>[0][] = [];
+  const telemetry = createStructuredAuthTelemetry((record) => { records.push(record); });
   const app = createApp();
   const timer = registerAuthTelemetryLifecycle(app, telemetry, 10);
   assert.equal(timer.hasRef(), false);
@@ -163,9 +163,12 @@ test('structured telemetry periodically evaluates bounded aggregates and stops w
     telemetry.metrics.observe('auth_session_lookup_seconds', 0.025, { operation: 'inspect', outcome: 'miss' });
   }
   await new Promise((resolve) => setTimeout(resolve, 25));
-  assert.ok(records.some((record) => record.event === 'auth_metrics'
-    && record.counters.auth_oidc_callback_total === 100));
-  assert.deepEqual(records.filter((record) => record.event === 'auth_alert').map((record) => record.type).sort(), [
+  assert.ok(records.some((record) => record.counters.some((counter) =>
+    counter.metric === 'auth_oidc_callback_total' && counter.value === 100)));
+  assert.deepEqual(Object.keys(records.flatMap((record) => Object.keys(record.alerts)).reduce<Record<string, true>>((all, type) => {
+    all[type] = true;
+    return all;
+  }, {})).sort(), [
     'oidc_callback_success_slo',
     'session_lookup_latency_slo'
   ]);
