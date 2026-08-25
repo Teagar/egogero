@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { appendFile, chmod, mkdir, mkdtemp, readFile, rename, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -12,6 +12,7 @@ import {
   AUTH_SESSION_HISTOGRAM_BOUNDS_SECONDS,
   evaluateAuthRolloutSnapshots,
   readAuthRolloutJsonl,
+  readAuthRolloutInventory,
   type AuthRolloutInventory,
   type AuthRolloutSnapshot
 } from '../src/auth-rollout.js';
@@ -398,6 +399,42 @@ test('streaming JSONL limits fail safely and secure file sink repairs mode and r
     const output = JSON.parse(command.stdout) as { result: string; reasons: string[] };
     assert.equal(output.result, 'inconclusive');
     assert.ok(output.reasons.includes('input_limit_exceeded'));
+
+    const special = path.join(root, 'special');
+    await mkdir(special);
+    await assert.rejects(readAuthRolloutInventory(special), /regular file/);
+    const emptySnapshots = path.join(root, 'empty.jsonl');
+    await writeFile(emptySnapshots, '', 'utf8');
+    const specialCommand = spawnSync(process.execPath, [
+      '--import', 'tsx', 'src/auth-rollout.ts', '--inventory', special, emptySnapshots
+    ], { cwd: process.cwd(), encoding: 'utf8' });
+    assert.equal(specialCommand.status, 2, specialCommand.stderr);
+    const specialOutput = JSON.parse(specialCommand.stdout) as { result: string; reasons: string[] };
+    assert.equal(specialOutput.result, 'inconclusive');
+    assert.ok(specialOutput.reasons.includes('input_limit_exceeded'));
+    const link = path.join(root, 'inventory-link.json');
+    await symlink(inventoryPath, link);
+    await assert.rejects(readAuthRolloutInventory(link), /regular file/);
+    const multiline = path.join(root, 'inventory-multiline.json');
+    await writeFile(multiline, '{}\n{}\n', 'utf8');
+    await assert.rejects(readAuthRolloutInventory(multiline), /exactly one JSON record/);
+
+    const growing = path.join(root, 'inventory-growing.json');
+    await writeFile(growing, JSON.stringify(inventory()), 'utf8');
+    await assert.rejects(readAuthRolloutInventory(growing, {
+      chunkBytes: 1,
+      afterOpen: async () => { await appendFile(growing, ' '); }
+    }), /changed while being read/);
+    const replaced = path.join(root, 'inventory-replaced.json');
+    const replacedOld = path.join(root, 'inventory-replaced-old.json');
+    await writeFile(replaced, JSON.stringify(inventory()), 'utf8');
+    await assert.rejects(readAuthRolloutInventory(replaced, {
+      chunkBytes: 1,
+      afterOpen: async () => {
+        await rename(replaced, replacedOld);
+        await writeFile(replaced, JSON.stringify(inventory()), 'utf8');
+      }
+    }), /changed while being read/);
 
     const directory = path.join(root, 'later');
     const file = path.join(directory, 'snapshots.jsonl');

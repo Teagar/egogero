@@ -235,8 +235,8 @@ export function createAuthAlertWebhookAdapter(
   request: typeof fetch = fetch
 ): AuthAlertDeliveryAdapter {
   const endpoint = new URL(url);
-  if (endpoint.protocol !== 'https:' || endpoint.username || endpoint.password) {
-    throw new Error('Auth alert webhook must be an HTTPS URL without credentials');
+  if (endpoint.protocol !== 'https:' || endpoint.username || endpoint.password || endpoint.search || endpoint.hash) {
+    throw new Error('Auth alert webhook must be an HTTPS URL without credentials, query, or fragment');
   }
   return async (delivery, signal) => {
     const response = await request(endpoint, {

@@ -15,8 +15,6 @@ export const AUTH_RATE_LIMIT_POLICIES = {
   authentication_failure_ip: { limit: 60, windowMs: 60_000 }
 } as const;
 
-const AUTH_RATE_LIMIT_TRANSACTION_OPTIONS = { maxWait: 10_000, timeout: 10_000 } as const;
-
 export type AuthRateLimitAction = keyof typeof AUTH_RATE_LIMIT_POLICIES;
 export type AuthFailureRateLimitAction = Extract<AuthRateLimitAction, 'callback_failure_ip' | 'authentication_failure_ip'>;
 export type AuthRateLimitDecision = { allowed: boolean; retryAfterSeconds: number; repeatedExcess: boolean };
@@ -185,7 +183,7 @@ export function createPrismaAuthRateLimiter(
           WHERE action = ${action} AND subject = ${subject}
         `;
         return { allowed: true, retryAfterSeconds: 0, repeatedExcess: false, reservationId };
-      }, AUTH_RATE_LIMIT_TRANSACTION_OPTIONS);
+      });
       observeDecision(action, result);
       return result;
     },
@@ -227,7 +225,7 @@ export function createPrismaAuthRateLimiter(
               "updatedAt" = clock_timestamp()
           WHERE action = ${reservation.action} AND subject = ${reservation.subject}
         `;
-      }, AUTH_RATE_LIMIT_TRANSACTION_OPTIONS);
+      });
     },
     async cleanup() {
       return client.$executeRaw`

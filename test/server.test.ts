@@ -7,7 +7,9 @@ import test from 'node:test';
 
 import { PrismaClient } from '@prisma/client';
 
-import { getEnv, normalizePublicValidationBaseUrl } from '../src/env.js';
+import { authAlertConfigFromEnvironment, getEnv, normalizePublicValidationBaseUrl } from '../src/env.js';
+import { createServerAuthObservability } from '../src/server.js';
+import type { AuthRolloutSnapshot } from '../src/auth-rollout.js';
 
 const INVITATION_TOKEN_SECRET = 'idempotency-db-invitation-token-secret-minimum-32-bytes';
 const DEVICE_API_KEY_SECRET = 'test-device-api-key-secret-at-least-32-bytes';
@@ -35,7 +37,8 @@ async function reservePort() {
 async function startRuntime(
   nodeEnvironment: string,
   localDevelopmentAuth: boolean,
-  databaseUrl = process.env.DATABASE_URL ?? 'postgresql://unused:unused@127.0.0.1:1/unused'
+  databaseUrl = process.env.DATABASE_URL ?? 'postgresql://unused:unused@127.0.0.1:1/unused',
+  overrides: NodeJS.ProcessEnv = {}
 ) {
   const port = await reservePort();
   const child = spawn(process.execPath, ['--import', 'tsx', 'src/server.ts'], {
@@ -49,7 +52,8 @@ async function startRuntime(
       HOST: '127.0.0.1',
       LOCAL_DEVELOPMENT_AUTH: localDevelopmentAuth ? 'true' : '',
       NODE_ENV: nodeEnvironment,
-      PORT: String(port)
+      PORT: String(port),
+      ...overrides
     },
     stdio: ['ignore', 'ignore', 'pipe']
   });
@@ -233,6 +237,73 @@ test('public validation URL is optional but rejects unsafe values', () => {
   assert.equal(base.publicValidationBaseUrl, 'https://access.example.test');
   assert.throws(() => normalizePublicValidationBaseUrl('http://access.example.test'), /absolute HTTPS URL/);
   assert.throws(() => normalizePublicValidationBaseUrl('https://access.example.test/?token=secret'), /without credentials/);
+});
+
+test('auth alert adapter environment is bounded and fails closed', () => {
+  assert.deepEqual(authAlertConfigFromEnvironment({}), { adapter: 'stdout', timeoutMs: 5_000 });
+  assert.deepEqual(authAlertConfigFromEnvironment({
+    AUTH_ALERT_ADAPTER: 'https_webhook', AUTH_ALERT_WEBHOOK_URL: 'https://alerts.example.test/auth',
+    AUTH_ALERT_TIMEOUT_MS: '2500'
+  }), { adapter: 'https_webhook', url: 'https://alerts.example.test/auth', timeoutMs: 2_500 });
+  assert.throws(() => authAlertConfigFromEnvironment({ AUTH_ALERT_ADAPTER: 'file' }), /stdout or https_webhook/);
+  assert.throws(() => authAlertConfigFromEnvironment({
+    AUTH_ALERT_ADAPTER: 'stdout', AUTH_ALERT_WEBHOOK_URL: 'https://alerts.example.test'
+  }), /only valid/);
+  for (const url of ['http://alerts.example.test', 'https://user:secret@alerts.example.test',
+    'https://alerts.example.test/?token=secret', 'not-a-url']) {
+    assert.throws(() => authAlertConfigFromEnvironment({
+      AUTH_ALERT_ADAPTER: 'https_webhook', AUTH_ALERT_WEBHOOK_URL: url
+    }), /AUTH_ALERT_WEBHOOK_URL/);
+  }
+  assert.throws(() => authAlertConfigFromEnvironment({ AUTH_ALERT_TIMEOUT_MS: '10001' }), /AUTH_ALERT_TIMEOUT_MS/);
+});
+
+test('startServer rejects malformed alert routing before database startup', async () => {
+  await assert.rejects(startRuntime(
+    'production', false, 'postgresql://unused:unused@127.0.0.1:1/unused',
+    { AUTH_ALERT_ADAPTER: 'https_webhook', AUTH_ALERT_WEBHOOK_URL: 'http://alerts.example.test' }
+  ), /AUTH_ALERT_WEBHOOK_URL/);
+});
+
+test('server auth observability composes bounded delivery and records sink failures', async () => {
+  const snapshots: AuthRolloutSnapshot[] = [];
+  const rejected = createServerAuthObservability({ adapter: 'stdout', timeoutMs: 100 }, {
+    snapshotSink: (snapshot) => { snapshots.push(snapshot); },
+    alertAdapter: async () => { throw new Error('sink unavailable'); }
+  });
+  assert.doesNotThrow(() => rejected.alerts.emit('crypto_key_failure', { token: 'CANARY-secret' }));
+  await new Promise((resolve) => setImmediate(resolve));
+  rejected.telemetry.flush();
+  assert.equal(JSON.stringify(snapshots).includes('CANARY'), false);
+  assert.equal(snapshots[0].alerts.crypto_key_failure, 1);
+  assert.ok(snapshots[0].observability.gaps.some((gap) => gap.code === 'alert_route_rejected'));
+
+  const timedOut = createServerAuthObservability({ adapter: 'stdout', timeoutMs: 5 }, {
+    snapshotSink: () => {}, alertAdapter: () => new Promise(() => {})
+  });
+  timedOut.alerts.emit('oidc_callback_success_slo', {});
+  timedOut.alerts.emit('oidc_callback_success_slo', {});
+  timedOut.alerts.emit('oidc_callback_success_slo', {});
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.deepEqual(timedOut.routingState(), { inFlight: true, pending: 1 });
+  const timeoutSnapshot = timedOut.telemetry.flush();
+  assert.ok(timeoutSnapshot?.observability.gaps.some((gap) => gap.code === 'alert_route_timeout'));
+  assert.ok(timeoutSnapshot?.observability.gaps.some((gap) => gap.code === 'alert_route_backpressure'));
+
+  const requests: Array<{ url: string; body: string }> = [];
+  const webhook = createServerAuthObservability({
+    adapter: 'https_webhook', timeoutMs: 100, url: 'https://alerts.example.test/auth'
+  }, {
+    snapshotSink: () => {},
+    request: async (input, init) => {
+      requests.push({ url: String(input), body: String(init?.body) });
+      return new Response(null, { status: 202 });
+    }
+  });
+  webhook.alerts.emit('oidc_issuer_mixup', { accountId: 'CANARY-account' });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(requests[0].url, 'https://alerts.example.test/auth');
+  assert.equal(requests[0].body.includes('CANARY'), false);
 });
 
 test('production gatehouse validation rejects HTTP and untrusted forwarded protocol', { skip: !runDatabaseTests }, async () => {

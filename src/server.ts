@@ -19,7 +19,41 @@ import {
 } from './sessions.js';
 import { createHumanAdministrationService } from './human-administration.js';
 import { createPrismaAuthRateLimiter } from './auth-rate-limits.js';
-import { createStructuredAuthTelemetry, registerAuthTelemetryLifecycle } from './auth-observability.js';
+import {
+  combineAuthAlertSinks,
+  createAuthAlertStdoutAdapter,
+  createAuthAlertWebhookAdapter,
+  createRoutedAuthAlertSink,
+  createStructuredAuthTelemetry,
+  DEFAULT_AUTH_ALERT_ROUTES,
+  registerAuthTelemetryLifecycle,
+  type AuthAlertDeliveryAdapter,
+  type AuthSnapshotSink
+} from './auth-observability.js';
+import type { AuthAlertEnvironmentConfig } from './env.js';
+
+export function createServerAuthObservability(
+  config: AuthAlertEnvironmentConfig,
+  dependencies: {
+    snapshotSink?: AuthSnapshotSink;
+    alertAdapter?: AuthAlertDeliveryAdapter;
+    request?: typeof fetch;
+  } = {}
+) {
+  const telemetry = createStructuredAuthTelemetry(dependencies.snapshotSink);
+  const adapter = dependencies.alertAdapter ?? (config.adapter === 'stdout'
+    ? createAuthAlertStdoutAdapter()
+    : createAuthAlertWebhookAdapter(config.url, dependencies.request));
+  const routed = createRoutedAuthAlertSink(DEFAULT_AUTH_ALERT_ROUTES, adapter, {
+    timeoutMs: config.timeoutMs,
+    onGap: telemetry.recordObservabilityGap
+  });
+  return {
+    telemetry,
+    alerts: combineAuthAlertSinks(telemetry.alerts, routed.sink),
+    routingState: routed.state
+  };
+}
 
 export async function startServer(environment: NodeJS.ProcessEnv = process.env) {
   const env = getEnv(environment);
@@ -37,13 +71,14 @@ export async function startServer(environment: NodeJS.ProcessEnv = process.env) 
   const notificationSender = environment.NODE_ENV === 'development'
     ? createDevelopmentNotificationSender()
     : createUnavailableNotificationSender();
-  const authTelemetry = createStructuredAuthTelemetry();
-  const authRateLimiter = createPrismaAuthRateLimiter(prisma, authTelemetry.metrics, authTelemetry.alerts);
+  const authObservability = createServerAuthObservability(env.authAlerts);
+  const authTelemetry = authObservability.telemetry;
+  const authRateLimiter = createPrismaAuthRateLimiter(prisma, authTelemetry.metrics, authObservability.alerts);
   const oidcService = env.oidc
     ? await createOidcService(env.oidc, createPrismaOidcLoginStore(prisma), fetch, {
         rateLimiter: authRateLimiter,
         metrics: authTelemetry.metrics,
-        alerts: authTelemetry.alerts
+        alerts: authObservability.alerts
       })
     : undefined;
   const humanAdministrationService = env.humanAdministration
@@ -53,7 +88,7 @@ export async function startServer(environment: NodeJS.ProcessEnv = process.env) 
     ? createPrismaBrowserSessionStore(prisma, {
         ...env.sessions,
         mfaPolicy: env.humanAdministration?.mfaPolicy
-      }, { rateLimiter: authRateLimiter, metrics: authTelemetry.metrics, alerts: authTelemetry.alerts })
+      }, { rateLimiter: authRateLimiter, metrics: authTelemetry.metrics, alerts: authObservability.alerts })
     : undefined;
   const browserSessionService = browserSessionStore
     ? createBrowserSessionService(browserSessionStore)

@@ -1,5 +1,5 @@
-import { createReadStream } from 'node:fs';
-import { readFile, stat } from 'node:fs/promises';
+import { constants, createReadStream } from 'node:fs';
+import { lstat, open } from 'node:fs/promises';
 import { StringDecoder } from 'node:string_decoder';
 import { pathToFileURL } from 'node:url';
 
@@ -407,12 +407,70 @@ export async function readAuthRolloutJsonl(
   return values;
 }
 
-export async function readAuthRolloutInventory(path: string): Promise<unknown> {
-  const metadata = await stat(path);
-  if (metadata.size > AUTH_ROLLOUT_INPUT_LIMITS.inventoryBytes) {
-    throw new AuthRolloutInputLimitError('inventory input limit exceeded');
+export async function readAuthRolloutInventory(
+  path: string,
+  options: { chunkBytes?: number; afterOpen?: () => void | Promise<void> } = {}
+): Promise<unknown> {
+  const chunkBytes = options.chunkBytes ?? 64 * 1_024;
+  if (!Number.isSafeInteger(chunkBytes) || chunkBytes < 1 || chunkBytes > 64 * 1_024) {
+    throw new AuthRolloutInputLimitError('invalid inventory read chunk size');
   }
-  return JSON.parse(await readFile(path, 'utf8')) as unknown;
+  const pathBeforeOpen = await lstat(path);
+  if (!pathBeforeOpen.isFile()) throw new AuthRolloutInputLimitError('inventory must be a regular file');
+  const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    const initial = await handle.stat();
+    if (!initial.isFile() || initial.dev !== pathBeforeOpen.dev || initial.ino !== pathBeforeOpen.ino) {
+      throw new AuthRolloutInputLimitError('inventory changed before it was opened');
+    }
+    if (initial.size > AUTH_ROLLOUT_INPUT_LIMITS.inventoryBytes) {
+      throw new AuthRolloutInputLimitError('inventory input limit exceeded');
+    }
+    await options.afterOpen?.();
+    const decoder = new StringDecoder('utf8');
+    const buffer = Buffer.allocUnsafe(chunkBytes);
+    let partial = '';
+    let bytes = 0;
+    let records = 0;
+    let inventory: unknown;
+    function consume(line: string) {
+      if (Buffer.byteLength(line, 'utf8') > AUTH_ROLLOUT_INPUT_LIMITS.inventoryBytes) {
+        throw new AuthRolloutInputLimitError('inventory line limit exceeded');
+      }
+      if (line.trim().length === 0) return;
+      records += 1;
+      if (records > 1) throw new AuthRolloutInputLimitError('inventory must contain exactly one JSON record');
+      inventory = JSON.parse(line) as unknown;
+    }
+    while (true) {
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, null);
+      if (bytesRead === 0) break;
+      bytes += bytesRead;
+      if (bytes > AUTH_ROLLOUT_INPUT_LIMITS.inventoryBytes) {
+        throw new AuthRolloutInputLimitError('inventory input limit exceeded');
+      }
+      partial += decoder.write(buffer.subarray(0, bytesRead));
+      let newline = partial.indexOf('\n');
+      while (newline >= 0) {
+        consume(partial.slice(0, newline).replace(/\r$/, ''));
+        partial = partial.slice(newline + 1);
+        newline = partial.indexOf('\n');
+      }
+      if (Buffer.byteLength(partial, 'utf8') > AUTH_ROLLOUT_INPUT_LIMITS.inventoryBytes) {
+        throw new AuthRolloutInputLimitError('inventory line limit exceeded');
+      }
+    }
+    partial += decoder.end();
+    if (partial.length > 0) consume(partial.replace(/\r$/, ''));
+    if (records !== 1) throw new AuthRolloutInputLimitError('inventory must contain exactly one JSON record');
+    const finalHandle = await handle.stat();
+    const finalPath = await lstat(path);
+    if (finalHandle.size !== initial.size || finalPath.dev !== initial.dev || finalPath.ino !== initial.ino
+      || !finalPath.isFile()) throw new AuthRolloutInputLimitError('inventory changed while being read');
+    return inventory;
+  } finally {
+    await handle.close();
+  }
 }
 
 async function main() {

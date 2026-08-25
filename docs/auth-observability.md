@@ -116,6 +116,11 @@ be covered by that instance's snapshots, each no longer than its cadence. Planne
 is represented by ending the old instance and starting the new instance in inventory; a
 replica that silently stops while another remains healthy is inconclusive.
 
+Inventory is exactly one JSON record in a regular file. The evaluator checks the path, opens it
+once with `O_NOFOLLOW`, verifies the opened device/inode, reads incrementally from that handle,
+and verifies size and identity again after EOF. Symlinks, directories/special files, multiple
+records, growth, or path replacement are rejected as inconclusive with exit `2`.
+
 Run against one or more files, or pipe JSONL on stdin:
 
 ```sh
@@ -176,6 +181,20 @@ acknowledgement through `recordObservabilityGap`. `createAuthAlertWebhookAdapter
 credential-free HTTPS URLs; `createAuthAlertStdoutAdapter` is the provider-neutral alternative.
 Compose routing with snapshot alert counting through `combineAuthAlertSinks`. No provider is
 authoritative for authentication decisions.
+
+`startServer` always composes aggregate counting with routed delivery. Production configuration
+is deliberately small and fail-closed:
+
+| Variable | Values |
+| --- | --- |
+| `AUTH_ALERT_ADAPTER` | `stdout` (default) or `https_webhook` |
+| `AUTH_ALERT_WEBHOOK_URL` | Required only for `https_webhook`; HTTPS without credentials, query, or fragment |
+| `AUTH_ALERT_TIMEOUT_MS` | Integer `100..10000`, default `5000` |
+
+The stdout adapter emits only `egogero.auth-alert-delivery/v1`. The webhook adapter is a generic
+HTTP transport, not a claim of integration with any alert provider. Non-2xx acknowledgement,
+throw, rejection, timeout, and bounded-queue drops are observability gaps and never affect an
+authentication result.
 
 Rollback the canary (disable new human login, preserve existing sessions and device access) on
 any critical incident, callback success below 99.5%, session p95 above 20 ms, or repeated
