@@ -10,6 +10,9 @@
     "lint": "eslint .",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p web/tsconfig.json --noEmit",
     "test": "node --test --test-concurrency=1 --import tsx test/*.test.ts && vitest run --config web/vite.config.ts",
+    "test:e2e": "node --import tsx test/e2e/run.ts",
+    "test:e2e:install": "playwright install chromium",
+    "test:e2e:sanitize": "node --import tsx test/e2e/sanitize-artifacts.ts",
     "db:migrate:deploy": "prisma migrate deploy",
     "db:generate": "prisma generate",
     "privacy:anonymize": "node dist/src/jobs/anonymize-old-guests.js",
@@ -34,6 +37,7 @@
   },
   "devDependencies": {
     "@eslint/js": "^9.35.0",
+    "@playwright/test": "1.62.1",
     "@types/node": "^24.3.0",
     "@types/pg": "^8.23.1",
     "@types/qrcode": "^1.5.6",

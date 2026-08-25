@@ -4,3 +4,6 @@ dist
 .env.*
 coverage
 .DS_Store
+.e2e-tmp/
+playwright-report/
+test-results/
