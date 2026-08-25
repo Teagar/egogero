@@ -323,7 +323,8 @@ test('MFA evidence fails closed and trusted reauthentication is required before 
     assert.ok(residentSession);
     await prisma.humanMembership.create({ data: { id: providerMembershipId, accountId, role: 'provedor', status: 'active' } });
     assert.deepEqual(await store.rotate({ sessionToken: residentSession.sessionToken,
-      targetMembershipId: providerMembershipId, requestCorrelationId: 'elevation-denied' }), { status: 'denied' });
+      targetMembershipId: providerMembershipId, requestCorrelationId: 'elevation-denied' }),
+    { status: 'reauthentication-required' });
     const snapshot = await store.inspect({ sessionToken: residentSession.sessionToken, requestCorrelationId: 'snapshot' });
     assert.ok(snapshot);
     const reauthenticated = await store.issueFromHandoff({ handoffToken: await handoff(['webauthn'], 'strong', snapshot.familyId),

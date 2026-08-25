@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Painel do síndico | Referência Teagar</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@600;700;800;900&amp;family=IBM+Plex+Mono:wght@400;500;600&amp;family=Public+Sans:wght@400;500;600;700;800&amp;display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../styles/tokens.css"><link rel="stylesheet" href="../styles/reference.css">
+</head>
+<body>
+  <a class="skip-link" href="#conteudo">Ir para o conteúdo</a>
+  <div class="shell">
+    <aside class="sidebar" aria-label="Navegação principal">
+      <a class="brand" href="../index.html"><img src="../assets/brand-mark.svg" alt=""> Teagar</a>
+      <nav class="side-nav"><a href="dashboard.html" aria-current="page"><svg class="icon" aria-hidden="true"><path d="M4 11l8-7 8 7v9h-6v-6h-4v6H4z"/></svg>Visão geral</a><a href="../roles/manager.html"><svg class="icon" aria-hidden="true"><path d="M8 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8zm8-1a3 3 0 1 0 0-6M2 21v-3c0-3 2-5 6-5s6 2 6 5v3m2-8c4 0 6 2 6 5v3h-5"/></svg>Pessoas</a><a href="../roles/resident.html"><svg class="icon" aria-hidden="true"><path d="M3 6h18v5a2 2 0 0 0 0 4v5H3v-5a2 2 0 0 0 0-4zm9 0v14"/></svg>Convites</a><a href="../roles/gatehouse.html"><svg class="icon" aria-hidden="true"><path d="M12 3l8 3v6c0 5-3 8-8 10-5-2-8-5-8-10V6z"/></svg>Portaria</a></nav>
+      <div class="side-context"><p class="context-label">Contexto ativo</p><strong>Jardins do Norte</strong><p class="small">Síndico · Marina Costa</p><a href="select-condominium.html">Trocar contexto</a></div>
+    </aside>
+    <main id="conteudo" class="shell-main">
+      <header class="appbar"><div><span class="context-label">Condomínio / papel</span><br><strong>Jardins do Norte · Síndico</strong></div><div class="cluster"><span class="muted small">Marina Costa</span><a class="button secondary" href="../auth/logout.html">Sair</a></div></header>
+      <div class="app-content stack">
+        <header><p class="eyebrow">Segunda-feira / 24 ago 2026</p><h1>Visão geral</h1><p class="lede">Operação atual do condomínio, sem esconder pendências.</p></header>
+        <section class="metrics" aria-label="Indicadores do condomínio"><div class="metric"><strong class="metric-value">284</strong><span class="metric-label">Vínculos ativos</span></div><div class="metric"><strong class="metric-value">18</strong><span class="metric-label">Convites hoje</span></div><div class="metric"><strong class="metric-value">03</strong><span class="metric-label">Aguardam cadastro</span></div><div class="metric"><strong class="metric-value">01</strong><span class="metric-label">Atenção operacional</span></div></section>
+        <div class="grid grid-2">
+          <section class="panel signal" aria-labelledby="pendencias"><div class="cluster spread"><div><p class="eyebrow">Ação necessária</p><h2 id="pendencias">Pendências</h2></div><span class="status warning">3 abertas</span></div><div class="stack"><div class="notice warning"><strong>2 convites administrativos expiram hoje</strong><br><span class="small">Reenvie somente após confirmar o destinatário.</span></div><div class="notice"><strong>1 vínculo aguarda revisão</strong><br><span class="small">Solicitação registrada pela administração.</span></div></div></section>
+          <section class="panel" aria-labelledby="operacao"><p class="eyebrow">Tempo real</p><h2 id="operacao">Operação</h2><p><span class="status success">Portaria online</span></p><p class="muted">Última sincronização às 10:42. Validações respondendo normalmente.</p><a href="../roles/gatehouse.html">Abrir painel da portaria</a></section>
+        </div>
+        <section aria-labelledby="atividade"><div class="cluster spread"><div><p class="eyebrow">Rastro recente</p><h2 id="atividade">Atividade</h2></div><button class="secondary" type="button">Exportar relatório</button></div><div class="table-wrap"><table class="table-cards"><caption>Últimos eventos administrativos</caption><thead><tr><th>Horário</th><th>Evento</th><th>Responsável</th><th>Estado</th></tr></thead><tbody><tr><td data-label="Horário">10:36</td><td data-label="Evento">Convite de visitante criado</td><td data-label="Responsável">Apto. 804</td><td data-label="Estado"><span class="status success">Ativo</span></td></tr><tr><td data-label="Horário">09:18</td><td data-label="Evento">Vínculo de morador atualizado</td><td data-label="Responsável">Marina Costa</td><td data-label="Estado"><span class="status success">Concluído</span></td></tr><tr><td data-label="Horário">08:57</td><td data-label="Evento">Tentativa de acesso não validada</td><td data-label="Responsável">Portaria principal</td><td data-label="Estado"><span class="status warning">Revisar</span></td></tr></tbody></table></div></section>
+      </div>
+    </main>
+    <nav class="mobile-nav" aria-label="Navegação móvel"><a href="dashboard.html" aria-current="page"><svg class="icon" aria-hidden="true"><path d="M4 11l8-7 8 7v9h-6v-6h-4v6H4z"/></svg>Início</a><a href="../roles/manager.html"><svg class="icon" aria-hidden="true"><path d="M8 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8zM2 21v-3c0-3 2-5 6-5s6 2 6 5v3"/></svg>Pessoas</a><a href="../roles/resident.html"><svg class="icon" aria-hidden="true"><path d="M3 6h18v5a2 2 0 0 0 0 4v5H3v-5a2 2 0 0 0 0-4z"/></svg>Convites</a><a href="select-condominium.html"><svg class="icon" aria-hidden="true"><path d="M4 21V5h11v16M8 9h3m-3 4h3m-3 4h3m4-7h5v11M2 21h20"/></svg>Contexto</a></nav>
+  </div>
+</body>
+</html>

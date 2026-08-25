@@ -1091,7 +1091,7 @@ export function registerOidcRoutes(
     try {
       const authorizationUrl = await service.startLogin({ invitationToken: body.token,
         returnTo: body.returnTo as string | undefined, requestCorrelationId: request.id });
-      return reply.redirect(authorizationUrl.toString(), 303);
+      return { navigateTo: authorizationUrl.toString() };
     } catch { return reply.status(400).send({ error: 'invalid_request' }); }
   });
 

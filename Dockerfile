@@ -10,6 +10,7 @@ COPY tsconfig.json eslint.config.mjs ./
 COPY prisma ./prisma
 COPY src ./src
 COPY test ./test
+COPY web ./web
 RUN npm run build
 
 FROM base AS runner
@@ -18,6 +19,7 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
+COPY --from=build /app/web/dist ./web/dist
 COPY --from=build /app/prisma ./prisma
 COPY scripts ./scripts
 EXPOSE 3000

@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" role="img" aria-labelledby="title desc">
+  <title id="title">Marca Teagar</title>
+  <desc id="desc">Monograma geométrico T em uma grade de engenharia.</desc>
+  <rect width="48" height="48" rx="2" fill="#2b2a28"/>
+  <path d="M8 10h32v8H28v22h-8V18H8z" fill="#ff6700"/>
+  <path d="M8 28h8v12H8zm24 0h8v12h-8z" fill="#f0f1f3"/>
+  <path d="M4 24h40M24 4v40" stroke="#fff" stroke-opacity=".16"/>
+</svg>

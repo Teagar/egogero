@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Estados de segurança | Referência Teagar</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@600;700;800;900&amp;family=IBM+Plex+Mono:wght@400;500;600&amp;family=Public+Sans:wght@400;500;600;700;800&amp;display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../styles/tokens.css"><link rel="stylesheet" href="../styles/reference.css">
+</head>
+<body>
+  <a class="skip-link" href="#conteudo">Ir para o conteúdo</a>
+  <header class="site-header"><div class="container topbar"><a class="brand" href="../index.html"><img src="../assets/brand-mark.svg" alt=""> Teagar</a><nav class="top-links" aria-label="Navegação"><a href="login.html">Entrar</a><a href="logout.html">Sair</a><a href="../index.html">Catálogo</a></nav></div></header>
+  <main id="conteudo">
+    <header class="page-header blueprint-grid"><div class="container"><p class="eyebrow">A03 / Falhar sem denunciar</p><h1>Estados de segurança</h1><p class="lede">Mensagens acionáveis para a pessoa, discretas sobre política, existência de recurso e motivo interno.</p></div></header>
+    <section class="section" aria-labelledby="sessao"><div class="container"><h2 id="sessao">Sessão e garantia</h2><div class="grid grid-3">
+      <article class="panel stack"><span class="status warning">Sessão expirada</span><h3>Entre novamente</h3><p class="muted">Sua sessão terminou por segurança. O trabalho salvo permanece disponível.</p><a class="button primary" href="login.html">Voltar a entrar</a></article>
+      <article class="panel stack"><span class="status warning">Reautenticação</span><h3>Confirme sua identidade</h3><p class="muted">Esta ação sensível exige uma confirmação recente no provedor.</p><button type="button">Confirmar identidade</button></article>
+      <article class="panel stack"><span class="status danger">MFA insuficiente</span><h3>Verificação adicional</h3><p class="muted">O nível atual de verificação não permite concluir esta ação.</p><button type="button">Reforçar verificação</button></article>
+    </div></div></section>
+    <section class="section" aria-labelledby="acesso"><div class="container"><h2 id="acesso">Conta e acesso</h2><div class="grid grid-3">
+      <article class="panel stack"><span class="status danger">Conta indisponível</span><h3>Acesso suspenso</h3><p class="muted">Não foi possível entrar. Procure o suporte da sua organização.</p><a href="login.html">Voltar à entrada</a></article>
+      <article class="panel stack"><span class="status danger">Vínculo inativo</span><h3>Sem acesso neste contexto</h3><p class="muted">Seu acesso ao condomínio selecionado não está disponível.</p><a href="../shell/select-condominium.html">Escolher outro vínculo</a></article>
+      <article class="panel stack"><span class="status">403 / 404 neutro</span><h3>Página indisponível</h3><p class="muted">Não encontramos uma página disponível para você neste endereço.</p><a href="../shell/dashboard.html">Ir para o início</a></article>
+    </div></div></section>
+    <section class="section"><div class="container notice"><strong>Recuperação:</strong> atualização de credenciais e fatores acontece no provedor de identidade, não nesta aplicação.</div></section>
+  </main>
+  <footer class="footer"><div class="container">Referência de conteúdo seguro: nenhuma mensagem confirma a existência de usuário, vínculo ou recurso.</div></footer>
+</body>
+</html>

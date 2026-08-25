@@ -9,6 +9,7 @@ import {
   parseBrowserSessionCookie
 } from './sessions.js';
 import type { BrowserSessionService, BrowserSessionStore } from './sessions.js';
+import type { ReauthenticationReturnTo } from './sessions.js';
 import type { AuthRateLimiter } from './auth-rate-limits.js';
 import { requestIpPrefix } from './client-ip.js';
 
@@ -94,6 +95,7 @@ export function registerBrowserAuthRoutes(
     return {
       account: snapshot.account,
       memberships: snapshot.memberships,
+      activeMembershipId: snapshot.activeMembershipId,
       activeTenantId: snapshot.activeTenantId,
       csrfToken: snapshot.csrfToken,
       expiresAt: snapshot.expiresAt.toISOString(),
@@ -126,6 +128,9 @@ export function registerBrowserAuthRoutes(
     });
     if (result.status === 'stale') {
       return reply.status(409).send({ error: 'stale_session' });
+    }
+    if (result.status === 'reauthentication-required') {
+      return reply.status(403).send({ error: 'reauthentication_required' });
     }
     if (result.status !== 'rotated') return reply.status(403).send({ error: 'forbidden' });
     reply.header('Set-Cookie', service.sessionCookie(result.sessionToken));
@@ -193,8 +198,9 @@ export function registerBrowserAuthRoutes(
   app.post('/auth/reauthenticate', unambiguous, async (request, reply) => {
     noStore(reply);
     if (!oidcService) return reply.status(503).send({ error: 'authentication_unavailable' });
+    let identity;
     try {
-      await authenticateMutation(request);
+      identity = await authenticateMutation(request);
     } catch (error) {
       if (!(error instanceof AuthenticationError)) throw error;
       for (const [name, value] of Object.entries(error.headers)) reply.header(name, value);
@@ -207,16 +213,57 @@ export function registerBrowserAuthRoutes(
       || (body.returnTo !== undefined && typeof body.returnTo !== 'string')) {
       return reply.status(400).send({ error: 'invalid_request' });
     }
-    const limited = await rateLimiter?.check('reauthentication_account', request.browserSessionSnapshot!.account.id);
-    if (limited && !limited.allowed) {
-      return reply.header('Retry-After', limited.retryAfterSeconds).status(429).send({ error: 'authentication_temporarily_unavailable' });
+    const returnTo = (body.returnTo ?? '/app') as ReauthenticationReturnTo;
+    if (!['/app', '/logout-all/continue'].includes(returnTo)
+      || !store.createReauthenticationStartIntent) {
+      return reply.status(400).send({ error: 'invalid_request' });
     }
-    const authorizationUrl = await oidcService.startLogin({
-      returnTo: body.returnTo as string | undefined,
+    if (!identity || identity.principalType !== 'human' || identity.authMethod !== 'oidc-session') {
+      return reply.status(401).send({ error: 'authentication_required' });
+    }
+    const limited = await rateLimiter!.check('reauthentication_account', identity.accountId);
+    if (!limited.allowed) {
+      return reply.header('Retry-After', limited.retryAfterSeconds).status(429)
+        .send({ error: 'authentication_temporarily_unavailable' });
+    }
+    const sessionToken = parseBrowserSessionCookie(request.headers.cookie)!;
+    const intentToken = await store.createReauthenticationStartIntent({
+      sessionToken,
+      returnTo,
       requestCorrelationId: request.id,
-      reauthentication: true,
-      reauthenticationFamilyId: request.browserSessionSnapshot!.familyId
+      ipPrefix: requestIpPrefix(request),
+      userAgent: typeof request.headers['user-agent'] === 'string' ? request.headers['user-agent'] : null
     });
-    return reply.redirect(authorizationUrl.toString(), 303);
+    return intentToken
+      ? { navigateTo: `/auth/reauthenticate/start/${intentToken}` }
+      : reply.status(401).send({ error: 'authentication_required' });
+  });
+
+  app.get('/auth/reauthenticate/start/:intent', unambiguous, async (request, reply) => {
+    noStore(reply);
+    if (!oidcService || !store.consumeReauthenticationStartIntent) {
+      return reply.status(503).send({ error: 'authentication_unavailable' });
+    }
+    const sessionToken = parseBrowserSessionCookie(request.headers.cookie);
+    const intentToken = String((request.params as Record<string, unknown>).intent ?? '');
+    const intent = sessionToken ? await store.consumeReauthenticationStartIntent({
+      sessionToken,
+      intentToken,
+      requestCorrelationId: request.id,
+      ipPrefix: requestIpPrefix(request),
+      userAgent: typeof request.headers['user-agent'] === 'string' ? request.headers['user-agent'] : null
+    }) : null;
+    if (!intent) return reply.status(401).send({ error: 'authentication_required' });
+    try {
+      const authorizationUrl = await oidcService.startLogin({
+        returnTo: intent.returnTo,
+        requestCorrelationId: request.id,
+        reauthentication: true,
+        reauthenticationFamilyId: intent.familyId
+      });
+      return reply.redirect(authorizationUrl.toString(), 303);
+    } catch {
+      return reply.redirect(oidcService.failurePath, 303);
+    }
   });
 }

@@ -1,4 +1,5 @@
 import { pathToFileURL } from 'node:url';
+import path from 'node:path';
 
 import { createApp } from './app.js';
 import { createCompositeAuthenticator, createDevelopmentHeaderAuthenticator } from './auth.js';
@@ -75,7 +76,8 @@ export async function startServer(environment: NodeJS.ProcessEnv = process.env) 
     browserSessionService,
     browserSessionStore,
     humanAdministrationService,
-    authRateLimiter
+    authRateLimiter,
+    frontendRoot: path.resolve(process.cwd(), 'web/dist')
   });
   registerAuthTelemetryLifecycle(app, authTelemetry);
 

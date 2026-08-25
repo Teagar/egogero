@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Gestão de moradores | Referência Teagar</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@600;700;800;900&amp;family=IBM+Plex+Mono:wght@400;500;600&amp;family=Public+Sans:wght@400;500;600;700;800&amp;display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../styles/tokens.css"><link rel="stylesheet" href="../styles/reference.css">
+</head>
+<body>
+  <a class="skip-link" href="#conteudo">Ir para o conteúdo</a>
+  <header class="site-header"><div class="container topbar"><a class="brand" href="../shell/dashboard.html"><img src="../assets/brand-mark.svg" alt=""> Jardins do Norte</a><nav class="top-links" aria-label="Navegação"><a href="../shell/dashboard.html">Visão geral</a><a href="resident.html">Convites de visitante</a><a href="../shell/select-condominium.html">Trocar contexto</a><a href="../index.html">Catálogo</a></nav></div></header>
+  <main id="conteudo">
+    <header class="page-header"><div class="container cluster spread"><div><p class="eyebrow">R02 / Papel: síndico</p><h1>Pessoas e vínculos</h1><p class="lede">Administração de quem pode entrar na plataforma e em qual papel.</p></div><button class="primary" type="button">Convidar pessoa</button></div></header>
+    <section class="section"><div class="container stack">
+      <div class="notice"><strong>Convite administrativo:</strong> cria um usuário ou vínculo humano e expira em 24 horas. Não é um passe de visitante.</div>
+      <section class="metrics" aria-label="Indicadores de pessoas"><div class="metric"><strong class="metric-value">247</strong><span class="metric-label">Moradores</span></div><div class="metric"><strong class="metric-value">11</strong><span class="metric-label">Equipe</span></div><div class="metric"><strong class="metric-value">03</strong><span class="metric-label">Convites pendentes</span></div><div class="metric"><strong class="metric-value">02</strong><span class="metric-label">Vínculos inativos</span></div></section>
+      <section aria-labelledby="membros"><div class="cluster spread"><div><p class="eyebrow">Diretório</p><h2 id="membros">Membros</h2></div><div class="cluster"><button class="secondary" type="button">Filtrar</button><button class="secondary" type="button">Exportar</button></div></div><div class="table-wrap"><table class="table-cards"><caption>Pessoas vinculadas ao Jardins do Norte</caption><thead><tr><th>Pessoa</th><th>Unidade</th><th>Papel</th><th>Vínculo</th><th>Ação</th></tr></thead><tbody><tr><td data-label="Pessoa"><strong>Ana Ribeiro</strong><br><span class="small muted">ana.r@example.com</span></td><td data-label="Unidade">804 / B</td><td data-label="Papel">Morador</td><td data-label="Vínculo"><span class="status success">Ativo</span></td><td data-label="Ação"><button class="secondary" type="button">Revisar</button></td></tr><tr><td data-label="Pessoa"><strong>João Freitas</strong><br><span class="small muted">joao.f@example.com</span></td><td data-label="Unidade">Portaria</td><td data-label="Papel">Porteiro</td><td data-label="Vínculo"><span class="status success">Ativo</span></td><td data-label="Ação"><button class="secondary" type="button">Revisar</button></td></tr><tr><td data-label="Pessoa"><strong>Carla Nunes</strong><br><span class="small muted">carla.n@example.com</span></td><td data-label="Unidade">1201 / A</td><td data-label="Papel">Morador</td><td data-label="Vínculo"><span class="status warning">Convidado</span></td><td data-label="Ação"><button class="secondary" type="button">Reenviar</button></td></tr></tbody></table></div></section>
+      <section class="panel signal" aria-labelledby="pendentes"><div class="cluster spread"><div><p class="eyebrow">Provisionamento</p><h2 id="pendentes">Convites pendentes</h2></div><span class="status warning">3 aguardando</span></div><p class="muted">Exiba destinatário, papel e prazo, nunca o token bruto do convite.</p><div class="cluster"><button type="button">Revisar convites</button><a href="../auth/invitation.html">Ver experiência do destinatário</a></div></section>
+    </div></section>
+  </main>
+  <footer class="footer"><div class="container">Contexto: Jardins do Norte · Síndico · Marina Costa</div></footer>
+</body>
+</html>

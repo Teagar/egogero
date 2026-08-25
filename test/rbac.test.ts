@@ -678,7 +678,9 @@ test('route inventory keeps every business route in the RBAC matrix', async () =
       '│       └── /dispositivos (POST, GET, HEAD)',
       '│           └── /:deviceId (DELETE)',
       '├── /moradores (POST)',
-      '└── /portaria/convites/validar (POST)',
+      '├── /portaria/convites/validar (POST)',
+      '├── /portaria/human/convites/validar (POST)',
+      '└── /portaria/human/validacoes-recentes (GET, HEAD)',
       ''
     ].join('\n')
   );

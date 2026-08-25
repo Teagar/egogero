@@ -17,6 +17,7 @@ import { authorize, isUuid } from './auth.js';
 import type { Authenticator } from './auth.js';
 import { createMemoryDeviceRateLimiter, DEVICE_RATE_LIMIT } from './dispositivos.js';
 import type { DeviceRateLimiter } from './dispositivos.js';
+import type { AuthRateLimiter } from './auth-rate-limits.js';
 import { insertEntryNotification } from './notificacoes.js';
 import { isValidTimeZone } from './timezones.js';
 
@@ -124,6 +125,15 @@ export type AccessAuditRecord = {
   result: 'permitido' | 'negado';
 };
 
+export type HumanAccessAuditRecord = {
+  id: string;
+  createdAt: Date;
+  accessType: AccessType;
+  result: 'permitido' | 'negado';
+  invitationType: TipoConvite | null;
+  guestName: string | null;
+};
+
 export interface InvitationStore {
   createActive(args: InvitationAllocation): Promise<InvitationRecord | null>;
   createBatchActive(args: readonly InvitationAllocation[]): Promise<readonly InvitationRecord[] | null>;
@@ -134,6 +144,18 @@ export interface InvitationStore {
     accessType: AccessType;
     requireActiveDevice?: boolean;
   }, now: Date): Promise<InvitationValidationResult>;
+  validateHumanActive?(args: {
+    token: string | null;
+    condominiumId: string;
+    accountId: string;
+    membershipId: string;
+    accessType: AccessType;
+  }, now: Date): Promise<InvitationValidationResult>;
+  listHumanAudits?(args: {
+    condominiumId: string;
+    accountId: string;
+    limit: number;
+  }): Promise<readonly HumanAccessAuditRecord[]>;
   listOwnedAudits(args: {
     condominiumId: string;
     residentId: string;
@@ -668,10 +690,12 @@ export function createPrismaInvitationStore(
     throw new TokenGenerationExhaustedError();
   }
 
-  async function validateActive(args: {
+  async function validateAccess(args: {
     token: string | null;
     condominiumId: string;
-    deviceId: string;
+    deviceId?: string;
+    accountId?: string;
+    membershipId?: string;
     accessType: AccessType;
     requireActiveDevice?: boolean;
   }): Promise<InvitationValidationResult> {
@@ -682,24 +706,77 @@ export function createPrismaInvitationStore(
         createdAt?: Date
       ) => {
         const auditTime = createdAt ?? new Date();
-        await transaction.$executeRaw`
-          INSERT INTO "AuditoriaAcesso" (
-            id, "createdAt", "condominioId", "dispositivoId", "conviteId",
-            "moradorId", "convidadoId", "tipoAcesso", resultado
-          ) VALUES (
-            ${randomUUID()}, ${auditTime}, ${args.condominiumId}, ${args.deviceId}, ${identified?.id ?? null},
-            ${identified?.moradorId ?? null}, ${identified?.convidadoId ?? null},
-            ${args.accessType}::"TipoAcesso", ${result}::"ResultadoAcesso"
-          )
-        `;
+        if (args.accountId && args.membershipId) {
+          await transaction.$executeRaw`
+            INSERT INTO "AuditoriaAcessoHumano" (
+              id, "createdAt", "condominioId", "accountId", "membershipId", "conviteId",
+              "moradorId", "convidadoId", "tipoAcesso", resultado
+            ) VALUES (
+              ${randomUUID()}::uuid, ${auditTime}, ${args.condominiumId}, ${args.accountId}::uuid,
+              ${args.membershipId}::uuid, ${identified?.id ?? null}, ${identified?.moradorId ?? null},
+              ${identified?.convidadoId ?? null}, ${args.accessType}::"TipoAcesso", ${result}::"ResultadoAcesso"
+            )
+          `;
+        } else {
+          await transaction.$executeRaw`
+            INSERT INTO "AuditoriaAcesso" (
+              id, "createdAt", "condominioId", "dispositivoId", "conviteId",
+              "moradorId", "convidadoId", "tipoAcesso", resultado
+            ) VALUES (
+              ${randomUUID()}, ${auditTime}, ${args.condominiumId}, ${args.deviceId!}, ${identified?.id ?? null},
+              ${identified?.moradorId ?? null}, ${identified?.convidadoId ?? null},
+              ${args.accessType}::"TipoAcesso", ${result}::"ResultadoAcesso"
+            )
+          `;
+        }
       };
+
+      if (args.accountId && args.membershipId) {
+        // Match administrative lock order: account, membership, then condominium.
+        const accounts = await transaction.$queryRaw<Array<{ status: string }>>`
+          SELECT status::text FROM "HumanAccount"
+          WHERE id = ${args.accountId}::uuid
+          FOR UPDATE
+        `;
+        if (accounts[0]?.status !== 'active') {
+          await insertAudit('negado');
+          return { allowed: false, reason: 'invalid_or_unavailable' };
+        }
+        const memberships = await transaction.$queryRaw<Array<{
+          accountId: string;
+          condominioId: string | null;
+          role: string;
+          status: string;
+        }>>`
+          SELECT "accountId", "condominioId", role::text, status::text
+          FROM "HumanMembership"
+          WHERE id = ${args.membershipId}::uuid
+          FOR UPDATE
+        `;
+        const membership = memberships[0];
+        if (!membership || membership.accountId !== args.accountId
+          || membership.condominioId !== args.condominiumId
+          || membership.role !== 'portaria' || membership.status !== 'active') {
+          await insertAudit('negado');
+          return { allowed: false, reason: 'invalid_or_unavailable' };
+        }
+        const condominiums = await transaction.$queryRaw<Array<{ deletedAt: Date | null }>>`
+          SELECT "deletedAt" FROM "Condominio"
+          WHERE id = ${args.condominiumId}
+          FOR UPDATE
+        `;
+        if (!condominiums[0] || condominiums[0].deletedAt !== null) {
+          await insertAudit('negado');
+          return { allowed: false, reason: 'invalid_or_unavailable' };
+        }
+      }
 
       if (args.requireActiveDevice) {
         const activeDevices = await transaction.$queryRaw<Array<{ id: string }>>`
           SELECT dispositivo.id
           FROM "Dispositivo" AS dispositivo
           JOIN "Condominio" AS condominio ON condominio.id = dispositivo."condominioId"
-          WHERE dispositivo.id = ${args.deviceId}
+          WHERE dispositivo.id = ${args.deviceId!}
             AND dispositivo."condominioId" = ${args.condominiumId}
             AND dispositivo.status = 'ativo'
             AND dispositivo."apiKeyDigest" IS NOT NULL
@@ -851,7 +928,42 @@ export function createPrismaInvitationStore(
     createBatchActive: inTransaction,
 
     validateActive(args) {
-      return validateActive(args);
+      return validateAccess(args);
+    },
+
+    validateHumanActive(args) {
+      return validateAccess(args);
+    },
+
+    async listHumanAudits({ condominiumId, accountId, limit }) {
+      const rows = await client.$queryRaw<Array<{
+        id: string;
+        createdAt: Date;
+        tipoAcesso: AccessType;
+        resultado: 'permitido' | 'negado';
+        invitationType: TipoConvite | null;
+        guestName: string | null;
+      }>>`
+        SELECT audit.id, audit."createdAt", audit."tipoAcesso", audit.resultado,
+               CASE WHEN audit.resultado = 'permitido' THEN convite.tipo ELSE NULL END AS "invitationType",
+               CASE WHEN audit.resultado = 'permitido' THEN convidado.nome ELSE NULL END AS "guestName"
+        FROM "AuditoriaAcessoHumano" audit
+        LEFT JOIN "Convite" convite ON convite.id = audit."conviteId"
+        LEFT JOIN "Convidado" convidado ON convidado.id = audit."convidadoId"
+          AND convidado."condominioId" = audit."condominioId"
+        WHERE audit."condominioId" = ${condominiumId}
+          AND audit."accountId" = ${accountId}::uuid
+        ORDER BY audit."createdAt" DESC, audit.id DESC
+        LIMIT ${limit}
+      `;
+      return rows.map((row) => ({
+        id: row.id,
+        createdAt: row.createdAt,
+        accessType: row.tipoAcesso,
+        result: row.resultado,
+        invitationType: row.invitationType,
+        guestName: row.guestName
+      }));
     },
 
     async listOwnedAudits({ condominiumId, residentId, cursor, limit }) {
@@ -1079,13 +1191,16 @@ export function registerConviteRoutes(
   publicValidationBaseUrl?: string,
   deviceRateLimiter: DeviceRateLimiter = createMemoryDeviceRateLimiter(),
   developmentRateLimiter: DeviceRateLimiter = createMemoryDeviceRateLimiter(),
-  secureValidationTransport = false
+  secureValidationTransport = false,
+  authRateLimiter?: AuthRateLimiter
 ) {
   const singlePath = '/condominios/:condominioId/moradores/:moradorId/convidados/:convidadoId/convites';
   const batchPath = '/condominios/:condominioId/moradores/:moradorId/convites/multiplos';
   const revokePath = '/condominios/:condominioId/moradores/:moradorId/convites/:conviteId';
   const auditPath = '/condominios/:condominioId/moradores/:moradorId/auditorias-acesso';
   const validationPath = '/portaria/convites/validar';
+  const humanValidationPath = '/portaria/human/convites/validar';
+  const humanRecentPath = '/portaria/human/validacoes-recentes';
   const management = {
     preHandler: authorize(
       authenticator,
@@ -1159,6 +1274,67 @@ export function registerConviteRoutes(
       }
       throw error;
     }
+  });
+
+  const humanGatehouse = { preHandler: authorize(authenticator, 'convites:validate') };
+  app.post(humanValidationPath, humanGatehouse, async (request, reply) => {
+    reply.header('cache-control', 'no-store');
+    const identity = request.authenticatedIdentity;
+    const snapshot = request.browserSessionSnapshot;
+    const condominiumId = identity?.role === 'portaria' && identity.principalType === 'human'
+      && identity.condominioIds.length === 1 ? identity.condominioIds[0] : null;
+    if (!identity || identity.authMethod !== 'oidc-session' || !condominiumId || !snapshot) {
+      return reply.status(403).send({ allowed: false, reason: 'invalid_or_unavailable' });
+    }
+    const limited = await authRateLimiter?.check('human_validation_account', identity.accountId);
+    if (limited && !limited.allowed) {
+      return reply.header('retry-after', limited.retryAfterSeconds).status(429)
+        .send({ allowed: false, reason: 'invalid_or_unavailable' });
+    }
+    const body = parseValidationBody(request.body);
+    if (!body || !store?.validateHumanActive) {
+      return reply.status(store ? 400 : 503).send({ allowed: false, reason: 'invalid_or_unavailable' });
+    }
+    try {
+      const result = await store.validateHumanActive({
+        token: body.token,
+        condominiumId,
+        accountId: identity.accountId,
+        membershipId: snapshot.activeMembershipId,
+        accessType: body.accessType
+      }, new Date());
+      return result.allowed
+        ? { allowed: true, guest: result.guest, invitation: result.invitation }
+        : result;
+    } catch (error) {
+      if (error instanceof InvitationSecretMismatchError) {
+        return reply.status(503).send({ allowed: false, reason: 'invalid_or_unavailable' });
+      }
+      throw error;
+    }
+  });
+
+  app.get(humanRecentPath, humanGatehouse, async (request, reply) => {
+    reply.header('cache-control', 'no-store');
+    const identity = request.authenticatedIdentity;
+    const condominiumId = identity?.role === 'portaria' && identity.principalType === 'human'
+      && identity.condominioIds.length === 1 ? identity.condominioIds[0] : null;
+    if (!identity || identity.authMethod !== 'oidc-session' || !condominiumId || !store?.listHumanAudits) {
+      return reply.status(403).send({ error: 'unavailable' });
+    }
+    const audits = await store.listHumanAudits({
+      condominiumId,
+      accountId: identity.accountId,
+      limit: 25
+    });
+    return audits.map((audit) => ({
+      id: audit.id,
+      occurredAt: audit.createdAt.toISOString(),
+      accessType: audit.accessType,
+      result: audit.result,
+      invitationType: audit.invitationType,
+      guestName: audit.guestName
+    }));
   });
 
   app.get(auditPath, {

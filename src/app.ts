@@ -29,6 +29,7 @@ import type { HumanAdministrationService } from './human-administration.js';
 import { prisma as defaultPrisma } from './lib/prisma.js';
 import { isDatabaseTimeZoneRejection, isValidTimeZone } from './timezones.js';
 import type { AuthRateLimiter } from './auth-rate-limits.js';
+import { registerFrontend } from './frontend.js';
 
 type CondominioRecord = {
   id: string;
@@ -438,7 +439,8 @@ export function createApp(
     browserSessionService,
     browserSessionStore,
     humanAdministrationService,
-    authRateLimiter
+    authRateLimiter,
+    frontendRoot
   }: {
     db?: AppDependencies;
     invitationStore?: InvitationStore;
@@ -459,6 +461,7 @@ export function createApp(
     browserSessionStore?: BrowserSessionStore;
     humanAdministrationService?: HumanAdministrationService;
     authRateLimiter?: AuthRateLimiter;
+    frontendRoot?: string;
   } = {}
 ) {
   if (!authRateLimiter && (oidcService || browserSessionService || browserSessionStore || humanAdministrationService)) {
@@ -481,6 +484,7 @@ export function createApp(
     ?? suppliedDb?.notificationSender
     ?? createUnavailableNotificationSender();
   const app = Fastify({ logger: false, trustProxy });
+  registerFrontend(app, frontendRoot);
   app.setErrorHandler((error, _request, reply) => {
     if (error instanceof DeviceSecretMismatchError) {
       return reply.status(503).send({ error: 'Device service unavailable' });
@@ -786,7 +790,8 @@ export function createApp(
     publicValidationBaseUrl,
     deviceRateLimiter,
     developmentRateLimiter,
-    secureValidationTransport
+    secureValidationTransport,
+    authRateLimiter
   );
   registerNotificationRoutes(app, db.notificacao, authenticator);
   registerOidcRoutes(

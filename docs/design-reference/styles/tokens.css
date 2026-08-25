@@ -1,0 +1,35 @@
+:root {
+  --ink: #1c1b1a;
+  --charcoal: #2b2a28;
+  --charcoal-deep: #201f1d;
+  --paper: #f0f1f3;
+  --paper-raised: #ffffff;
+  --paper-muted: #e3e5e9;
+  --signal: #ff6700;
+  --signal-deep: #c94e00;
+  --signal-tint: #fce3d2;
+  --blueprint: #1f4b8c;
+  --blueprint-deep: #15335f;
+  --blueprint-tint: #dde6f3;
+  --steel: #585c63;
+  --steel-soft: #8a8e94;
+  --line: #d3d6db;
+  --success: #1f7a52;
+  --success-tint: #dcece5;
+  --warning: #a66a00;
+  --warning-tint: #f8ebcf;
+  --danger: #b8352a;
+  --danger-tint: #f5deda;
+  --font-display: "Big Shoulders Display", sans-serif;
+  --font-body: "Public Sans", sans-serif;
+  --font-mono: "IBM Plex Mono", monospace;
+  --space-1: 8px;
+  --space-2: 16px;
+  --space-3: 24px;
+  --space-4: 32px;
+  --space-5: 48px;
+  --space-6: 64px;
+  --radius-sm: 2px;
+  --radius-md: 4px;
+  --content: 1180px;
+}

@@ -28,7 +28,9 @@ test('migrations form one exact contiguous immutable sequence', async () => {
     '0019_add_oidc_reauthentication_intent',
     '0020_add_human_provisioning_mfa_recovery',
     '0021_add_distributed_auth_rate_limits',
-    '0022_add_callback_reservations_and_intent_checks'
+    '0022_add_callback_reservations_and_intent_checks',
+    '0023_add_human_gatehouse_access_audit',
+    '0024_add_reauthentication_start_intent'
   ]);
 });
 

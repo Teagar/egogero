@@ -11,6 +11,7 @@ export const AUTH_RATE_LIMIT_POLICIES = {
   session_creation_account: { limit: 10, windowMs: 15 * 60_000, backoffMs: 15 * 60_000 },
   recovery_ip: { limit: 3, windowMs: 30 * 60_000 },
   reauthentication_account: { limit: 5, windowMs: 10 * 60_000 },
+  human_validation_account: { limit: 20, windowMs: 60_000 },
   authentication_failure_ip: { limit: 60, windowMs: 60_000 }
 } as const;
 

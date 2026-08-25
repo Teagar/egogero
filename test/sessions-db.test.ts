@@ -252,6 +252,43 @@ test(
       assert.deepEqual(await store.authenticate(first.sessionToken, 'authenticate-provider'), first.identity);
       const otherSession = await issue(await createHandoff(undefined, otherAccountId, otherExternalIdentityId));
       assert.ok(otherSession);
+      const startIntent = await store.createReauthenticationStartIntent!({
+        sessionToken: first.sessionToken, returnTo: '/app', requestCorrelationId: 'reauth-start-create'
+      });
+      assert.ok(startIntent);
+      const storedIntent = await prisma.reauthenticationStartIntent.findFirstOrThrow({
+        where: { accountId, consumedAt: null }
+      });
+      assert.deepEqual(Buffer.from(storedIntent.tokenDigest), digest(startIntent));
+      assert.equal(JSON.stringify(storedIntent).includes(startIntent), false, 'only the intent digest is persisted');
+      assert.equal(await store.consumeReauthenticationStartIntent!({
+        sessionToken: otherSession.sessionToken, intentToken: startIntent,
+        requestCorrelationId: 'reauth-start-cross-session'
+      }), null);
+      assert.deepEqual(await store.consumeReauthenticationStartIntent!({
+        sessionToken: first.sessionToken, intentToken: startIntent,
+        requestCorrelationId: 'reauth-start-consume'
+      }), { accountId, familyId: firstStored.familyId, returnTo: '/app' });
+      assert.equal(await store.consumeReauthenticationStartIntent!({
+        sessionToken: first.sessionToken, intentToken: startIntent,
+        requestCorrelationId: 'reauth-start-replay'
+      }), null);
+      const expiredIntent = await store.createReauthenticationStartIntent!({
+        sessionToken: first.sessionToken, returnTo: '/logout-all/continue',
+        requestCorrelationId: 'reauth-start-expired-create'
+      });
+      assert.ok(expiredIntent);
+      await prisma.reauthenticationStartIntent.update({
+        where: { tokenDigest: digest(expiredIntent) },
+        data: {
+          createdAt: new Date(Date.now() - 10 * 60_000),
+          expiresAt: new Date(Date.now() - 5 * 60_000)
+        }
+      });
+      assert.equal(await store.consumeReauthenticationStartIntent!({
+        sessionToken: first.sessionToken, intentToken: expiredIntent,
+        requestCorrelationId: 'reauth-start-expired'
+      }), null);
       const switchedAccount = await issue(await createHandoff(), otherSession.sessionToken);
       assert.ok(switchedAccount);
       assert.equal(switchedAccount.identity.accountId, accountId);
@@ -553,6 +590,9 @@ test(
           && !metadata.includes('ciphertext') && !metadata.includes('csrf');
       }));
     } finally {
+      await prisma.reauthenticationStartIntent.deleteMany({
+        where: { accountId: { in: [accountId, otherAccountId] } }
+      }).catch(() => undefined);
       await prisma.oidcValidatedHandoff.deleteMany({
         where: { accountId: { in: [accountId, otherAccountId] } }
       }).catch(() => undefined);

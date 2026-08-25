@@ -110,6 +110,21 @@ model AuditoriaAcesso {
   @@index([condominioId, createdAt])
 }
 
+model AuditoriaAcessoHumano {
+  id            String          @id @default(uuid()) @db.Uuid
+  createdAt     DateTime        @default(now()) @db.Timestamptz(3)
+  condominioId  String
+  accountId     String          @db.Uuid
+  membershipId  String          @db.Uuid
+  conviteId     String?
+  moradorId     String?
+  convidadoId   String?
+  tipoAcesso    TipoAcesso
+  resultado     ResultadoAcesso
+
+  @@index([condominioId, accountId, createdAt, id])
+}
+
 model Dispositivo {
   id           String                @id @default(uuid())
   createdAt    DateTime              @default(now()) @db.Timestamptz(3)
@@ -380,6 +395,19 @@ model RecoveryWebhookEvent {
 
   @@unique([issuer, eventId])
   @@index([createdAt])
+}
+
+model ReauthenticationStartIntent {
+  id          String    @id @default(uuid()) @db.Uuid
+  createdAt   DateTime  @default(now()) @db.Timestamptz(3)
+  expiresAt   DateTime  @db.Timestamptz(3)
+  consumedAt  DateTime? @db.Timestamptz(3)
+  tokenDigest Bytes     @unique
+  accountId   String    @db.Uuid
+  familyId    String    @db.Uuid
+  returnTo    String
+
+  @@index([expiresAt, consumedAt, id])
 }
 
 model AuthenticationAuditEvent {

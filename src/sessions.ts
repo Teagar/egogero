@@ -29,6 +29,7 @@ export const SESSION_ABSOLUTE_TTL_MS = 12 * 60 * 60 * 1000;
 export const SESSION_TOUCH_INTERVAL_MS = 5 * 60 * 1000;
 export const SESSION_CREATION_LIMIT = 10;
 export const SESSION_CREATION_WINDOW_MS = 15 * 60 * 1000;
+export const REAUTHENTICATION_START_TTL_MS = 5 * 60 * 1000;
 export const CLEARED_SESSION_COOKIE = `${SESSION_COOKIE_NAME}=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0`;
 
 const CSRF_PURPOSE = 'egogero-csrf-v1';
@@ -49,8 +50,11 @@ export type BrowserSessionSnapshot = {
     id: string;
     role: Role;
     tenantId: string | null;
+    tenantLabel: string | null;
     residentId: string | null;
+    residentLabel: string | null;
   }>;
+  activeMembershipId: string;
   activeTenantId: string | null;
   csrfToken: string;
   csrfDigest: Buffer;
@@ -76,7 +80,7 @@ export type IssuedBrowserSession = {
 
 export type SessionRotationResult =
   | ({ status: 'rotated' } & IssuedBrowserSession)
-  | { status: 'stale' | 'denied' };
+  | { status: 'stale' | 'denied' | 'reauthentication-required' };
 
 export type SessionRevocationResult = 'revoked' | 'already-revoked' | 'unavailable';
 
@@ -85,6 +89,8 @@ export type SessionRequestContext = {
   ipPrefix?: string | null;
   userAgent?: string | null;
 };
+
+export type ReauthenticationReturnTo = '/app' | '/logout-all/continue';
 
 export interface BrowserSessionStore {
   readonly publicApplicationOrigin: string;
@@ -106,6 +112,14 @@ export interface BrowserSessionStore {
   revokeAll(input: SessionRequestContext & { sessionToken: string }): Promise<'revoked' | 'reauthentication-required' | 'unavailable'>;
   recordAmbiguousCredentials(input: SessionRequestContext): Promise<void>;
   recordCsrfFailure?(input: SessionRequestContext): Promise<void>;
+  createReauthenticationStartIntent?(input: SessionRequestContext & {
+    sessionToken: string;
+    returnTo: ReauthenticationReturnTo;
+  }): Promise<string | null>;
+  consumeReauthenticationStartIntent?(input: SessionRequestContext & {
+    sessionToken: string;
+    intentToken: string;
+  }): Promise<{ accountId: string; familyId: string; returnTo: ReauthenticationReturnTo } | null>;
 }
 
 export interface BrowserSessionService {
@@ -124,7 +138,9 @@ type MembershipRow = {
   accountId: string;
   role: Role;
   condominioId: string | null;
+  condominiumName?: string | null;
   residentId: string | null;
+  residentName?: string | null;
 };
 
 type SessionRow = MembershipRow & {
@@ -523,6 +539,7 @@ async function loadSession(transaction: Prisma.TransactionClient, tokenDigest: B
            account.status::text AS "accountStatus", account."displayName" AS "accountDisplayName", membership.id,
            membership."accountId", membership.role, membership.status::text AS "membershipStatus",
            membership."condominioId", membership."residentId",
+           condominium.nome AS "condominiumName", resident.nome AS "residentName",
            condominium."deletedAt" AS "condominiumDeletedAt",
            resident."deletedAt" AS "residentDeletedAt",
            resident."condominioId" AS "residentCondominiumId",
@@ -607,6 +624,59 @@ export function createPrismaBrowserSessionStore(
 
   return {
     publicApplicationOrigin: config.publicApplicationOrigin,
+    async createReauthenticationStartIntent(input) {
+      if (!validSessionToken(input.sessionToken)
+        || !['/app', '/logout-all/continue'].includes(input.returnTo)) return null;
+      return client.$transaction(async (transaction) => {
+        const session = await loadSession(transaction, digest(input.sessionToken), true);
+        if (!session || sessionDenialReason(session)) return null;
+        await transaction.$executeRaw`
+          DELETE FROM "ReauthenticationStartIntent"
+          WHERE id IN (
+            SELECT id FROM "ReauthenticationStartIntent"
+            WHERE "expiresAt" <= clock_timestamp() OR "consumedAt" IS NOT NULL
+            ORDER BY "expiresAt", id
+            LIMIT 100
+          )
+        `;
+        const token = generateSessionToken();
+        await transaction.$executeRaw`
+          INSERT INTO "ReauthenticationStartIntent" (
+            id, "createdAt", "expiresAt", "tokenDigest", "accountId", "familyId", "returnTo"
+          ) VALUES (
+            ${randomUUID()}::uuid, statement_timestamp(), statement_timestamp() + interval '5 minutes', ${digest(token)},
+            ${session.accountId}::uuid, ${session.familyId}::uuid, ${input.returnTo}
+          )
+        `;
+        return token;
+      });
+    },
+
+    async consumeReauthenticationStartIntent(input) {
+      if (!validSessionToken(input.sessionToken) || !validSessionToken(input.intentToken)) return null;
+      return client.$transaction(async (transaction) => {
+        // Session first, then intent: every create/consume path uses this lock order.
+        const session = await loadSession(transaction, digest(input.sessionToken), true);
+        if (!session || sessionDenialReason(session)) return null;
+        const rows = await transaction.$queryRaw<Array<{ returnTo: ReauthenticationReturnTo }>>`
+          UPDATE "ReauthenticationStartIntent"
+          SET "consumedAt" = clock_timestamp()
+          WHERE "tokenDigest" = ${digest(input.intentToken)}
+            AND "accountId" = ${session.accountId}::uuid
+            AND "familyId" = ${session.familyId}::uuid
+            AND "consumedAt" IS NULL
+            AND "expiresAt" > clock_timestamp()
+          RETURNING "returnTo"
+        `;
+        const intent = rows[0];
+        return intent ? {
+          accountId: session.accountId,
+          familyId: session.familyId,
+          returnTo: intent.returnTo
+        } : null;
+      });
+    },
+
     async issueFromHandoff(input) {
       const request = input;
       if (!validSessionToken(input.handoffToken)
@@ -967,8 +1037,9 @@ export function createPrismaBrowserSessionStore(
           ? session.idleExpiresAt
           : await touchSession(transaction, session);
         const memberships = await transaction.$queryRaw<MembershipRow[]>(Prisma.sql`
-          SELECT membership.id, membership."accountId", membership.role,
-                 membership."condominioId", membership."residentId"
+           SELECT membership.id, membership."accountId", membership.role,
+                  membership."condominioId", membership."residentId",
+                  condominium.nome AS "condominiumName", resident.nome AS "residentName"
           FROM "HumanMembership" membership
           LEFT JOIN "Condominio" condominium ON condominium.id = membership."condominioId"
           LEFT JOIN "Morador" resident ON resident.id = membership."residentId"
@@ -985,8 +1056,11 @@ export function createPrismaBrowserSessionStore(
             id: membership.id,
             role: membership.role,
             tenantId: membership.condominioId,
-            residentId: membership.residentId
+            tenantLabel: membership.condominiumName ?? null,
+            residentId: membership.residentId,
+            residentLabel: membership.residentName ?? null
           })),
+          activeMembershipId: session.id,
           activeTenantId: session.condominioId,
           csrfToken: csrf.toString('base64url'),
           csrfDigest: Buffer.from(session.csrfDigest),
@@ -1058,7 +1132,7 @@ export function createPrismaBrowserSessionStore(
           amr: session.authenticationMethods, acr: session.assuranceContext
         })) {
           await auditDenied(transaction, input, 'mfa_policy_denied', 'insufficient_authentication_assurance', session);
-          return { status: 'denied' };
+          return { status: 'reauthentication-required' };
         }
         const creationLimit = await rateLimiter.check('session_creation_account', session.accountId, true, transaction);
         if (!creationLimit.allowed) {

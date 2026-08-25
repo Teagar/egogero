@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Entrar | Referência Teagar</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@600;700;800;900&amp;family=IBM+Plex+Mono:wght@400;500;600&amp;family=Public+Sans:wght@400;500;600;700;800&amp;display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../styles/tokens.css"><link rel="stylesheet" href="../styles/reference.css">
+</head>
+<body>
+  <a class="skip-link" href="#conteudo">Ir para o conteúdo</a>
+  <main id="conteudo" class="auth-layout">
+    <aside class="auth-rail blueprint-grid" aria-label="Apresentação">
+      <a class="brand" href="../index.html"><img src="../assets/brand-mark.svg" alt=""> Teagar</a>
+      <div class="auth-rail-copy"><p class="eyebrow">Acesso controlado</p><h1>Entre no seu contexto.</h1><p class="muted">Identidade centralizada, vínculo explícito e nenhuma senha mantida por esta plataforma.</p></div>
+    </aside>
+    <section class="auth-main" aria-labelledby="titulo">
+      <div class="auth-card stack">
+        <div><p class="eyebrow">OIDC / estado normal</p><h2 id="titulo">Entrar na plataforma</h2><p class="muted">Você será direcionado ao provedor de identidade da organização.</p></div>
+        <div class="panel stack">
+          <div class="notice">Confirme o domínio antes de continuar: <strong>identidade.teagar.com.br</strong>.</div>
+          <button class="primary" type="button"><svg class="icon" aria-hidden="true"><path d="M5 12h13M13 6l6 6-6 6"/></svg>Continuar com identidade corporativa</button>
+          <a href="security.html">Não consigo acessar minha conta</a>
+          <p class="field-help">Recuperação e credenciais são administradas pelo provedor de identidade.</p>
+          <div class="demo-state stack" aria-labelledby="carregando"><p class="eyebrow" id="carregando">Exemplo / carregando</p><button type="button" disabled aria-busy="true">Conectando ao provedor…</button><div class="skeleton" aria-hidden="true"></div></div>
+          <div class="demo-state stack" aria-labelledby="falha"><p class="eyebrow" id="falha">Exemplo / erro</p><div class="notice error" role="alert" aria-live="polite"><strong>Não foi possível entrar.</strong><br>Tente novamente ou fale com o suporte se o problema continuar.</div><button class="secondary" type="button">Tentar novamente</button></div>
+        </div>
+        <nav class="cluster small" aria-label="Referências relacionadas"><a href="invitation.html">Convites</a><a href="security.html">Estados de segurança</a><a href="../index.html">Catálogo</a></nav>
+      </div>
+    </section>
+  </main>
+</body>
+</html>

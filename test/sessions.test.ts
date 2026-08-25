@@ -331,8 +331,9 @@ test('browser auth endpoints are no-store and implement session, tenant, logout,
     identity,
     familyId: randomUUID(),
     account: { id: accountId, displayName: 'Person' },
-    memberships: [{ id: membershipId, role: 'provedor' as const, tenantId: null, residentId: null }],
-    activeTenantId: null, csrfToken,
+    memberships: [{ id: membershipId, role: 'provedor' as const, tenantId: null, tenantLabel: null,
+      residentId: null, residentLabel: null }],
+    activeMembershipId: membershipId, activeTenantId: null, csrfToken,
     csrfDigest: createHash('sha256').update(Buffer.from(csrfToken, 'base64url')).digest(),
     expiresAt: new Date('2030-01-01T00:00:00Z'), idleExpiresAt: new Date('2030-01-01T00:00:00Z'),
     authenticatedAt: new Date()
@@ -342,6 +343,12 @@ test('browser auth endpoints are no-store and implement session, tenant, logout,
   let authenticationLive = true;
   let ambiguousAudits = 0;
   let reauthenticationFamilyId: string | undefined;
+  let reauthenticationReturnTo: string | undefined;
+  let reauthenticationAllowed = true;
+  let reauthenticationChecks = 0;
+  let createdIntents = 0;
+  let startLoginFails = false;
+  const reauthenticationIntents = new Map<string, '/app' | '/logout-all/continue'>();
   let staleRotation = false;
   let revokeAllResult: 'revoked' | 'reauthentication-required' = 'reauthentication-required';
   const store = {
@@ -356,12 +363,26 @@ test('browser auth endpoints are no-store and implement session, tenant, logout,
     },
     async revoke() { revoked += 1; return 'revoked' as const; },
     async revokeAll() { return revokeAllResult; },
+    async createReauthenticationStartIntent({ returnTo }: { returnTo: '/app' | '/logout-all/continue' }) {
+      createdIntents += 1;
+      const intent = generateSessionToken();
+      reauthenticationIntents.set(intent, returnTo);
+      return intent;
+    },
+    async consumeReauthenticationStartIntent({ intentToken }: { intentToken: string }) {
+      const returnTo = reauthenticationIntents.get(intentToken);
+      if (!returnTo) return null;
+      reauthenticationIntents.delete(intentToken);
+      return { accountId, familyId: snapshot.familyId, returnTo };
+    },
     async recordAmbiguousCredentials() { ambiguousAudits += 1; }
   } satisfies BrowserSessionStore;
   const oidcService = {
     failurePath: '/auth/error',
-    async startLogin(input: { reauthenticationFamilyId?: string }) {
+    async startLogin(input: { reauthenticationFamilyId?: string; returnTo?: string }) {
+      if (startLoginFails) throw new Error('provider unavailable');
       reauthenticationFamilyId = input.reauthenticationFamilyId;
+      reauthenticationReturnTo = input.returnTo;
       return new URL('https://identity.example.test/authorize?max_age=0&prompt=login');
     },
     async completeCallback() { throw new Error('not used'); }
@@ -371,7 +392,15 @@ test('browser auth endpoints are no-store and implement session, tenant, logout,
     browserSessionService: createBrowserSessionService(store),
     oidcService,
     authRateLimiter: {
-      async check() { return { allowed: true, retryAfterSeconds: 0, repeatedExcess: false }; },
+      async check(action) {
+        if (action === 'reauthentication_account') {
+          reauthenticationChecks += 1;
+          return reauthenticationAllowed
+            ? { allowed: true, retryAfterSeconds: 0, repeatedExcess: false }
+            : { allowed: false, retryAfterSeconds: 17, repeatedExcess: false };
+        }
+        return { allowed: true, retryAfterSeconds: 0, repeatedExcess: false };
+      },
       async reserveFailure() { return { allowed: true, retryAfterSeconds: 0, repeatedExcess: false, reservationId: randomUUID() }; },
       async finalizeFailure() {}
     }
@@ -384,6 +413,11 @@ test('browser auth endpoints are no-store and implement session, tenant, logout,
   assert.equal(session.statusCode, 200);
   assert.equal(session.headers['cache-control'], 'no-store');
   assert.equal(session.json().csrfToken, csrfToken);
+  assert.equal(session.json().activeMembershipId, membershipId);
+  assert.deepEqual(session.json().memberships[0], {
+    id: membershipId, role: 'provedor', tenantId: null, tenantLabel: null,
+    residentId: null, residentLabel: null
+  });
   const ambiguous = await app.inject({
     method: 'GET', url: '/auth/session',
     headers: { cookie, authorization: `Bearer egdev_${generateSessionToken()}` }
@@ -391,9 +425,41 @@ test('browser auth endpoints are no-store and implement session, tenant, logout,
   assert.equal(ambiguous.statusCode, 400);
   assert.equal(ambiguous.headers['cache-control'], 'no-store');
   assert.equal(ambiguousAudits, 1);
+  reauthenticationAllowed = false;
+  const deniedReauthentication = await app.inject({ method: 'POST', url: '/auth/reauthenticate', headers, payload: {} });
+  assert.equal(deniedReauthentication.statusCode, 429);
+  assert.equal(deniedReauthentication.headers['retry-after'], '17');
+  assert.equal(createdIntents, 0, 'a denied POST must not persist an intent');
+  reauthenticationAllowed = true;
   const reauthenticate = await app.inject({ method: 'POST', url: '/auth/reauthenticate', headers, payload: {} });
-  assert.equal(reauthenticate.statusCode, 303);
+  assert.equal(reauthenticate.statusCode, 200);
+  assert.match(reauthenticate.json().navigateTo, /^\/auth\/reauthenticate\/start\/[A-Za-z0-9_-]{43}$/);
+  assert.equal(createdIntents, 1);
+  const reauthenticateStart = await app.inject({
+    method: 'GET', url: reauthenticate.json().navigateTo, headers: { cookie }
+  });
+  assert.equal(reauthenticateStart.statusCode, 303);
+  assert.equal(reauthenticateStart.headers.location, 'https://identity.example.test/authorize?max_age=0&prompt=login');
   assert.equal(reauthenticationFamilyId, snapshot.familyId);
+  assert.equal(reauthenticationReturnTo, '/app');
+  assert.equal(reauthenticationChecks, 2, 'GET must not perform a second limiter check');
+  assert.equal((await app.inject({
+    method: 'GET', url: reauthenticate.json().navigateTo, headers: { cookie }
+  })).statusCode, 401, 'a start intent is single use');
+  const failingStart = await app.inject({
+    method: 'POST', url: '/auth/reauthenticate', headers, payload: { returnTo: '/logout-all/continue' }
+  });
+  assert.equal(failingStart.statusCode, 200);
+  startLoginFails = true;
+  const failedStart = await app.inject({ method: 'GET', url: failingStart.json().navigateTo, headers: { cookie } });
+  assert.equal(failedStart.statusCode, 303);
+  assert.equal(failedStart.headers.location, '/auth/error');
+  startLoginFails = false;
+  assert.equal((await app.inject({
+    method: 'GET', url: failingStart.json().navigateTo, headers: { cookie }
+  })).statusCode, 401, 'a failed provider start still consumes the authorized intent');
+  assert.equal(createdIntents, 2);
+  assert.equal(reauthenticationChecks, 3);
   const tenant = await app.inject({ method: 'POST', url: '/auth/tenant', headers, payload: { membershipId } });
   assert.equal(tenant.statusCode, 204);
   assert.equal(tenant.headers['set-cookie'], serializeBrowserSessionCookie(replacement));

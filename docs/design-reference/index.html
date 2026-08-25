@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Referências de interface | Teagar</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@600;700;800;900&amp;family=IBM+Plex+Mono:wght@400;500;600&amp;family=Public+Sans:wght@400;500;600;700;800&amp;display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles/tokens.css">
+  <link rel="stylesheet" href="styles/reference.css">
+</head>
+<body>
+  <a class="skip-link" href="#conteudo">Ir para o conteúdo</a>
+  <header class="site-header">
+    <div class="container topbar">
+      <a class="brand" href="index.html"><img src="assets/brand-mark.svg" alt=""> Teagar / Referências</a>
+      <nav class="top-links" aria-label="Navegação do catálogo">
+        <a href="auth/login.html">Autenticação</a>
+        <a href="shell/dashboard.html">Shell</a>
+        <a href="roles/provider.html">Papéis</a>
+      </nav>
+    </div>
+  </header>
+  <main id="conteudo">
+    <section class="catalog-hero blueprint-grid" aria-labelledby="titulo">
+      <div class="container">
+        <p class="eyebrow">Sistema de acesso / referência 01</p>
+        <h1 id="titulo">Engenharia<br>à <em>mostra.</em></h1>
+        <p class="lede">Um catálogo estático de decisões visuais, estados operacionais e limites de segurança para uma plataforma multi-condomínio.</p>
+        <div class="cluster mono small"><span>11 telas</span><span>·</span><span>4 papéis</span><span>·</span><span>3 breakpoints</span></div>
+      </div>
+    </section>
+    <section class="section" aria-labelledby="catalogo">
+      <div class="container">
+        <p class="eyebrow">Mapa de telas</p>
+        <h2 id="catalogo">Catálogo operacional</h2>
+        <div class="grid grid-3">
+          <article class="panel catalog-card signal"><p class="eyebrow">A01 / OIDC</p><h3>Entrar</h3><p class="muted">Login normal, carregamento e falha genérica.</p><a class="button secondary" href="auth/login.html">Abrir referência</a></article>
+          <article class="panel catalog-card"><p class="eyebrow">A02 / Convite</p><h3>Provisionamento</h3><p class="muted">Convite humano válido e indisponível, com validade de 24 horas.</p><a class="button secondary" href="auth/invitation.html">Abrir referência</a></article>
+          <article class="panel catalog-card"><p class="eyebrow">A03 / Proteção</p><h3>Segurança</h3><p class="muted">Sessão, reautenticação, MFA, conta e erros neutros.</p><a class="button secondary" href="auth/security.html">Abrir referência</a></article>
+          <article class="panel catalog-card"><p class="eyebrow">A04 / Sessão</p><h3>Sair</h3><p class="muted">Encerrar a sessão atual ou todas as sessões.</p><a class="button secondary" href="auth/logout.html">Abrir referência</a></article>
+          <article class="panel catalog-card signal"><p class="eyebrow">S01 / Síndico</p><h3>Shell autenticado</h3><p class="muted">Navegação desktop e mobile, métricas e estados reais.</p><a class="button secondary" href="shell/dashboard.html">Abrir referência</a></article>
+          <article class="panel catalog-card"><p class="eyebrow">S02 / Contexto</p><h3>Trocar condomínio</h3><p class="muted">Seleção explícita de vínculo e papel, incluindo vazio.</p><a class="button secondary" href="shell/select-condominium.html">Abrir referência</a></article>
+          <article class="panel catalog-card"><p class="eyebrow">R01 / Provedor</p><h3>Operações</h3><p class="muted">Saúde e administração de condomínios.</p><a class="button secondary" href="roles/provider.html">Abrir referência</a></article>
+          <article class="panel catalog-card"><p class="eyebrow">R02 / Síndico</p><h3>Gestão</h3><p class="muted">Moradores, vínculos e convites administrativos.</p><a class="button secondary" href="roles/manager.html">Abrir referência</a></article>
+          <article class="panel catalog-card"><p class="eyebrow">R03 / Morador</p><h3>Meus convidados</h3><p class="muted">Acessos de visitantes separados do provisionamento humano.</p><a class="button secondary" href="roles/resident.html">Abrir referência</a></article>
+          <article class="panel catalog-card signal"><p class="eyebrow">R04 / Portaria</p><h3>Validar acesso</h3><p class="muted">Fluxo focado de código de visitante com resposta neutra.</p><a class="button secondary" href="roles/gatehouse.html">Abrir referência</a></article>
+        </div>
+      </div>
+    </section>
+    <section class="section" aria-labelledby="fundamentos">
+      <div class="container grid grid-2">
+        <div><p class="eyebrow">Princípio</p><h2 id="fundamentos">Menos decoração.<br>Mais contexto.</h2></div>
+        <div class="stack"><p>O laranja marca decisões, não superfícies inteiras. O azul organiza orientação, vínculo e informação técnica. Bordas substituem sombras.</p><p class="mono small">8PT GRID · 2–4PX RADIUS · HIGH CONTRAST · NO NESTED CARDS</p><a href="README.md">Ler regras e limites do kit</a></div>
+      </div>
+    </section>
+  </main>
+  <footer class="footer"><div class="container spread cluster"><span>Referência estática, não produção.</span><a href="source/README.md">Fonte e atribuição</a></div></footer>
+</body>
+</html>
