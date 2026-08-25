@@ -57,6 +57,20 @@ model HumanAuthRolloutHistory {
   @@index([scope, createdAt, id])
 }
 
+model HumanAuthDeploymentAuthorization {
+  id                   String                @id @db.Uuid
+  createdAt            DateTime              @default(now()) @db.Timestamptz(3)
+  expiresAt            DateTime              @db.Timestamptz(3)
+  usedAt               DateTime?             @db.Timestamptz(3)
+  tokenDigest          Bytes                 @unique
+  actorAccountId       String                @db.Uuid
+  scope                 String
+  state                 HumanAuthRolloutState
+  cohortPercentage     Int?
+  approvalReference    String
+  requestCorrelationId String?
+}
+
 enum HumanAuthRolloutState {
   disabled
   internal_provider

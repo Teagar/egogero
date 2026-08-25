@@ -227,6 +227,17 @@ export function createHumanAuthRolloutService(client: PrismaClient) {
 
   return {
     ...gate,
+    async verifyGlobalPolicy() {
+      const rows = await client.$queryRaw<Array<{ valid: boolean }>>`
+        SELECT state IN ('disabled', 'internal_provider', 'pilot', 'enabled')
+          AND version > 0
+          AND ((state = 'pilot' AND "cohortPercentage" IN (10, 50, 100)
+            AND "cohortAlgorithm" = ${HUMAN_AUTH_COHORT_ALGORITHM})
+            OR (state <> 'pilot' AND "cohortPercentage" IS NULL AND "cohortAlgorithm" IS NULL)) AS valid
+        FROM "HumanAuthRolloutPolicy" WHERE scope = 'global' AND "condominioId" IS NULL
+      `;
+      if (rows.length !== 1 || !rows[0]?.valid) throw new Error('Human authentication rollout policy is unavailable');
+    },
     async getPolicies() {
       const rows = await client.$queryRaw<PolicyRow[]>`
         SELECT scope, "condominioId", state::text, "cohortPercentage", "cohortAlgorithm", version, "updatedAt"
@@ -240,10 +251,30 @@ export function createHumanAuthRolloutService(client: PrismaClient) {
       cohortPercentage: number | null;
       actorAccountId: string;
       requestCorrelationId: string;
+      authorization: { kind: 'browser'; authenticatedAt: Date } | { kind: 'deployment'; token: string };
     }) {
       const scope = input.condominioId ? `tenant:${input.condominioId}` : 'global';
       const state = storedState(input.state);
       return client.$transaction(async (transaction) => {
+        if (input.authorization.kind === 'browser') {
+          const recent = await transaction.$queryRaw<Array<{ recent: boolean }>>`
+            SELECT ${input.authorization.authenticatedAt}::timestamptz >= clock_timestamp() - interval '10 minutes'
+              AND ${input.authorization.authenticatedAt}::timestamptz <= clock_timestamp() AS recent
+          `;
+          if (!recent[0]?.recent) return null;
+        } else {
+          const tokenDigest = createHash('sha256').update(input.authorization.token, 'utf8').digest();
+          const consumed = await transaction.$queryRaw<Array<{ id: string }>>(Prisma.sql`
+            UPDATE "HumanAuthDeploymentAuthorization"
+            SET "usedAt" = clock_timestamp(), "requestCorrelationId" = ${input.requestCorrelationId}
+            WHERE "tokenDigest" = ${tokenDigest} AND "usedAt" IS NULL
+              AND "expiresAt" > clock_timestamp() AND "actorAccountId" = ${input.actorAccountId}::uuid
+              AND scope = ${scope} AND state = ${state}::"HumanAuthRolloutState"
+              AND "cohortPercentage" IS NOT DISTINCT FROM ${input.cohortPercentage}
+            RETURNING id
+          `);
+          if (!consumed[0]) return null;
+        }
         // Global-first ordering also prevents global and tenant rollbacks from deadlocking on sessions.
         await transaction.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended('global', 170030))`;
         if (scope !== 'global') {
@@ -352,9 +383,13 @@ export function registerHumanAuthRolloutRoutes(
         : cohortPercentage !== null)) {
       return reply.status(400).send({ error: 'invalid_request' });
     }
+    const authenticatedAt = request.browserSessionSnapshot?.authenticatedAt;
+    if (!authenticatedAt || authenticatedAt.getTime() < Date.now() - 10 * 60_000) {
+      return reply.status(403).send({ error: 'reauthentication_required' });
+    }
     const result = await service.setPolicy({ condominioId, state: state as HumanAuthRolloutState,
       cohortPercentage: cohortPercentage as number | null, actorAccountId: actor.accountId,
-      requestCorrelationId: request.id });
+      requestCorrelationId: request.id, authorization: { kind: 'browser', authenticatedAt } });
     return result ? reply.send(result) : reply.status(404).send({ error: 'not_found' });
   });
 }

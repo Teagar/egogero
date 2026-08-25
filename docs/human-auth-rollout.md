@@ -2,6 +2,8 @@
 
 `HUMAN_AUTH_ENABLED=true` starts the OIDC/session infrastructure. It does not authorize a human login.
 Authorization is controlled by `HumanAuthRolloutPolicy`; a missing or inconsistent applicable policy fails closed.
+When human authentication is enabled, startup and every readiness probe validate the global policy before traffic is
+served. Failure is generic externally. Human-auth-disabled deployments do not depend on the policy.
 
 ## Policy states
 
@@ -21,10 +23,19 @@ provisioned provider to administer rollout. A provider using an OIDC browser ses
 check. The PUT body has only `condominioId`, `state`, and `cohortPercentage`; unknown keys and non-exact cohort
 values are rejected. Responses and immutable history contain no credentials or invitation/session secrets.
 
+Every browser mutation additionally requires the session's last full OIDC authentication to be no more than ten
+minutes old. Stale sessions receive `reauthentication_required` and use the existing `/auth/reauthenticate` flow;
+the normal session, CSRF, and provider RBAC checks still run first.
+
 After a global `disabled` rollback, use the operational command because all browser sessions, including providers,
-are denied: `npm run auth:rollout -- --actor <provider-account-uuid> --scope global --state internal-provider`.
-The actor must be an active, externally bound provider. Tenant scopes use `tenant:<uuid>` and pilot additionally
-requires `--cohort 10`, `50`, or `100`. Unknown, duplicate, or inapplicable arguments fail without changing policy.
+are denied. The command requires `HUMAN_AUTH_ROLLOUT_AUTHORIZATION_TOKEN`, a single-use random token from a
+`HumanAuthDeploymentAuthorization` row created by a separately authenticated approval job. The row binds the exact
+active externally bound provider actor, scope, state, cohort, approval reference, and an expiry no more than ten
+minutes after creation. The application database role can only select and consume these rows, not mint them; token
+digests, use time, and request correlation provide replay-safe immutable binding. The token must be injected as a
+masked secret and never passed on the command line or retained in evidence. Tenant scopes use `tenant:<uuid>` and
+pilot additionally requires `--cohort 10`, `50`, or `100`. Unknown, duplicate, or inapplicable arguments fail without
+changing policy.
 
 ## Rollback
 

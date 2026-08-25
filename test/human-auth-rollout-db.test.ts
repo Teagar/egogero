@@ -50,8 +50,12 @@ test('PostgreSQL rollout serializes changes, fails closed, isolates tenants, and
   { skip: !run }, async () => {
     const prisma = new PrismaClient();
     const second = new PrismaClient();
-    const service = createHumanAuthRolloutService(prisma);
-    const secondService = createHumanAuthRolloutService(second);
+    const rawService = createHumanAuthRolloutService(prisma);
+    const rawSecondService = createHumanAuthRolloutService(second);
+    const service = { ...rawService, setPolicy: (input: Omit<Parameters<typeof rawService.setPolicy>[0], 'authorization'>) =>
+      rawService.setPolicy({ ...input, authorization: { kind: 'browser', authenticatedAt: new Date() } }) };
+    const secondService = { ...rawSecondService, setPolicy: (input: Omit<Parameters<typeof rawSecondService.setPolicy>[0], 'authorization'>) =>
+      rawSecondService.setPolicy({ ...input, authorization: { kind: 'browser', authenticatedAt: new Date() } }) };
     const actorAccountId = randomUUID();
     const tenantA = tenantInCohort(51, 100);
     const tenantB = tenantInCohort(1, 10);
@@ -121,6 +125,38 @@ test('PostgreSQL rollout serializes changes, fails closed, isolates tenants, and
       ] });
       await prisma.externalIdentity.create({ data: { accountId: actorAccountId,
         issuer: 'https://identity.example.test', subject: `rollout-${actorAccountId}` } });
+      const deploymentToken = randomBytes(32).toString('base64url');
+      const deploymentAuthorizationId = randomUUID();
+      await prisma.humanAuthDeploymentAuthorization.create({ data: { id: deploymentAuthorizationId,
+        expiresAt: new Date(Date.now() + 60_000), tokenDigest: createHash('sha256').update(deploymentToken).digest(),
+        actorAccountId, scope: 'global', state: 'internal_provider', approvalReference: 'PC-36-test' } });
+      assert.equal(await rawService.setPolicy({ condominioId: null, state: 'enabled', cohortPercentage: null,
+        actorAccountId, requestCorrelationId: 'actor-mismatch',
+        authorization: { kind: 'deployment', token: deploymentToken } }), null);
+      assert.ok(await rawService.setPolicy({ condominioId: null, state: 'internal-provider', cohortPercentage: null,
+        actorAccountId, requestCorrelationId: 'deployment-success',
+        authorization: { kind: 'deployment', token: deploymentToken } }));
+      assert.equal(await rawService.setPolicy({ condominioId: null, state: 'internal-provider', cohortPercentage: null,
+        actorAccountId, requestCorrelationId: 'deployment-replay',
+        authorization: { kind: 'deployment', token: deploymentToken } }), null);
+      const expiredToken = randomBytes(32).toString('base64url');
+      await prisma.humanAuthDeploymentAuthorization.create({ data: { id: randomUUID(),
+        createdAt: new Date(Date.now() - 9 * 60_000), expiresAt: new Date(Date.now() - 1),
+        tokenDigest: createHash('sha256').update(expiredToken).digest(), actorAccountId, scope: 'global',
+        state: 'internal_provider', approvalReference: 'PC-36-expired' } });
+      assert.equal(await rawService.setPolicy({ condominioId: null, state: 'internal-provider', cohortPercentage: null,
+        actorAccountId, requestCorrelationId: 'deployment-expired',
+        authorization: { kind: 'deployment', token: expiredToken } }), null);
+      const concurrentToken = randomBytes(32).toString('base64url');
+      await prisma.humanAuthDeploymentAuthorization.create({ data: { id: randomUUID(),
+        expiresAt: new Date(Date.now() + 60_000), tokenDigest: createHash('sha256').update(concurrentToken).digest(),
+        actorAccountId, scope: 'global', state: 'internal_provider', approvalReference: 'PC-36-concurrent' } });
+      const concurrentUses = await Promise.all([rawService, rawSecondService].map((candidate, index) => candidate.setPolicy({
+        condominioId: null, state: 'internal-provider', cohortPercentage: null, actorAccountId,
+        requestCorrelationId: `deployment-concurrent-${index}`,
+        authorization: { kind: 'deployment', token: concurrentToken }
+      })));
+      assert.equal(concurrentUses.filter(Boolean).length, 1);
       const accountIdentity = await prisma.externalIdentity.create({ data: { accountId: accountA,
         issuer: 'https://identity.example.test', subject: `rollout-${accountA}` } });
       await service.setPolicy({ condominioId: null, state: 'internal-provider', cohortPercentage: null,

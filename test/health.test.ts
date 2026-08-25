@@ -46,7 +46,8 @@ test('human-auth readiness requires cached OIDC validation and complete composit
     humanAuthEnabled: true,
     oidcMetadataValidated: false,
     requiredServicesComposed: true,
-    async checkDatabase() { databaseChecks += 1; }
+    async checkDatabase() { databaseChecks += 1; },
+    async checkHumanAuthRolloutPolicy() {}
   };
   const app = createApp({ readiness });
 
@@ -58,8 +59,14 @@ test('human-auth readiness requires cached OIDC validation and complete composit
   readiness.requiredServicesComposed = true;
   assert.equal((await app.inject({ method: 'GET', url: '/ready' })).statusCode, 200);
   assert.equal(databaseChecks, 1);
+  readiness.checkHumanAuthRolloutPolicy = async () => { throw new Error('private policy detail'); };
+  const missingPolicy = await app.inject({ method: 'GET', url: '/ready' });
+  assert.equal(missingPolicy.statusCode, 503);
+  assert.deepEqual(missingPolicy.json(), { status: 'unavailable' });
+  assert.doesNotMatch(missingPolicy.body, /policy|private/i);
+  readiness.checkHumanAuthRolloutPolicy = async () => {};
   readiness.deviceSecretValidated = false;
   assert.equal((await app.inject({ method: 'GET', url: '/ready' })).statusCode, 503);
-  assert.equal(databaseChecks, 1);
+  assert.equal(databaseChecks, 2);
   await app.close();
 });
