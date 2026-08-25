@@ -1,0 +1,35 @@
+# Contract only. Values are supplied by the deployment platform at runtime; this file contains no secrets.
+schema: office-deployment-environment/v1
+environments: [staging, production]
+variables:
+  NODE_ENV: { required: true, secret: false, allowed: [staging, production] }
+  HUMAN_AUTH_ENABLED: { required: true, secret: false, allowed: ["true", "false"] }
+  HOST: { required: false, secret: false, format: ip-address }
+  PORT: { required: false, secret: false, format: positive-integer }
+  DATABASE_URL: { required: true, secret: true, format: postgresql-url }
+  INVITATION_TOKEN_SECRET: { required: true, secret: true, minimum_bytes: 32 }
+  IDEMPOTENCY_CACHE_SECRET: { required: true, secret: true, minimum_bytes: 32 }
+  DEVICE_API_KEY_SECRET: { required: true, secret: true, minimum_bytes: 32 }
+  PUBLIC_VALIDATION_BASE_URL: { required: false, secret: false, format: exact-https-url }
+  TRUST_PROXY: { required_when: HUMAN_AUTH_ENABLED=true, secret: false, format: comma-separated-ip-cidr-allowlist }
+  PUBLIC_APPLICATION_ORIGIN: { required_when: HUMAN_AUTH_ENABLED=true, secret: false, format: exact-https-origin }
+  OIDC_ISSUER: { required_when: HUMAN_AUTH_ENABLED=true, secret: false, format: exact-https-url }
+  OIDC_AUTHORIZATION_ENDPOINT: { required_when: HUMAN_AUTH_ENABLED=true, secret: false, format: exact-https-url }
+  OIDC_TOKEN_ENDPOINT: { required_when: HUMAN_AUTH_ENABLED=true, secret: false, format: exact-https-url }
+  OIDC_JWKS_URI: { required_when: HUMAN_AUTH_ENABLED=true, secret: false, format: exact-https-url }
+  OIDC_CLIENT_ID: { required_when: HUMAN_AUTH_ENABLED=true, secret: false }
+  OIDC_CLIENT_SECRET: { required_when: HUMAN_AUTH_ENABLED=true, secret: true, minimum_bytes: 32 }
+  OIDC_REDIRECT_URI: { required_when: HUMAN_AUTH_ENABLED=true, secret: false, format: public-origin-plus-auth-callback }
+  OIDC_ID_TOKEN_SIGNING_ALG: { required_when: HUMAN_AUTH_ENABLED=true, secret: false, allowed: [RS256, PS256, ES256, EdDSA] }
+  OIDC_PKCE_KEYS: { required_when: HUMAN_AUTH_ENABLED=true, secret: true, format: version-to-32-byte-base64url-json }
+  OIDC_PKCE_CURRENT_KEY_VERSION: { required_when: HUMAN_AUTH_ENABLED=true, secret: false, format: positive-integer }
+  OIDC_RETURN_TO_PREFIXES: { required: false, secret: false, format: comma-separated-relative-paths }
+  OIDC_FAILURE_PATH: { required: false, secret: false, format: relative-path }
+  SESSION_CSRF_KEYS: { required_when: HUMAN_AUTH_ENABLED=true, secret: true, format: version-to-32-byte-base64url-json }
+  SESSION_CSRF_CURRENT_KEY_VERSION: { required_when: HUMAN_AUTH_ENABLED=true, secret: false, format: positive-integer }
+  HUMAN_MFA_ROLE_POLICY: { required_when: HUMAN_AUTH_ENABLED=true, secret: false, format: role-policy-json }
+  OIDC_RECOVERY_URL: { required_when: HUMAN_AUTH_ENABLED=true, secret: false, format: exact-https-url }
+  RECOVERY_WEBHOOK_ISSUERS: { required_when: HUMAN_AUTH_ENABLED=true, secret: false, format: exact-issuer-allowlist }
+  RECOVERY_WEBHOOK_SECRET: { required_when: HUMAN_AUTH_ENABLED=true, secret: true, minimum_bytes: 32 }
+disabled_human_auth:
+  rule: HUMAN_AUTH_ENABLED=false requires every variable marked required_when to be absent

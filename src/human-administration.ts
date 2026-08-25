@@ -72,16 +72,22 @@ function parseMfaPolicy(value: string): RoleMfaPolicy {
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
     throw new Error('HUMAN_MFA_ROLE_POLICY must define every role');
   }
+  const roles = ['provedor', 'sindico', 'morador', 'portaria'] as const;
+  if (Object.keys(parsed).length !== roles.length || Object.keys(parsed).some((role) => !roles.includes(role as Role))) {
+    throw new Error('HUMAN_MFA_ROLE_POLICY must define exactly every role');
+  }
   const result = {} as Record<Role, { amr: string[]; acr: string[] }>;
-  for (const role of ['provedor', 'sindico', 'morador', 'portaria'] as const) {
+  for (const role of roles) {
     const entry = (parsed as Record<string, unknown>)[role];
     if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
       throw new Error('HUMAN_MFA_ROLE_POLICY must define every role');
     }
     const amr = (entry as Record<string, unknown>).amr;
     const acr = (entry as Record<string, unknown>).acr;
-    if (!Array.isArray(amr) || amr.length === 0 || !amr.every((item) => typeof item === 'string' && item.length > 0)
-      || !Array.isArray(acr) || !acr.every((item) => typeof item === 'string' && item.length > 0)) {
+    if (!Array.isArray(amr) || amr.length === 0 || amr.length > 16
+      || !amr.every((item) => typeof item === 'string' && item.length > 0 && item.length <= 100)
+      || !Array.isArray(acr) || acr.length > 16
+      || !acr.every((item) => typeof item === 'string' && item.length > 0 && item.length <= 255)) {
       throw new Error('HUMAN_MFA_ROLE_POLICY entries require non-empty amr and valid acr arrays');
     }
     const phishingResistant = new Set(['webauthn', 'fido', 'fido2', 'hwk']);
@@ -112,7 +118,10 @@ export function humanAdministrationConfigFromEnvironment(
   }
   const rawSecret = required(environment, 'RECOVERY_WEBHOOK_SECRET');
   const recoveryWebhookSecret = Buffer.from(rawSecret, 'utf8');
-  if (recoveryWebhookSecret.length < 32) throw new Error('RECOVERY_WEBHOOK_SECRET must be at least 32 bytes');
+  if (recoveryWebhookSecret.length < 32 || new Set(rawSecret).size < 12
+    || /(change[-_ ]?me|placeholder|example|secret){2,}/i.test(rawSecret)) {
+    throw new Error('RECOVERY_WEBHOOK_SECRET must be at least 32 bytes and have adequate entropy');
+  }
   return {
     publicApplicationOrigin: new URL(origin).origin,
     recoveryUrl,

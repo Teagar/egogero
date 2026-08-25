@@ -233,6 +233,10 @@ export function sessionConfigFromEnvironment(environment: NodeJS.ProcessEnv): Se
     || !csrfKeys.has(currentCsrfKeyVersion)) {
     throw new Error('SESSION_CSRF_CURRENT_KEY_VERSION must identify an active key');
   }
+  const allowedVersions = new Set([currentCsrfKeyVersion, ...(currentCsrfKeyVersion > 1 ? [currentCsrfKeyVersion - 1] : [])]);
+  if (csrfKeys.size > 2 || [...csrfKeys.keys()].some((version) => !allowedVersions.has(version))) {
+    throw new Error('SESSION_CSRF_KEYS may contain only the current and immediately previous key versions');
+  }
   const rawOrigin = requireEnvironment(environment, 'PUBLIC_APPLICATION_ORIGIN');
   let origin: URL;
   try {

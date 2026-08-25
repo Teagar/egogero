@@ -156,6 +156,13 @@ export type AppDependencies = AppStore & {
 
 export type CondominioStore = AppStore;
 
+export type Readiness = {
+  checkDatabase(): Promise<void>;
+  humanAuthEnabled: boolean;
+  oidcMetadataValidated: boolean;
+  requiredServicesComposed: boolean;
+};
+
 type CondominioBody = Partial<Record<keyof CondominioCreateData, unknown>>;
 type MoradorBody = Partial<Record<'nome' | 'condominioId' | 'endereco', unknown>>;
 type EnderecoBody = Partial<Record<'rua' | 'numero' | 'bloco' | 'apartamento', unknown>>;
@@ -440,7 +447,8 @@ export function createApp(
     browserSessionStore,
     humanAdministrationService,
     authRateLimiter,
-    frontendRoot
+    frontendRoot,
+    readiness
   }: {
     db?: AppDependencies;
     invitationStore?: InvitationStore;
@@ -462,6 +470,7 @@ export function createApp(
     humanAdministrationService?: HumanAdministrationService;
     authRateLimiter?: AuthRateLimiter;
     frontendRoot?: string;
+    readiness?: Readiness;
   } = {}
 ) {
   if (!authRateLimiter && (oidcService || browserSessionService || browserSessionStore || humanAdministrationService)) {
@@ -517,6 +526,19 @@ export function createApp(
   };
 
   app.get('/health', async () => ({ status: 'ok' }));
+  app.get('/ready', async (_request, reply) => {
+    try {
+      if (!readiness) throw new Error('Readiness is not configured');
+      if (readiness.humanAuthEnabled
+        && (!readiness.oidcMetadataValidated || !readiness.requiredServicesComposed)) {
+        throw new Error('Human authentication is not ready');
+      }
+      await readiness.checkDatabase();
+      return { status: 'ready' };
+    } catch {
+      return reply.status(503).send({ status: 'unavailable' });
+    }
+  });
 
   app.post('/condominios', condominioManagement, async (request, reply) => {
     const payload = request.body && typeof request.body === 'object' && !Array.isArray(request.body)
