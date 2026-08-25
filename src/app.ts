@@ -442,6 +442,7 @@ export function createApp(
     browserSessionStore,
     humanAdministrationService,
     humanAuthRolloutService,
+    testOnlyBypassHumanAuthRollout = false,
     authRateLimiter,
     frontendRoot
   }: {
@@ -464,12 +465,17 @@ export function createApp(
     browserSessionStore?: BrowserSessionStore;
     humanAdministrationService?: HumanAdministrationService;
     humanAuthRolloutService?: HumanAuthRolloutService;
+    testOnlyBypassHumanAuthRollout?: boolean;
     authRateLimiter?: AuthRateLimiter;
     frontendRoot?: string;
   } = {}
 ) {
   if (!authRateLimiter && (oidcService || browserSessionService || browserSessionStore || humanAdministrationService)) {
     throw new Error('Human authentication routes require an AuthRateLimiter');
+  }
+  if ((oidcService || browserSessionService || browserSessionStore)
+    && !humanAuthRolloutService && !testOnlyBypassHumanAuthRollout) {
+    throw new Error('Human OIDC and session components require a HumanAuthRolloutService');
   }
   const db: AppDependencies = suppliedDb ?? {
     ...defaultStore,

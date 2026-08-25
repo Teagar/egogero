@@ -7,12 +7,25 @@ import {
   registerHumanAuthRolloutRoutes
 } from '../src/human-auth-rollout.js';
 import { createApp } from '../src/app.js';
+import { createPrismaOidcLoginStore } from '../src/oidc.js';
+import { createPrismaBrowserSessionStore } from '../src/sessions.js';
+import type { PrismaClient } from '@prisma/client';
 
 test('tenant cohorts use a fixed, stable and auditable SHA-256 mapping', () => {
   assert.equal(HUMAN_AUTH_COHORT_ALGORITHM, 'sha256-tenant-v1');
   assert.equal(humanAuthTenantCohort('00000000-0000-4000-8000-000000000001'), 42);
   assert.equal(humanAuthTenantCohort('00000000-0000-4000-8000-000000000002'), 55);
   assert.equal(humanAuthTenantCohort('00000000-0000-4000-8000-000000000001'), 42);
+});
+
+test('OIDC and session stores reject missing rollout gates at construction', () => {
+  assert.throws(() => createPrismaOidcLoginStore({} as PrismaClient, undefined as never),
+    /requires a HumanAuthRolloutGate/);
+  assert.throws(() => createPrismaBrowserSessionStore({} as PrismaClient, {
+    currentCsrfKeyVersion: 1,
+    csrfKeys: new Map([[1, Buffer.alloc(32)]]),
+    publicApplicationOrigin: 'https://app.example.test'
+  }, {} as never), /requires a HumanAuthRolloutGate/);
 });
 
 test('rollout admin endpoint is provider-only and validates an exact secret-free payload', async () => {

@@ -44,11 +44,11 @@ export async function startServer(environment: NodeJS.ProcessEnv = process.env) 
     ? createHumanAuthRolloutService(prisma)
     : undefined;
   const oidcService = env.oidc
-    ? await createOidcService(env.oidc, createPrismaOidcLoginStore(prisma, humanAuthRolloutService), fetch, {
+    ? await createOidcService(env.oidc, createPrismaOidcLoginStore(prisma, humanAuthRolloutService!), fetch, {
         rateLimiter: authRateLimiter,
         metrics: authTelemetry.metrics,
         alerts: authTelemetry.alerts,
-        rolloutGate: humanAuthRolloutService
+        rolloutGate: humanAuthRolloutService!
       })
     : undefined;
   const humanAdministrationService = env.humanAdministration
@@ -59,7 +59,7 @@ export async function startServer(environment: NodeJS.ProcessEnv = process.env) 
         ...env.sessions,
         mfaPolicy: env.humanAdministration?.mfaPolicy
       }, { rateLimiter: authRateLimiter, metrics: authTelemetry.metrics, alerts: authTelemetry.alerts,
-        rolloutGate: humanAuthRolloutService })
+        rolloutGate: humanAuthRolloutService! })
     : undefined;
   const browserSessionService = browserSessionStore
     ? createBrowserSessionService(browserSessionStore)

@@ -11,6 +11,7 @@ import {
 import type { SessionRuntimeConfig } from '../src/sessions.js';
 import { createPrismaAuthRateLimiter } from '../src/auth-rate-limits.js';
 import type { AuthRateLimiter } from '../src/auth-rate-limits.js';
+import { TEST_ONLY_ALLOW_ALL_HUMAN_AUTH_ROLLOUT } from '../src/human-auth-rollout.js';
 
 const runDatabaseTests = process.env.RUN_DATABASE_TESTS === 'true' && Boolean(process.env.DATABASE_URL);
 
@@ -35,7 +36,8 @@ test(
       async reserveFailure() { return { allowed: true, retryAfterSeconds: 0, repeatedExcess: false, reservationId: randomUUID() }; },
       async finalizeFailure() {}
     } satisfies AuthRateLimiter;
-    const store = createPrismaBrowserSessionStore(prisma, config, { rateLimiter: permissiveRateLimiter });
+    const store = createPrismaBrowserSessionStore(prisma, config, { rateLimiter: permissiveRateLimiter,
+      rolloutGate: TEST_ONLY_ALLOW_ALL_HUMAN_AUTH_ROLLOUT });
     const accountId = randomUUID();
     const externalIdentityId = randomUUID();
     const otherAccountId = randomUUID();
@@ -231,7 +233,7 @@ test(
         currentCsrfKeyVersion: 2,
         csrfKeys: new Map([[1, csrfKey], [2, nextCsrfKey]]),
         publicApplicationOrigin: 'https://app.example.test'
-      }, { rateLimiter: permissiveRateLimiter });
+      }, { rateLimiter: permissiveRateLimiter, rolloutGate: TEST_ONLY_ALLOW_ALL_HUMAN_AUTH_ROLLOUT });
       assert.equal((await rotatedKeyStore.inspect({
         sessionToken: first.sessionToken,
         requestCorrelationId: 'csrf-key-rotation'
@@ -512,7 +514,7 @@ test(
         currentCsrfKeyVersion: 2,
         csrfKeys: new Map([[2, randomBytes(32)]]),
         publicApplicationOrigin: 'https://app.example.test'
-      }, { rateLimiter: permissiveRateLimiter });
+      }, { rateLimiter: permissiveRateLimiter, rolloutGate: TEST_ONLY_ALLOW_ALL_HUMAN_AUTH_ROLLOUT });
       assert.deepEqual(await missingKeyStore.rotate({
         sessionToken: nextLogin.sessionToken,
         requestCorrelationId: 'csrf-key-missing'
@@ -553,7 +555,8 @@ test(
       await prisma.browserSession.deleteMany({ where: { accountId } });
       await prisma.authenticationRateLimit.deleteMany({ where: { subject: accountId } });
       const limitedStore = createPrismaBrowserSessionStore(prisma, config, {
-        rateLimiter: createPrismaAuthRateLimiter(prisma)
+        rateLimiter: createPrismaAuthRateLimiter(prisma),
+        rolloutGate: TEST_ONLY_ALLOW_ALL_HUMAN_AUTH_ROLLOUT
       });
       for (let index = 0; index < 10; index += 1) {
         assert.ok(await issue(await createHandoff(), undefined, limitedStore));
@@ -625,7 +628,7 @@ test('recovery always revokes old sessions before an exhausted replacement-sessi
     currentCsrfKeyVersion: 1,
     csrfKeys: new Map([[1, randomBytes(32)]]),
     publicApplicationOrigin: 'https://app.example.test'
-  });
+  }, { rolloutGate: TEST_ONLY_ALLOW_ALL_HUMAN_AUTH_ROLLOUT });
 
   async function handoff(recoveryIntent: boolean) {
     const loginTransactionId = randomUUID();

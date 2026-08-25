@@ -28,13 +28,25 @@ requires `--cohort 10`, `50`, or `100`. Unknown, duplicate, or inapplicable argu
 
 ## Rollback
 
-Setting a tenant to `disabled` changes policy and revokes active sessions whose active membership belongs to that
-tenant in one transaction serialized by the scope lock. Other tenants, provider sessions, device API keys, and public visitor
-invitations are untouched. Global `disabled` revokes every human browser session. Global `internal-provider`
-revokes non-provider human sessions. Repeating rollback is safe and revokes only sessions still active.
+Every policy change evaluates active sessions against the resulting effective global and tenant policy. It revokes
+every session that is then ineligible, including `enabled` to `pilot`, pilot percentage reductions, global cohort
+changes, missing tenant policy, `disabled`, and global `internal-provider`. A tenant change examines only sessions
+active in that tenant; a global change examines every human session. Other eligible tenants and provider sessions
+remain active. Device API keys and public visitor invitations are never examined or revoked. Repeating a policy
+change is safe and only revokes sessions still active.
 
 Policy writes take a transaction-scoped global advisory lock, then a tenant advisory lock when applicable, followed
 by the policy row lock. This serializes missing-row creation and gives global/tenant rollbacks one deadlock-free
 order. OIDC callback binding, invitation acceptance, handoff issue,
 membership switch, session inspection, and request authentication re-evaluate policy in their database
 transaction. Rollback history is protected against update, delete, and truncate by both privileges and triggers.
+
+## In-flight requests
+
+The linearization point is the request's transactional session authentication and rollout gate check. A business
+operation whose check completed before a rollback acquired the policy lock may finish after rollback begins. The
+system does not hold that Prisma transaction across a Fastify business handler. Rollback waits for earlier gate
+transactions, commits the restrictive policy and revokes every resulting ineligible session before returning. Any
+authentication beginning after rollback commits reads the new policy or revoked session and fails before its
+business handler runs. This is the bounded residual: already authenticated work may complete; no newly
+authenticated work starts after rollback commit.

@@ -18,6 +18,7 @@ import type { AuthRateLimiter } from '../src/auth-rate-limits.js';
 import type { PrismaClient } from '@prisma/client';
 import { createHumanAdministrationService } from '../src/human-administration.js';
 import { createPrismaBrowserSessionStore, generateSessionToken } from '../src/sessions.js';
+import { TEST_ONLY_ALLOW_ALL_HUMAN_AUTH_ROLLOUT } from '../src/human-auth-rollout.js';
 
 test('IP minimization handles IPv4, mapped IPv4, and canonical IPv6 prefixes', () => {
   assert.equal(normalizeIpPrefix('192.0.2.129'), '192.0.2.0/24');
@@ -58,7 +59,8 @@ test('Fastify only derives minimized forwarded IP through an explicitly trusted 
         failurePath: '/auth/error',
         async startLogin() { throw new Error('must be rate limited first'); },
         async completeCallback() { throw new Error('unused'); }
-      }
+      },
+      testOnlyBypassHumanAuthRollout: true
     });
     const response = await app.inject({ method: 'GET', url: '/auth/login', headers: { 'x-forwarded-for': forwarded } });
     await app.close();
@@ -91,6 +93,7 @@ test('recovery initiation is generic, marks recovery intent, and returns Retry-A
       },
       async completeCallback() { throw new Error('unused'); }
     },
+    testOnlyBypassHumanAuthRollout: true,
     humanAdministrationService: createHumanAdministrationService({} as PrismaClient, {
       publicApplicationOrigin: 'https://app.example.test',
       recoveryUrl: 'https://identity.example.test/authorize',
@@ -179,6 +182,12 @@ test('human authentication routes fail construction without the distributed limi
     async completeCallback() { throw new Error('unused'); }
   };
   assert.throws(() => createApp({ oidcService }), /require an AuthRateLimiter/);
+  assert.throws(() => createApp({ oidcService, authRateLimiter: {
+    async check() { return { allowed: true, retryAfterSeconds: 0, repeatedExcess: false }; },
+    async reserveFailure() { return { allowed: true, retryAfterSeconds: 0, repeatedExcess: false,
+      reservationId: randomUUID() }; },
+    async finalizeFailure() {}
+  } }), /require a HumanAuthRolloutService/);
   const deviceOnlyApp = createApp();
   await deviceOnlyApp.close();
 });
@@ -197,7 +206,7 @@ test('session lookup metrics distinguish database failure from a credential miss
     currentCsrfKeyVersion: 1,
     csrfKeys: new Map([[1, Buffer.alloc(32, 1)]]),
     publicApplicationOrigin: 'https://app.example.test'
-  }, { rateLimiter, metrics: collectors.metricSink });
+  }, { rateLimiter, metrics: collectors.metricSink, rolloutGate: TEST_ONLY_ALLOW_ALL_HUMAN_AUTH_ROLLOUT });
   assert.equal(await store.authenticate('malformed', 'miss'), null);
   await assert.rejects(store.authenticate(generateSessionToken(), 'failure'), /database unavailable/);
   const outcomes = collectors.metrics

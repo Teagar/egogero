@@ -391,6 +391,7 @@ test('browser auth endpoints are no-store and implement session, tenant, logout,
     browserSessionStore: store,
     browserSessionService: createBrowserSessionService(store),
     oidcService,
+    testOnlyBypassHumanAuthRollout: true,
     authRateLimiter: {
       async check(action) {
         if (action === 'reauthentication_account') {

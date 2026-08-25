@@ -384,7 +384,8 @@ async function insertAudit(transaction: Prisma.TransactionClient, input: AuditIn
   `;
 }
 
-export function createPrismaOidcLoginStore(client: PrismaClient, rolloutGate?: HumanAuthRolloutGate): OidcLoginStore {
+export function createPrismaOidcLoginStore(client: PrismaClient, rolloutGate: HumanAuthRolloutGate): OidcLoginStore {
+  if (!rolloutGate) throw new Error('OidcLoginStore requires a HumanAuthRolloutGate');
   return {
     async createTransaction(input) {
       await client.$transaction(async (transaction) => {
@@ -452,10 +453,10 @@ export function createPrismaOidcLoginStore(client: PrismaClient, rolloutGate?: H
           const invitationMembership = await transaction.$queryRaw<Array<{ condominioId: string | null; role: string }>>`
             SELECT "condominioId", role::text FROM "HumanMembership" WHERE id = ${invitation.membershipId}::uuid
           `;
-          const invitationGate = invitationMembership[0] && rolloutGate
+          const invitationGate = invitationMembership[0]
             ? await rolloutGate.gateScope(transaction, invitationMembership[0].condominioId,
                 invitationMembership[0].role === 'provedor')
-            : { allowed: rolloutGate === undefined, reason: 'rollout_unavailable' };
+            : { allowed: false, reason: 'rollout_unavailable' };
           if (!invitationGate.allowed) {
             await insertAudit(transaction, { ...input.audit, eventType: 'account_invitation_accept_failed',
               outcome: 'denied', reasonCode: 'rollout_disabled' });
@@ -516,13 +517,11 @@ export function createPrismaOidcLoginStore(client: PrismaClient, rolloutGate?: H
           });
           return null;
         }
-        if (rolloutGate) {
-          const decision = await rolloutGate.gateIdentity(transaction, identity.accountId);
-          if (!decision.allowed) {
-            await insertAudit(transaction, { ...input.audit, eventType: 'oidc_callback_failed',
-              outcome: 'denied', reasonCode: 'rollout_disabled' });
-            return null;
-          }
+        const decision = await rolloutGate.gateIdentity(transaction, identity.accountId);
+        if (!decision.allowed) {
+          await insertAudit(transaction, { ...input.audit, eventType: 'oidc_callback_failed',
+            outcome: 'denied', reasonCode: 'rollout_disabled' });
+          return null;
         }
 
         await transaction.$executeRaw`
@@ -759,10 +758,11 @@ async function exchangeAuthorizationCode(
 export async function createOidcService(
   config: OidcRuntimeConfig,
   store: OidcLoginStore,
-  fetchImplementation: typeof fetch = fetch,
-  dependencies: { rateLimiter?: AuthRateLimiter; metrics?: AuthMetrics; alerts?: AuthAlertSink;
-    rolloutGate?: HumanAuthRolloutGate } = {}
+  fetchImplementation: typeof fetch,
+  dependencies: { rolloutGate: HumanAuthRolloutGate; rateLimiter?: AuthRateLimiter; metrics?: AuthMetrics;
+    alerts?: AuthAlertSink }
 ): Promise<OidcService> {
+  if (!dependencies?.rolloutGate) throw new Error('OidcService requires a HumanAuthRolloutGate');
   const metrics = safeAuthMetrics(dependencies.metrics ?? noopAuthMetrics);
   const alerts = safeAuthAlerts(dependencies.alerts ?? noopAuthAlerts);
   const exactFetch = createExactOidcFetch(config, fetchImplementation);
@@ -878,12 +878,10 @@ export async function createOidcService(
       if (invitationToken !== undefined && !/^[A-Za-z0-9_-]{43}$/.test(invitationToken)) {
         throw new Error('Invalid invitation');
       }
-      if (dependencies.rolloutGate) {
-        const decision = invitationToken
-          ? await dependencies.rolloutGate.preflightInvitation(digestSecret(invitationToken))
-          : await dependencies.rolloutGate.preflightGlobal();
-        if (!decision.allowed) throw new Error('Human authentication rollout denied');
-      }
+      const decision = invitationToken
+        ? await dependencies.rolloutGate.preflightInvitation(digestSecret(invitationToken))
+        : await dependencies.rolloutGate.preflightGlobal();
+      if (!decision.allowed) throw new Error('Human authentication rollout denied');
       const normalizedReturnTo = normalizeSafeRelativePath(returnTo, '/', config.returnToPrefixes);
       const id = randomUUID();
       const state = oidc.randomState();

@@ -54,6 +54,18 @@ function policyAllows(policy: PolicyRow | undefined, tenantId: string | null, pr
   return { allowed, reason: allowed ? 'pilot_cohort' : 'outside_pilot_cohort', policyVersion: policy.version };
 }
 
+function effectiveDecision(
+  policies: ReadonlyMap<string, PolicyRow>,
+  tenantId: string | null,
+  provider: boolean
+) {
+  const global = policies.get('global');
+  const globalDecision = policyAllows(global, tenantId, provider);
+  if (!globalDecision.allowed || provider || global?.state === 'internal_provider') return globalDecision;
+  if (!tenantId) return { allowed: false, reason: 'tenant_context_required', policyVersion: global?.version };
+  return policyAllows(policies.get(`tenant:${tenantId}`), tenantId, false);
+}
+
 async function lockedPolicies(transaction: Prisma.TransactionClient, tenantId: string | null) {
   const scopes = tenantId ? ['global', `tenant:${tenantId}`] : ['global'];
   return transaction.$queryRaw<PolicyRow[]>(Prisma.sql`
@@ -71,11 +83,7 @@ async function evaluate(
   provider: boolean
 ): Promise<HumanAuthGateDecision> {
   const policies = await lockedPolicies(transaction, tenantId);
-  const global = policies.find((policy) => policy.scope === 'global');
-  const globalDecision = policyAllows(global, tenantId, provider);
-  if (!globalDecision.allowed || provider || global?.state === 'internal_provider') return globalDecision;
-  if (!tenantId) return { allowed: false, reason: 'tenant_context_required', policyVersion: global?.version };
-  return policyAllows(policies.find((policy) => policy.scope === `tenant:${tenantId}`), tenantId, false);
+  return effectiveDecision(new Map(policies.map((policy) => [policy.scope, policy])), tenantId, provider);
 }
 
 export interface HumanAuthRolloutGate {
@@ -84,6 +92,66 @@ export interface HumanAuthRolloutGate {
   gateScope(transaction: Prisma.TransactionClient, tenantId: string | null, provider: boolean): Promise<HumanAuthGateDecision>;
   gateIdentity(transaction: Prisma.TransactionClient, accountId: string): Promise<HumanAuthGateDecision>;
   gateMembership(transaction: Prisma.TransactionClient, membershipId: string, accountId: string): Promise<HumanAuthGateDecision>;
+}
+
+export const TEST_ONLY_ALLOW_ALL_HUMAN_AUTH_ROLLOUT: HumanAuthRolloutGate = Object.freeze({
+  async preflightGlobal() { return { allowed: true, reason: 'test_only_bypass' }; },
+  async preflightInvitation() { return { allowed: true, reason: 'test_only_bypass' }; },
+  async gateScope() { return { allowed: true, reason: 'test_only_bypass' }; },
+  async gateIdentity() { return { allowed: true, reason: 'test_only_bypass' }; },
+  async gateMembership() { return { allowed: true, reason: 'test_only_bypass' }; }
+});
+
+async function revokeIneligibleSessions(
+  transaction: Prisma.TransactionClient,
+  changedTenantId: string | null
+) {
+  const sessions = await transaction.$queryRaw<Array<{
+    sessionId: string;
+    tenantId: string | null;
+    provider: boolean;
+  }>>(Prisma.sql`
+    SELECT session.id AS "sessionId", membership."condominioId" AS "tenantId",
+           membership.role = 'provedor' AS provider
+    FROM "BrowserSession" session
+    JOIN "HumanMembership" membership ON membership.id = session."activeMembershipId"
+      AND membership."accountId" = session."accountId"
+    WHERE session."revokedAt" IS NULL
+      ${changedTenantId ? Prisma.sql`AND membership."condominioId" = ${changedTenantId}` : Prisma.empty}
+    ORDER BY session.id
+    FOR UPDATE OF session
+  `);
+  if (sessions.length === 0) return 0;
+  const tenantScopes = [...new Set(sessions.flatMap((session) =>
+    session.tenantId ? [`tenant:${session.tenantId}`] : []
+  ))];
+  const scopes = ['global', ...tenantScopes];
+  const policies = await transaction.$queryRaw<PolicyRow[]>(Prisma.sql`
+    SELECT scope, "condominioId", state::text, "cohortPercentage", "cohortAlgorithm", version, "updatedAt"
+    FROM "HumanAuthRolloutPolicy" WHERE scope IN (${Prisma.join(scopes)}) ORDER BY scope
+  `);
+  const policyMap = new Map(policies.map((policy) => [policy.scope, policy]));
+  const revokedIds = sessions
+    .filter((session) => !effectiveDecision(policyMap, session.tenantId, session.provider).allowed)
+    .map((session) => session.sessionId);
+  if (revokedIds.length === 0) return 0;
+  return transaction.$executeRaw(Prisma.sql`
+    UPDATE "BrowserSession" SET "revokedAt" = clock_timestamp(),
+      "revokeReason" = 'human_auth_policy_change'
+    WHERE id IN (${Prisma.join(revokedIds.map((id) => Prisma.sql`${id}::uuid`))})
+      AND "revokedAt" IS NULL
+  `);
+}
+
+function potentiallyRestrictive(previous: PolicyRow | undefined, state: StoredState, cohortPercentage: number | null) {
+  if (!previous) return state !== 'enabled';
+  if (state === 'disabled') return previous.state !== 'disabled';
+  if (state === 'internal_provider') return !['disabled', 'internal_provider'].includes(previous.state);
+  if (state === 'pilot') {
+    return previous.state === 'enabled'
+      || previous.state === 'pilot' && (previous.cohortPercentage ?? 0) > (cohortPercentage ?? 0);
+  }
+  return false;
 }
 
 export function createHumanAuthRolloutService(client: PrismaClient) {
@@ -189,7 +257,7 @@ export function createHumanAuthRolloutService(client: PrismaClient) {
         const previous = existing[0];
         const cohortAlgorithm = state === 'pilot' ? HUMAN_AUTH_COHORT_ALGORITHM : null;
         const version = (previous?.version ?? 0) + 1;
-        const rollback = state === 'disabled' || state === 'internal_provider';
+        const restrictiveTransition = potentiallyRestrictive(previous, state, input.cohortPercentage);
         await transaction.$executeRaw(Prisma.sql`
           INSERT INTO "HumanAuthRolloutPolicy" (
             scope, "condominioId", state, "cohortPercentage", "cohortAlgorithm", version, "updatedAt", "updatedByAccountId"
@@ -201,25 +269,8 @@ export function createHumanAuthRolloutService(client: PrismaClient) {
             version = EXCLUDED.version, "updatedAt" = EXCLUDED."updatedAt",
             "updatedByAccountId" = EXCLUDED."updatedByAccountId"
         `);
-        let revokedSessions = 0;
-        if (rollback) {
-          if (input.condominioId) {
-            revokedSessions = await transaction.$executeRaw`
-              UPDATE "BrowserSession" session SET "revokedAt" = clock_timestamp(), "revokeReason" = 'tenant_rollout_rollback'
-              FROM "HumanMembership" membership
-              WHERE session."activeMembershipId" = membership.id
-                AND membership."condominioId" = ${input.condominioId} AND session."revokedAt" IS NULL
-            `;
-          } else {
-            const providerOnly = state === 'internal_provider';
-            revokedSessions = await transaction.$executeRaw`
-              UPDATE "BrowserSession" session SET "revokedAt" = clock_timestamp(), "revokeReason" = 'global_rollout_rollback'
-              FROM "HumanMembership" membership
-              WHERE session."activeMembershipId" = membership.id AND session."revokedAt" IS NULL
-                AND (${providerOnly} = false OR membership.role <> 'provedor')
-            `;
-          }
-        }
+        const revokedSessions = await revokeIneligibleSessions(transaction, input.condominioId);
+        const rollback = restrictiveTransition || revokedSessions > 0;
         await transaction.$executeRaw`
           INSERT INTO "HumanAuthRolloutHistory" (
             id, scope, "condominioId", "previousState", "previousCohortPercentage", state,

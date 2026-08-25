@@ -1,13 +1,29 @@
 import assert from 'node:assert/strict';
-import { randomBytes, randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import test from 'node:test';
 
 import { PrismaClient } from '@prisma/client';
+import Fastify from 'fastify';
 import pg from 'pg';
 
-import { createHumanAuthRolloutService } from '../src/human-auth-rollout.js';
+import { authorize } from '../src/auth.js';
+import { createHumanAuthRolloutService, humanAuthTenantCohort } from '../src/human-auth-rollout.js';
+import {
+  createBrowserSessionAuthenticator,
+  createPrismaBrowserSessionStore,
+  generateSessionToken,
+  SESSION_COOKIE_NAME
+} from '../src/sessions.js';
 
 const run = process.env.RUN_DATABASE_TESTS === 'true' && Boolean(process.env.DATABASE_URL);
+
+function tenantInCohort(minimum: number, maximum: number) {
+  while (true) {
+    const id = randomUUID();
+    const cohort = humanAuthTenantCohort(id);
+    if (cohort >= minimum && cohort <= maximum) return id;
+  }
+}
 
 test('PostgreSQL rollout serializes changes, fails closed, isolates tenants, and rolls sessions back atomically',
   { skip: !run }, async () => {
@@ -16,8 +32,8 @@ test('PostgreSQL rollout serializes changes, fails closed, isolates tenants, and
     const service = createHumanAuthRolloutService(prisma);
     const secondService = createHumanAuthRolloutService(second);
     const actorAccountId = randomUUID();
-    const tenantA = randomUUID();
-    const tenantB = randomUUID();
+    const tenantA = tenantInCohort(51, 100);
+    const tenantB = tenantInCohort(1, 10);
     const accountA = randomUUID();
     const accountB = randomUUID();
     const membershipA = randomUUID();
@@ -25,11 +41,26 @@ test('PostgreSQL rollout serializes changes, fails closed, isolates tenants, and
     const providerMembershipId = randomUUID();
     const sessionA = randomUUID();
     const sessionB = randomUUID();
-    const racingSession = randomUUID();
+    let racingSession: string | undefined;
     const invitedAccount = randomUUID();
     const invitedMembership = randomUUID();
     const invitationId = randomUUID();
     const invitationDigest = randomBytes(32);
+    const racingTransactionId = randomUUID();
+    const racingHandoffToken = generateSessionToken();
+    const sessionStore = createPrismaBrowserSessionStore(prisma, {
+      currentCsrfKeyVersion: 1,
+      csrfKeys: new Map([[1, randomBytes(32)]]),
+      publicApplicationOrigin: 'https://app.example.test'
+    }, {
+      rolloutGate: service,
+      rateLimiter: {
+        async check() { return { allowed: true, retryAfterSeconds: 0, repeatedExcess: false }; },
+        async reserveFailure() { return { allowed: true, retryAfterSeconds: 0, repeatedExcess: false,
+          reservationId: randomUUID() }; },
+        async finalizeFailure() {}
+      }
+    });
     try {
       await prisma.condominio.createMany({ data: [tenantA, tenantB].map((id) => ({ id, nome: id,
         responsavel: 'PC30', tipo: 'residencial', timezone: 'UTC' })) });
@@ -42,6 +73,8 @@ test('PostgreSQL rollout serializes changes, fails closed, isolates tenants, and
       ] });
       await prisma.externalIdentity.create({ data: { accountId: actorAccountId,
         issuer: 'https://identity.example.test', subject: `rollout-${actorAccountId}` } });
+      const accountIdentity = await prisma.externalIdentity.create({ data: { accountId: accountA,
+        issuer: 'https://identity.example.test', subject: `rollout-${accountA}` } });
       await service.setPolicy({ condominioId: null, state: 'internal-provider', cohortPercentage: null,
         actorAccountId, requestCorrelationId: 'internal-provider' });
       assert.equal((await prisma.$transaction((tx) => service.gateMembership(
@@ -61,6 +94,8 @@ test('PostgreSQL rollout serializes changes, fails closed, isolates tenants, and
       assert.deepEqual(changes.map((change) => change?.version).sort(), [1, 2]);
       await service.setPolicy({ condominioId: tenantB, state: 'enabled', cohortPercentage: null,
         actorAccountId, requestCorrelationId: 'tenant-b-enable' });
+      await service.setPolicy({ condominioId: tenantA, state: 'enabled', cohortPercentage: null,
+        actorAccountId, requestCorrelationId: 'tenant-a-concurrent-result' });
 
       await prisma.humanAccount.create({ data: { id: invitedAccount, displayName: 'Invited' } });
       await prisma.humanMembership.create({ data: { id: invitedMembership, accountId: invitedAccount,
@@ -73,32 +108,59 @@ test('PostgreSQL rollout serializes changes, fails closed, isolates tenants, and
       const now = new Date();
       const locker = new pg.Client({ connectionString: process.env.DATABASE_URL });
       await locker.connect();
+      await prisma.oidcLoginTransaction.create({ data: { id: racingTransactionId,
+        expiresAt: new Date(Date.now() + 60_000), stateDigest: randomBytes(32), nonceDigest: randomBytes(32),
+        pkceVerifierCiphertext: randomBytes(43), pkceVerifierNonce: randomBytes(12),
+        pkceVerifierAuthTag: randomBytes(16), pkceKeyVersion: 1, issuer: 'https://identity.example.test',
+        clientId: 'rollout-race', redirectUri: 'https://app.example.test/auth/callback', returnTo: '/' } });
+      await prisma.oidcValidatedHandoff.create({ data: { loginTransactionId: racingTransactionId,
+        expiresAt: new Date(Date.now() + 60_000), handleDigest: createHash('sha256').update(racingHandoffToken).digest(),
+        accountId: accountA, externalIdentityId: accountIdentity.id, authenticatedAt: now } });
+      await locker.query(`CREATE FUNCTION pc30_block_session_issue() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN PERFORM pg_advisory_xact_lock(300030); RETURN NEW; END; $$`);
+      await locker.query(`CREATE TRIGGER pc30_block_session_issue BEFORE INSERT ON "BrowserSession"
+        FOR EACH ROW EXECUTE FUNCTION pc30_block_session_issue()`);
       await locker.query('BEGIN');
-      await locker.query(`SELECT scope FROM "HumanAuthRolloutPolicy"
-        WHERE scope IN ('global', $1) ORDER BY scope FOR SHARE`, [`tenant:${tenantA}`]);
-      await locker.query(`INSERT INTO "BrowserSession" (id, "familyId", "createdAt", "lastSeenAt",
-        "idleExpiresAt", "absoluteExpiresAt", "authenticatedAt", "tokenDigest", "csrfDigest",
-        "csrfCiphertext", "csrfNonce", "csrfAuthTag", "csrfKeyVersion", "accountId",
-        "accountSessionVersion", "activeMembershipId")
-        VALUES ($1, $2, $3, $3, $4, $5, $3, $6, $7, $8, $9, $10, 1, $11, 0, $12)`,
-      [racingSession, randomUUID(), now, new Date(now.getTime() + 60_000),
-        new Date(now.getTime() + 120_000), randomBytes(32), randomBytes(32), randomBytes(32),
-        randomBytes(12), randomBytes(16),
-        accountA, membershipA]);
+      await locker.query('SELECT pg_advisory_xact_lock(300030)');
+      const issuing = sessionStore.issueFromHandoff({ handoffToken: racingHandoffToken,
+        requestCorrelationId: 'rollout-issuance-race' });
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      let rollbackFinished = false;
       const racingRollback = service.setPolicy({ condominioId: tenantA, state: 'disabled', cohortPercentage: null,
-        actorAccountId, requestCorrelationId: 'racing-rollback' });
+        actorAccountId, requestCorrelationId: 'racing-rollback' }).finally(() => { rollbackFinished = true; });
       await new Promise((resolve) => setTimeout(resolve, 30));
+      assert.equal(rollbackFinished, false);
       await locker.query('COMMIT');
-      await locker.end();
+      const issued = await issuing;
+      assert.ok(issued);
+      racingSession = issued.identity.sessionId;
       assert.equal((await racingRollback)?.revokedSessions, 1);
       assert.ok((await prisma.browserSession.findUniqueOrThrow({ where: { id: racingSession } })).revokedAt);
+      await locker.query('DROP TRIGGER pc30_block_session_issue ON "BrowserSession"');
+      await locker.query('DROP FUNCTION pc30_block_session_issue()');
+      await locker.end();
+
+      let businessHandlerCalls = 0;
+      const businessApp = Fastify();
+      businessApp.get('/business/:tenantId', {
+        preHandler: authorize(createBrowserSessionAuthenticator(sessionStore), 'moradores:manage', (request) =>
+          String((request.params as Record<string, unknown>).tenantId)
+        )
+      }, async () => { businessHandlerCalls += 1; return { ok: true }; });
+      const deniedAfterRollback = await businessApp.inject({ method: 'GET', url: `/business/${tenantA}`,
+        headers: { cookie: `${SESSION_COOKIE_NAME}=${issued.sessionToken}` } });
+      assert.equal(deniedAfterRollback.statusCode, 401);
+      assert.equal(businessHandlerCalls, 0);
+      await businessApp.close();
       assert.equal((await service.preflightInvitation(invitationDigest)).allowed, false);
       await service.setPolicy({ condominioId: tenantA, state: 'enabled', cohortPercentage: null,
         actorAccountId, requestCorrelationId: 'tenant-a-reenable' });
 
+      const providerSession = randomUUID();
       const sessions = [
         { id: sessionA, accountId: accountA, membershipId: membershipA },
-        { id: sessionB, accountId: accountB, membershipId: membershipB }
+        { id: sessionB, accountId: accountB, membershipId: membershipB },
+        { id: providerSession, accountId: actorAccountId, membershipId: providerMembershipId }
       ];
       for (const session of sessions) {
         await prisma.browserSession.create({ data: { id: session.id, familyId: randomUUID(), createdAt: now,
@@ -108,30 +170,51 @@ test('PostgreSQL rollout serializes changes, fails closed, isolates tenants, and
           csrfNonce: randomBytes(12), csrfAuthTag: randomBytes(16), csrfKeyVersion: 1,
           accountId: session.accountId, accountSessionVersion: 0, activeMembershipId: session.membershipId } });
       }
-      const rollback = await service.setPolicy({ condominioId: tenantA, state: 'disabled', cohortPercentage: null,
-        actorAccountId, requestCorrelationId: 'tenant-a-rollback' });
-      assert.equal(rollback?.revokedSessions, 1);
+      assert.equal((await service.setPolicy({ condominioId: tenantA, state: 'pilot', cohortPercentage: 100,
+        actorAccountId, requestCorrelationId: 'tenant-pilot-100' }))?.revokedSessions, 0);
+      assert.equal((await service.setPolicy({ condominioId: tenantA, state: 'pilot', cohortPercentage: 50,
+        actorAccountId, requestCorrelationId: 'tenant-pilot-50' }))?.revokedSessions, 1);
       assert.ok((await prisma.browserSession.findUniqueOrThrow({ where: { id: sessionA } })).revokedAt);
       assert.equal((await prisma.browserSession.findUniqueOrThrow({ where: { id: sessionB } })).revokedAt, null);
+      assert.equal((await prisma.browserSession.findUniqueOrThrow({ where: { id: providerSession } })).revokedAt, null);
+
+      await service.setPolicy({ condominioId: tenantA, state: 'enabled', cohortPercentage: null,
+        actorAccountId, requestCorrelationId: 'tenant-before-global-pilot' });
+      const globalExcludedSession = randomUUID();
+      await prisma.browserSession.create({ data: { id: globalExcludedSession, familyId: randomUUID(), createdAt: now,
+        lastSeenAt: now, idleExpiresAt: new Date(now.getTime() + 60_000),
+        absoluteExpiresAt: new Date(now.getTime() + 120_000), authenticatedAt: now,
+        tokenDigest: randomBytes(32), csrfDigest: randomBytes(32), csrfCiphertext: randomBytes(32),
+        csrfNonce: randomBytes(12), csrfAuthTag: randomBytes(16), csrfKeyVersion: 1,
+        accountId: accountA, accountSessionVersion: 0, activeMembershipId: membershipA } });
+      assert.equal((await service.setPolicy({ condominioId: null, state: 'pilot', cohortPercentage: 10,
+        actorAccountId, requestCorrelationId: 'global-enabled-to-pilot' }))?.revokedSessions, 1);
+      assert.ok((await prisma.browserSession.findUniqueOrThrow({ where: { id: globalExcludedSession } })).revokedAt);
+      assert.equal((await prisma.browserSession.findUniqueOrThrow({ where: { id: sessionB } })).revokedAt, null);
+      assert.equal((await prisma.browserSession.findUniqueOrThrow({ where: { id: providerSession } })).revokedAt, null);
       assert.equal((await prisma.$transaction((tx) => service.gateMembership(tx, membershipA, accountA))).allowed, false);
       assert.equal((await prisma.$transaction((tx) => service.gateMembership(tx, membershipB, accountB))).allowed, true);
-      assert.equal(await prisma.humanAuthRolloutHistory.count({ where: { scope: `tenant:${tenantA}` } }), 5);
+      assert.ok(await prisma.humanAuthRolloutHistory.count({ where: { scope: `tenant:${tenantA}` } }) >= 8);
       await assert.rejects(prisma.$executeRaw`UPDATE "HumanAuthRolloutHistory" SET rollback = false
         WHERE scope = ${`tenant:${tenantA}`}`);
     } finally {
-      await prisma.browserSession.deleteMany({ where: { id: { in: [sessionA, sessionB, racingSession] } } });
+      await prisma.browserSession.deleteMany({ where: { accountId: { in: [actorAccountId, accountA, accountB] } } });
+      await prisma.oidcValidatedHandoff.deleteMany({ where: { loginTransactionId: racingTransactionId } });
+      await prisma.oidcLoginTransaction.deleteMany({ where: { id: racingTransactionId } });
       await prisma.humanProvisioningInvitation.deleteMany({ where: { id: invitationId } });
       await prisma.humanAuthRolloutHistory.deleteMany({ where: { actorAccountId } }).catch(() => undefined);
       // Immutable history intentionally prevents normal cleanup; isolate this test with unique rows and remove through owner SQL.
       const owner = new pg.Client({ connectionString: process.env.DATABASE_URL });
       await owner.connect();
+      await owner.query('DROP TRIGGER IF EXISTS pc30_block_session_issue ON "BrowserSession"');
+      await owner.query('DROP FUNCTION IF EXISTS pc30_block_session_issue()');
       await owner.query('DROP TRIGGER "HumanAuthRolloutHistory_reject_update_delete" ON "HumanAuthRolloutHistory"');
       await owner.query('DELETE FROM "HumanAuthRolloutHistory" WHERE "actorAccountId" = $1', [actorAccountId]);
       await owner.query(`CREATE TRIGGER "HumanAuthRolloutHistory_reject_update_delete" BEFORE UPDATE OR DELETE
         ON "HumanAuthRolloutHistory" FOR EACH ROW EXECUTE FUNCTION reject_human_auth_rollout_history_mutation()`);
       await owner.end();
       await prisma.humanAuthRolloutPolicy.deleteMany({ where: { condominioId: { in: [tenantA, tenantB] } } });
-      await prisma.externalIdentity.deleteMany({ where: { accountId: actorAccountId } });
+      await prisma.externalIdentity.deleteMany({ where: { accountId: { in: [actorAccountId, accountA] } } });
       await prisma.humanMembership.deleteMany({ where: { accountId: { in: [actorAccountId, accountA, accountB, invitedAccount] } } });
       await prisma.humanAccount.deleteMany({ where: { id: { in: [actorAccountId, accountA, accountB, invitedAccount] } } });
       await prisma.condominio.deleteMany({ where: { id: { in: [tenantA, tenantB] } } });
