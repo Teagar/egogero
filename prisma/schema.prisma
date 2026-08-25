@@ -23,6 +23,45 @@ model Condominio {
   notificacoes         Notificacao[]
   dispositivos         Dispositivo[]
   humanMemberships     HumanMembership[]
+  humanAuthRollout     HumanAuthRolloutPolicy?
+}
+
+model HumanAuthRolloutPolicy {
+  scope              String                @id
+  condominioId       String?               @unique
+  state              HumanAuthRolloutState
+  cohortPercentage   Int?
+  cohortAlgorithm    String?
+  version            Int                   @default(1)
+  updatedAt          DateTime              @default(now()) @db.Timestamptz(3)
+  updatedByAccountId String?               @db.Uuid
+  condominio         Condominio?           @relation(fields: [condominioId], references: [id], onDelete: Restrict)
+}
+
+model HumanAuthRolloutHistory {
+  id                       String                @id @default(uuid()) @db.Uuid
+  createdAt                DateTime              @default(now()) @db.Timestamptz(3)
+  scope                    String
+  condominioId             String?
+  previousState            HumanAuthRolloutState?
+  previousCohortPercentage Int?
+  state                    HumanAuthRolloutState
+  cohortPercentage         Int?
+  cohortAlgorithm          String?
+  policyVersion            Int
+  actorAccountId           String                @db.Uuid
+  requestCorrelationId     String
+  rollback                 Boolean
+  revokedSessions          Int                   @default(0)
+
+  @@index([scope, createdAt, id])
+}
+
+enum HumanAuthRolloutState {
+  disabled
+  internal_provider
+  pilot
+  enabled
 }
 
 model Morador {

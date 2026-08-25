@@ -30,6 +30,8 @@ import { prisma as defaultPrisma } from './lib/prisma.js';
 import { isDatabaseTimeZoneRejection, isValidTimeZone } from './timezones.js';
 import type { AuthRateLimiter } from './auth-rate-limits.js';
 import { registerFrontend } from './frontend.js';
+import { registerHumanAuthRolloutRoutes } from './human-auth-rollout.js';
+import type { HumanAuthRolloutService } from './human-auth-rollout.js';
 
 type CondominioRecord = {
   id: string;
@@ -439,6 +441,7 @@ export function createApp(
     browserSessionService,
     browserSessionStore,
     humanAdministrationService,
+    humanAuthRolloutService,
     authRateLimiter,
     frontendRoot
   }: {
@@ -460,6 +463,7 @@ export function createApp(
     browserSessionService?: BrowserSessionService;
     browserSessionStore?: BrowserSessionStore;
     humanAdministrationService?: HumanAdministrationService;
+    humanAuthRolloutService?: HumanAuthRolloutService;
     authRateLimiter?: AuthRateLimiter;
     frontendRoot?: string;
   } = {}
@@ -799,6 +803,7 @@ export function createApp(
   );
   registerBrowserAuthRoutes(app, browserSessionStore, browserSessionService, oidcService, authRateLimiter);
   registerHumanAdministrationRoutes(app, authenticator, humanAdministrationService);
+  registerHumanAuthRolloutRoutes(app, authenticator, humanAuthRolloutService);
 
   return app;
 }

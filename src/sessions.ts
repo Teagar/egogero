@@ -19,6 +19,7 @@ import type { AuthRateLimiter } from './auth-rate-limits.js';
 import { noopAuthAlerts, noopAuthMetrics, safeAuthAlerts, safeAuthMetrics } from './auth-observability.js';
 import type { AuthAlertSink, AuthMetrics } from './auth-observability.js';
 import { requestIpPrefix } from './client-ip.js';
+import type { HumanAuthRolloutGate } from './human-auth-rollout.js';
 
 export type { HumanSessionIdentity } from './auth.js';
 
@@ -583,7 +584,8 @@ async function touchSession(transaction: Prisma.TransactionClient, session: Sess
 export function createPrismaBrowserSessionStore(
   client: PrismaClient,
   config: SessionRuntimeConfig,
-  dependencies: { rateLimiter?: AuthRateLimiter; metrics?: AuthMetrics; alerts?: AuthAlertSink } = {}
+  dependencies: { rateLimiter?: AuthRateLimiter; metrics?: AuthMetrics; alerts?: AuthAlertSink;
+    rolloutGate?: HumanAuthRolloutGate } = {}
 ): BrowserSessionStore {
   const metrics = safeAuthMetrics(dependencies.metrics ?? noopAuthMetrics);
   const alerts = safeAuthAlerts(dependencies.alerts ?? noopAuthAlerts);
@@ -775,6 +777,21 @@ export function createPrismaBrowserSessionStore(
           });
           return null;
         }
+        if (membership) {
+          const rollout = dependencies.rolloutGate
+            ? await dependencies.rolloutGate.gateMembership(transaction, membership.id, account.id)
+            : { allowed: true };
+          if (!rollout.allowed) {
+            await insertAudit(transaction, {
+              eventType: 'session_issue_denied', outcome: 'denied', reasonCode: 'rollout_disabled',
+              requestCorrelationId: input.requestCorrelationId, accountId: account.id,
+              externalIdentityId: handoff.externalIdentityId, membershipId: membership.id,
+              condominioId: membership.condominioId, ipPrefix: input.ipPrefix,
+              userAgentHash: userAgentDigest(input.userAgent)
+            });
+            return null;
+          }
+        }
         const oldSession = input.oldSessionToken && oldCandidate
           ? await loadSession(transaction, digest(input.oldSessionToken), true)
           : null;
@@ -964,6 +981,11 @@ export function createPrismaBrowserSessionStore(
             await auditDenied(transaction, request, 'session_authentication_denied', reason, session);
             return null;
           }
+          if (dependencies.rolloutGate
+            && !(await dependencies.rolloutGate.gateMembership(transaction, session.id, session.accountId)).allowed) {
+            await auditDenied(transaction, request, 'session_authentication_denied', 'rollout_disabled', session);
+            return null;
+          }
           if (config.mfaPolicy && !evidenceSatisfiesRole(config.mfaPolicy, session.role, {
             amr: session.authenticationMethods, acr: session.assuranceContext
           })) {
@@ -1000,7 +1022,15 @@ export function createPrismaBrowserSessionStore(
       const databaseStartedAt = performance.now();
       try {
         const result = await client.$transaction(async (transaction) => {
-        const session = await loadSession(transaction, digest(input.sessionToken), true);
+        const tokenDigest = digest(input.sessionToken);
+        const candidate = await loadSession(transaction, tokenDigest, false);
+        if (candidate && dependencies.rolloutGate
+          && !(await dependencies.rolloutGate.gateMembership(transaction, candidate.id, candidate.accountId)).allowed) {
+          await auditDenied(transaction, input, 'session_authentication_denied', 'rollout_disabled', candidate);
+          return null;
+        }
+        // Policy is locked first so rollback never waits on a session held by this request.
+        const session = await loadSession(transaction, tokenDigest, true);
         if (!session) {
           await auditDenied(transaction, input, 'session_authentication_denied', 'invalid_session');
           return null;
@@ -1102,6 +1132,8 @@ export function createPrismaBrowserSessionStore(
         const membershipScopeLive = membership
           ? await lockLiveMembershipScope(transaction, membership)
           : false;
+        const rolloutAllowed = !membership || !dependencies.rolloutGate
+          || (await dependencies.rolloutGate.gateMembership(transaction, membership.id, candidate!.accountId)).allowed;
         const session = await loadSession(transaction, tokenDigest, true);
         if (!session) {
           await auditDenied(transaction, input, 'session_rotation_denied', 'invalid_session');
@@ -1122,6 +1154,10 @@ export function createPrismaBrowserSessionStore(
         }
         if (!membership) {
           await auditDenied(transaction, input, 'session_rotation_denied', 'target_membership_inactive', session);
+          return { status: 'denied' };
+        }
+        if (!rolloutAllowed) {
+          await auditDenied(transaction, input, 'session_rotation_denied', 'rollout_disabled', session);
           return { status: 'denied' };
         }
         if (!membershipScopeLive) {
