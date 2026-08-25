@@ -139,7 +139,7 @@ async function revokeIneligibleSessions(
     SET "revokedAt" = clock_timestamp(), "revokeReason" = 'human_auth_policy_change'
     FROM effective
     WHERE session.id = effective.id
-      AND NOT (
+      AND (
         (effective.provider AND effective.global_state IN ('internal_provider', 'pilot', 'enabled'))
         OR (NOT effective.provider
           AND (effective.global_state = 'enabled' OR (
@@ -155,7 +155,7 @@ async function revokeIneligibleSessions(
             AND effective.cohort <= effective.tenant_percentage
           ))
         )
-      )
+      ) IS NOT TRUE
   `);
 }
 

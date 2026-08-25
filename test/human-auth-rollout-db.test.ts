@@ -55,10 +55,14 @@ test('PostgreSQL rollout serializes changes, fails closed, isolates tenants, and
     const actorAccountId = randomUUID();
     const tenantA = tenantInCohort(51, 100);
     const tenantB = tenantInCohort(1, 10);
+    const tenantWithoutPolicy = randomUUID();
     const accountA = randomUUID();
     const accountB = randomUUID();
+    const accountWithoutPolicy = randomUUID();
     const membershipA = randomUUID();
     const membershipB = randomUUID();
+    const membershipWithoutPolicy = randomUUID();
+    const sessionWithoutPolicy = randomUUID();
     const providerMembershipId = randomUUID();
     const sessionA = randomUUID();
     const sessionB = randomUUID();
@@ -104,14 +108,16 @@ test('PostgreSQL rollout serializes changes, fails closed, isolates tenants, and
       `);
       assert.deepEqual(sqlCohorts.map(({ id, cohort }) => [id, Number(cohort)]),
         parityIds.map((id) => [id, humanAuthTenantCohort(id)]));
-      await prisma.condominio.createMany({ data: [tenantA, tenantB].map((id) => ({ id, nome: id,
+      await prisma.condominio.createMany({ data: [tenantA, tenantB, tenantWithoutPolicy].map((id) => ({ id, nome: id,
         responsavel: 'PC30', tipo: 'residencial', timezone: 'UTC' })) });
-      await prisma.humanAccount.createMany({ data: [actorAccountId, accountA, accountB].map((id) => ({ id,
+      await prisma.humanAccount.createMany({ data: [actorAccountId, accountA, accountB, accountWithoutPolicy].map((id) => ({ id,
         displayName: id, status: 'active' })) });
       await prisma.humanMembership.createMany({ data: [
         { id: providerMembershipId, accountId: actorAccountId, role: 'provedor', status: 'active' },
         { id: membershipA, accountId: accountA, condominioId: tenantA, role: 'sindico', status: 'active' },
-        { id: membershipB, accountId: accountB, condominioId: tenantB, role: 'sindico', status: 'active' }
+        { id: membershipB, accountId: accountB, condominioId: tenantB, role: 'sindico', status: 'active' },
+        { id: membershipWithoutPolicy, accountId: accountWithoutPolicy, condominioId: tenantWithoutPolicy,
+          role: 'portaria', status: 'active' }
       ] });
       await prisma.externalIdentity.create({ data: { accountId: actorAccountId,
         issuer: 'https://identity.example.test', subject: `rollout-${actorAccountId}` } });
@@ -127,6 +133,19 @@ test('PostgreSQL rollout serializes changes, fails closed, isolates tenants, and
       ))).allowed, false);
       await service.setPolicy({ condominioId: null, state: 'enabled', cohortPercentage: null,
         actorAccountId, requestCorrelationId: 'global-enable' });
+      const missingPolicyNow = new Date();
+      await prisma.browserSession.create({ data: { id: sessionWithoutPolicy, familyId: randomUUID(),
+        createdAt: missingPolicyNow, lastSeenAt: missingPolicyNow,
+        idleExpiresAt: new Date(missingPolicyNow.getTime() + 60_000),
+        absoluteExpiresAt: new Date(missingPolicyNow.getTime() + 120_000), authenticatedAt: missingPolicyNow,
+        tokenDigest: randomBytes(32), csrfDigest: randomBytes(32), csrfCiphertext: randomBytes(32),
+        csrfNonce: randomBytes(12), csrfAuthTag: randomBytes(16), csrfKeyVersion: 1,
+        accountId: accountWithoutPolicy, accountSessionVersion: 0,
+        activeMembershipId: membershipWithoutPolicy } });
+      const missingTenantPolicyCleanup = await service.setPolicy({ condominioId: null, state: 'enabled',
+        cohortPercentage: null, actorAccountId, requestCorrelationId: 'missing-tenant-policy-cleanup' });
+      assert.equal(missingTenantPolicyCleanup?.revokedSessions, 1);
+      assert.ok((await prisma.browserSession.findUniqueOrThrow({ where: { id: sessionWithoutPolicy } })).revokedAt);
       const changes = await Promise.all([
         service.setPolicy({ condominioId: tenantA, state: 'pilot', cohortPercentage: 10,
           actorAccountId, requestCorrelationId: 'pilot-10' }),
@@ -353,7 +372,7 @@ test('PostgreSQL rollout serializes changes, fails closed, isolates tenants, and
         WHERE scope = ${`tenant:${tenantA}`}`);
     } finally {
       await prisma.browserSession.deleteMany({ where: { accountId: {
-        in: [actorAccountId, accountA, accountB, highAccount]
+        in: [actorAccountId, accountA, accountB, accountWithoutPolicy, highAccount]
       } } });
       await prisma.oidcValidatedHandoff.deleteMany({ where: { loginTransactionId: racingTransactionId } });
       await prisma.oidcLoginTransaction.deleteMany({ where: { id: racingTransactionId } });
@@ -373,15 +392,15 @@ test('PostgreSQL rollout serializes changes, fails closed, isolates tenants, and
         ON "HumanAuthRolloutHistory" FOR EACH ROW EXECUTE FUNCTION reject_human_auth_rollout_history_mutation()`);
       await owner.end();
       await Promise.all([lockObserver.end().catch(() => undefined), rollbackBarrier.end().catch(() => undefined)]);
-      await prisma.humanAuthRolloutPolicy.deleteMany({ where: { condominioId: { in: [tenantA, tenantB] } } });
+      await prisma.humanAuthRolloutPolicy.deleteMany({ where: { condominioId: { in: [tenantA, tenantB, tenantWithoutPolicy] } } });
       await prisma.externalIdentity.deleteMany({ where: { accountId: { in: [actorAccountId, accountA] } } });
       await prisma.humanMembership.deleteMany({ where: { accountId: {
-        in: [actorAccountId, accountA, accountB, invitedAccount, highAccount]
+        in: [actorAccountId, accountA, accountB, accountWithoutPolicy, invitedAccount, highAccount]
       } } });
       await prisma.humanAccount.deleteMany({ where: { id: {
-        in: [actorAccountId, accountA, accountB, invitedAccount, highAccount]
+        in: [actorAccountId, accountA, accountB, accountWithoutPolicy, invitedAccount, highAccount]
       } } });
-      await prisma.condominio.deleteMany({ where: { id: { in: [tenantA, tenantB] } } });
+      await prisma.condominio.deleteMany({ where: { id: { in: [tenantA, tenantB, tenantWithoutPolicy] } } });
       await Promise.all([prisma.$disconnect(), second.$disconnect()]);
     }
   });
