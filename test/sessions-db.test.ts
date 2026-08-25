@@ -12,6 +12,7 @@ import type { SessionRuntimeConfig } from '../src/sessions.js';
 import { createPrismaAuthRateLimiter } from '../src/auth-rate-limits.js';
 import type { AuthRateLimiter } from '../src/auth-rate-limits.js';
 import { TEST_ONLY_ALLOW_ALL_HUMAN_AUTH_ROLLOUT } from '../src/human-auth-rollout.js';
+import { createAuthTestCollectors } from '../src/auth-observability.js';
 
 const runDatabaseTests = process.env.RUN_DATABASE_TESTS === 'true' && Boolean(process.env.DATABASE_URL);
 
@@ -659,11 +660,15 @@ test('recovery always revokes old sessions before an exhausted replacement-sessi
   const identityId = randomUUID();
   const membershipId = randomUUID();
   const transactionIds: string[] = [];
-  const store = createPrismaBrowserSessionStore(prisma, {
+  const telemetry = createAuthTestCollectors();
+  const sessionConfig = {
     currentCsrfKeyVersion: 1,
     csrfKeys: new Map([[1, randomBytes(32)]]),
     publicApplicationOrigin: 'https://app.example.test'
-  }, { rolloutGate: TEST_ONLY_ALLOW_ALL_HUMAN_AUTH_ROLLOUT });
+  };
+  const store = createPrismaBrowserSessionStore(prisma, sessionConfig, {
+    rolloutGate: TEST_ONLY_ALLOW_ALL_HUMAN_AUTH_ROLLOUT, alerts: telemetry.alertSink
+  });
 
   async function handoff(recoveryIntent: boolean) {
     const loginTransactionId = randomUUID();
@@ -694,6 +699,18 @@ test('recovery always revokes old sessions before an exhausted replacement-sessi
     await prisma.humanMembership.create({
       data: { id: membershipId, accountId, role: 'provedor', status: 'active' }
     });
+    const deniedTelemetry = createAuthTestCollectors();
+    const inconsistentStore = createPrismaBrowserSessionStore(prisma, sessionConfig, {
+      rolloutGate: {
+        ...TEST_ONLY_ALLOW_ALL_HUMAN_AUTH_ROLLOUT,
+        async gateMembership() { return { allowed: false, reason: 'policy_inconsistent' }; }
+      },
+      alerts: deniedTelemetry.alertSink
+    });
+    assert.equal(await inconsistentStore.issueFromHandoff({
+      handoffToken: await handoff(false), requestCorrelationId: 'cross-tenant-denial'
+    }), null);
+    assert.deepEqual(deniedTelemetry.alerts.map((alert) => alert.type), ['cross_tenant_access_denied']);
     const first = await store.issueFromHandoff({ handoffToken: await handoff(false), requestCorrelationId: 'initial' });
     assert.ok(first);
     const limiter = createPrismaAuthRateLimiter(prisma);
@@ -712,6 +729,7 @@ test('recovery always revokes old sessions before an exhausted replacement-sessi
     assert.equal(await prisma.authenticationAuditEvent.count({
       where: { accountId, eventType: 'session_issue_denied', reasonCode: 'session_creation_rate_limited' }
     }), 1);
+    assert.ok(telemetry.alerts.some((alert) => alert.type === 'unusual_session_creation'));
   } finally {
     await prisma.authenticationRateLimit.deleteMany({ where: { subject: accountId } });
     await prisma.browserSession.deleteMany({ where: { accountId } });

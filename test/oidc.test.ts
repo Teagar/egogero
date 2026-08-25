@@ -669,10 +669,14 @@ test('OIDC startup fails closed on metadata drift and never follows redirects', 
   const database = memoryStore();
   const provider = await mockProvider(config);
   provider.metadata = { token_endpoint: 'https://attacker.example/token' };
+  const telemetry = createAuthTestCollectors();
   await assert.rejects(
-    createOidcService(config, database.store, provider.fetchImplementation),
+    createOidcService(config, database.store, provider.fetchImplementation, { alerts: telemetry.alertSink }),
     /OIDC initialization failed/
   );
+  assert.deepEqual(telemetry.alerts.map((alert) => alert.type), [
+    'provider_configuration_drift', 'crypto_key_failure'
+  ]);
 
   const redirectingFetch: typeof fetch = async () => new Response(null, {
     status: 302,

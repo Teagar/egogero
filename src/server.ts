@@ -23,9 +23,11 @@ import {
   combineAuthAlertSinks,
   createAuthAlertStdoutAdapter,
   createAuthAlertWebhookAdapter,
+  createAuthSnapshotFileSink,
   createRoutedAuthAlertSink,
   createStructuredAuthTelemetry,
   DEFAULT_AUTH_ALERT_ROUTES,
+  prepareAuthSnapshotFile,
   registerAuthTelemetryLifecycle,
   type AuthAlertDeliveryAdapter,
   type AuthSnapshotSink
@@ -41,7 +43,12 @@ export function createServerAuthObservability(
     request?: typeof fetch;
   } = {}
 ) {
-  const telemetry = createStructuredAuthTelemetry(dependencies.snapshotSink);
+  const snapshotSink = dependencies.snapshotSink ?? (config.snapshotPath
+    ? createAuthSnapshotFileSink(config.snapshotPath)
+    : undefined);
+  const telemetry = createStructuredAuthTelemetry(snapshotSink, {
+    instanceId: config.instanceId, stageId: config.stageId
+  });
   const adapter = dependencies.alertAdapter ?? (config.adapter === 'stdout'
     ? createAuthAlertStdoutAdapter()
     : createAuthAlertWebhookAdapter(config.url, dependencies.request));
@@ -58,6 +65,7 @@ export function createServerAuthObservability(
 
 export async function startServer(environment: NodeJS.ProcessEnv = process.env) {
   const env = getEnv(environment);
+  if (env.authAlerts.rolloutMode === 'canary') await prepareAuthSnapshotFile(env.authAlerts.snapshotPath!);
   const deviceStore = createPrismaDeviceStore(prisma, env.deviceApiKeySecret);
   const invitationStore = createPrismaInvitationStore(
     prisma,

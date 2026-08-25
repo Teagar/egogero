@@ -1,10 +1,10 @@
-import { constants, createReadStream } from 'node:fs';
+import { constants } from 'node:fs';
 import { lstat, open } from 'node:fs/promises';
 import { StringDecoder } from 'node:string_decoder';
 import { pathToFileURL } from 'node:url';
 
-export const AUTH_ROLLOUT_CONTRACT = 'egogero.auth-rollout/v1' as const;
-export const AUTH_ROLLOUT_INVENTORY_CONTRACT = 'egogero.auth-rollout-inventory/v1' as const;
+export const AUTH_ROLLOUT_CONTRACT = 'egogero.auth-rollout/v2' as const;
+export const AUTH_ROLLOUT_INVENTORY_CONTRACT = 'egogero.auth-rollout-inventory/v2' as const;
 export const AUTH_ROLLOUT_MINIMUM_WINDOW_MS = 24 * 60 * 60 * 1_000;
 export const AUTH_ROLLOUT_MINIMUM_CALLBACKS = 100;
 export const AUTH_ROLLOUT_MINIMUM_SESSION_SAMPLES = 100;
@@ -27,12 +27,15 @@ const HISTOGRAM_DIMENSIONS: Readonly<Record<string, Readonly<Record<string, read
 };
 const ALERT_TYPES = new Set([
   'rate_limit_repeated_excess', 'crypto_integrity_failure', 'crypto_key_failure', 'oidc_replay_or_state_miss',
-  'oidc_issuer_mixup', 'oidc_callback_success_slo', 'session_lookup_latency_slo'
+  'oidc_issuer_mixup', 'oidc_callback_success_slo', 'session_lookup_latency_slo',
+  'cross_tenant_access_denied', 'provider_configuration_drift', 'session_revocation_slo', 'unusual_session_creation'
 ]);
 const CRITICAL_ALERT_TYPES = new Set([
-  'crypto_integrity_failure', 'crypto_key_failure', 'oidc_replay_or_state_miss', 'oidc_issuer_mixup'
+  'crypto_integrity_failure', 'crypto_key_failure', 'oidc_replay_or_state_miss', 'oidc_issuer_mixup',
+  'cross_tenant_access_denied', 'provider_configuration_drift', 'session_revocation_slo', 'unusual_session_creation'
 ]);
 const INSTANCE_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const EVIDENCE_STAGE_ID = /^(?:staging|production):(?!non-canary$)[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?$/;
 export type AuthRolloutInputLimits = {
   files: number;
   records: number;
@@ -69,6 +72,7 @@ export type AuthRolloutSnapshot = {
   contract: typeof AUTH_ROLLOUT_CONTRACT;
   interval: { start: string; end: string };
   instanceId: string;
+  stageId: string;
   sequence: number;
   counters: readonly AuthRolloutCounter[];
   histograms: readonly AuthRolloutHistogram[];
@@ -82,6 +86,7 @@ export type AuthRolloutSnapshot = {
 
 export type AuthRolloutInventory = {
   contract: typeof AUTH_ROLLOUT_INVENTORY_CONTRACT;
+  stageId: string;
   servingInstances: readonly {
     instanceId: string;
     expectedStart: string;
@@ -91,7 +96,8 @@ export type AuthRolloutInventory = {
 };
 
 export type AuthRolloutEvaluation = {
-  contract: 'egogero.auth-rollout-evaluation/v1';
+  contract: 'egogero.auth-rollout-evaluation/v2';
+  stageId: string | null;
   result: 'pass' | 'fail' | 'inconclusive';
   window: { start: string | null; end: string | null; durationMs: number };
   totals: {
@@ -126,6 +132,8 @@ function validInventory(value: unknown): value is AuthRolloutInventory {
   if (!value || typeof value !== 'object') return false;
   const inventory = value as Partial<AuthRolloutInventory>;
   if (inventory.contract !== AUTH_ROLLOUT_INVENTORY_CONTRACT
+    || typeof inventory.stageId !== 'string'
+    || !EVIDENCE_STAGE_ID.test(inventory.stageId)
     || !Array.isArray(inventory.servingInstances)
     || inventory.servingInstances.length === 0
     || inventory.servingInstances.length > 1_000) return false;
@@ -151,6 +159,8 @@ function validSnapshot(value: unknown): value is AuthRolloutSnapshot {
   if (snapshot.contract !== AUTH_ROLLOUT_CONTRACT
     || typeof snapshot.instanceId !== 'string'
     || !INSTANCE_ID.test(snapshot.instanceId)
+    || typeof snapshot.stageId !== 'string'
+    || !EVIDENCE_STAGE_ID.test(snapshot.stageId)
     || !safeInteger(snapshot.sequence)
     || snapshot.sequence < 1
     || !snapshot.interval
@@ -202,10 +212,18 @@ export function evaluateAuthRolloutSnapshots(
   inputReasons: readonly string[] = []
 ): AuthRolloutEvaluation {
   const reasons = new Set<string>(inputReasons);
-  const snapshots: AuthRolloutSnapshot[] = [];
+  let snapshots: AuthRolloutSnapshot[] = [];
   for (const value of input) {
     if (validSnapshot(value)) snapshots.push(value);
     else reasons.add('invalid_snapshot');
+  }
+
+  const inventory = validInventory(inventoryInput) ? inventoryInput : null;
+  if (!inventoryInput) reasons.add('expected_inventory_missing');
+  else if (!inventory) reasons.add('expected_inventory_invalid');
+  if (inventory && snapshots.some((snapshot) => snapshot.stageId !== inventory.stageId)) {
+    reasons.add('stage_mismatch');
+    snapshots = snapshots.filter((snapshot) => snapshot.stageId === inventory.stageId);
   }
 
   const intervals = snapshots.map((snapshot) => ({
@@ -226,9 +244,6 @@ export function evaluateAuthRolloutSnapshots(
     }
   }
 
-  const inventory = validInventory(inventoryInput) ? inventoryInput : null;
-  if (!inventoryInput) reasons.add('expected_inventory_missing');
-  else if (!inventory) reasons.add('expected_inventory_invalid');
   if (inventory) {
     const expectedIds = new Set(inventory.servingInstances.map((instance) => instance.instanceId));
     if (intervals.some((interval) => !expectedIds.has(interval.snapshot.instanceId))) {
@@ -332,7 +347,8 @@ export function evaluateAuthRolloutSnapshots(
   ].includes(reason));
 
   return {
-    contract: 'egogero.auth-rollout-evaluation/v1',
+    contract: 'egogero.auth-rollout-evaluation/v2',
+    stageId: inventory?.stageId ?? null,
     result: failed ? 'fail' : inconclusiveReasons.length > 0 ? 'inconclusive' : 'pass',
     window: {
       start: coverageStart === null ? null : new Date(coverageStart).toISOString(),
@@ -356,52 +372,66 @@ export class AuthRolloutInputLimitError extends Error {}
 
 export async function readAuthRolloutJsonl(
   paths: readonly string[],
-  limits: AuthRolloutInputLimits = AUTH_ROLLOUT_INPUT_LIMITS
+  limits: AuthRolloutInputLimits = AUTH_ROLLOUT_INPUT_LIMITS,
+  options: { chunkBytes?: number; afterOpen?: (path: string) => void | Promise<void> } = {}
 ): Promise<unknown[]> {
   if (paths.length > limits.files) throw new AuthRolloutInputLimitError('too many snapshot files');
+  const chunkBytes = options.chunkBytes ?? 64 * 1_024;
+  if (!Number.isSafeInteger(chunkBytes) || chunkBytes < 1 || chunkBytes > 64 * 1_024) {
+    throw new AuthRolloutInputLimitError('invalid snapshot read chunk size');
+  }
   const values: unknown[] = [];
   let totalBytes = 0;
-  const sourceNames: Array<string | null> = paths.length === 0 ? [null] : [...paths];
-  for (const name of sourceNames) {
-    const source = { name: name ?? 'stdin', stream: name
-      ? createReadStream(name) as NodeJS.ReadableStream
-      : process.stdin };
+  async function consumeStream(name: string, stream: NodeJS.ReadableStream) {
     let fileBytes = 0;
     let partial = '';
     const decoder = new StringDecoder('utf8');
     function consume(line: string) {
-      if (Buffer.byteLength(line, 'utf8') > limits.lineBytes) {
-        throw new AuthRolloutInputLimitError(`snapshot line limit exceeded at ${source.name}`);
-      }
+      if (Buffer.byteLength(line, 'utf8') > limits.lineBytes) throw new AuthRolloutInputLimitError(`snapshot line limit exceeded at ${name}`);
       if (line.trim().length === 0) return;
       if (values.length >= limits.records) throw new AuthRolloutInputLimitError('too many snapshot records');
       try { values.push(JSON.parse(line)); } catch { values.push(null); }
     }
-    try {
-      for await (const chunk of source.stream) {
-        const bytes = typeof chunk === 'string' ? Buffer.byteLength(chunk, 'utf8') : chunk.length;
-        fileBytes += bytes;
-        totalBytes += bytes;
-        if (fileBytes > limits.fileBytes || totalBytes > limits.totalBytes) {
-          throw new AuthRolloutInputLimitError(`snapshot input limit exceeded at ${source.name}`);
-        }
-        partial += typeof chunk === 'string' ? chunk : decoder.write(chunk);
-        let newline = partial.indexOf('\n');
-        while (newline >= 0) {
-          const line = partial.slice(0, newline).replace(/\r$/, '');
-          partial = partial.slice(newline + 1);
-          consume(line);
-          newline = partial.indexOf('\n');
-        }
-        if (Buffer.byteLength(partial, 'utf8') > limits.lineBytes) {
-          throw new AuthRolloutInputLimitError(`snapshot line limit exceeded at ${source.name}`);
-        }
+    for await (const chunk of stream) {
+      const bytes = typeof chunk === 'string' ? Buffer.byteLength(chunk, 'utf8') : chunk.length;
+      fileBytes += bytes;
+      totalBytes += bytes;
+      if (fileBytes > limits.fileBytes || totalBytes > limits.totalBytes) throw new AuthRolloutInputLimitError(`snapshot input limit exceeded at ${name}`);
+      partial += typeof chunk === 'string' ? chunk : decoder.write(chunk);
+      let newline = partial.indexOf('\n');
+      while (newline >= 0) {
+        consume(partial.slice(0, newline).replace(/\r$/, ''));
+        partial = partial.slice(newline + 1);
+        newline = partial.indexOf('\n');
       }
-      partial += decoder.end();
-      if (partial.length > 0) consume(partial.replace(/\r$/, ''));
-    } catch (error) {
-      if ('destroy' in source.stream && typeof source.stream.destroy === 'function') source.stream.destroy();
-      throw error;
+      if (Buffer.byteLength(partial, 'utf8') > limits.lineBytes) throw new AuthRolloutInputLimitError(`snapshot line limit exceeded at ${name}`);
+    }
+    partial += decoder.end();
+    if (partial.length > 0) consume(partial.replace(/\r$/, ''));
+    return fileBytes;
+  }
+  if (paths.length === 0) {
+    await consumeStream('stdin', process.stdin);
+    return values;
+  }
+  for (const path of paths) {
+    const before = await lstat(path);
+    if (!before.isFile()) throw new AuthRolloutInputLimitError(`snapshot must be a regular file at ${path}`);
+    const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    try {
+      const initial = await handle.stat();
+      if (!initial.isFile() || initial.dev !== before.dev || initial.ino !== before.ino) throw new AuthRolloutInputLimitError(`snapshot changed before it was opened at ${path}`);
+      if (initial.size > limits.fileBytes || totalBytes + initial.size > limits.totalBytes) throw new AuthRolloutInputLimitError(`snapshot input limit exceeded at ${path}`);
+      await options.afterOpen?.(path);
+      const bytesRead = await consumeStream(path, handle.createReadStream({ autoClose: false, highWaterMark: chunkBytes }));
+      const finalHandle = await handle.stat();
+      const finalPath = await lstat(path);
+      if (bytesRead !== initial.size || !finalPath.isFile() || finalHandle.size !== initial.size || finalHandle.dev !== initial.dev
+        || finalHandle.ino !== initial.ino || finalPath.dev !== initial.dev || finalPath.ino !== initial.ino) {
+        throw new AuthRolloutInputLimitError(`snapshot changed while being read at ${path}`);
+      }
+    } finally {
+      await handle.close();
     }
   }
   return values;
