@@ -575,7 +575,7 @@ test('OIDC enforces the authorization-response issuer parameter when configured'
   assert.equal(provider.tokenCalls, 1);
 });
 
-test('OIDC accepts an active previous PKCE key and rejects an unknown version before token exchange', async () => {
+test('rotation rehearsal persists PKCE material, emits current, reads overlap, and fails closed after removal', async () => {
   const firstConfig = configuration({ currentPkceKeyVersion: 1 });
   const database = memoryStore();
   const provider = await mockProvider(firstConfig);
@@ -593,6 +593,48 @@ test('OIDC accepts an active previous PKCE key and rejects an unknown version be
     requestCorrelationId: 'old-key-callback'
   });
   assert.equal(provider.tokenCalls, 1);
+
+  const currentEmission = await rotatedService.startLogin({ returnTo: '/', requestCorrelationId: 'current-key-login' });
+  const currentState = currentEmission.searchParams.get('state')!;
+  assert.equal(database.transactions.get(createHash('sha256').update(currentState).digest('hex'))!.pkceKeyVersion, 2);
+
+  const retirementCandidate = await firstService.startLogin({ returnTo: '/', requestCorrelationId: 'retired-key-login' });
+  provider.prepare(retirementCandidate);
+  const retiredService = await createOidcService(
+    configuration({ currentPkceKeyVersion: 2, pkceKeys: new Map([[2, Buffer.alloc(32, 2)]]) }),
+    database.store,
+    provider.fetchImplementation
+  );
+  await assert.rejects(
+    retiredService.completeCallback({
+      callbackUrl: callbackUrl(firstConfig, retirementCandidate), requestCorrelationId: 'retired-key-callback'
+    }),
+    OidcCallbackError
+  );
+  assert.equal(provider.tokenCalls, 1);
+
+  const compromisedCandidate = await rotatedService.startLogin({ returnTo: '/', requestCorrelationId: 'compromised-key-login' });
+  provider.prepare(compromisedCandidate);
+  const replacementConfig = configuration({
+    currentPkceKeyVersion: 3,
+    pkceKeys: new Map([[3, Buffer.alloc(32, 3)]])
+  });
+  const replacementService = await createOidcService(
+    replacementConfig, database.store, provider.fetchImplementation
+  );
+  await assert.rejects(
+    replacementService.completeCallback({
+      callbackUrl: callbackUrl(firstConfig, compromisedCandidate), requestCorrelationId: 'compromised-key-callback'
+    }),
+    OidcCallbackError
+  );
+  const replacementEmission = await replacementService.startLogin({
+    returnTo: '/', requestCorrelationId: 'replacement-key-login'
+  });
+  assert.equal(
+    database.transactions.get(createHash('sha256').update(replacementEmission.searchParams.get('state')!).digest('hex'))!.pkceKeyVersion,
+    3
+  );
 
   const unknown = await rotatedService.startLogin({ returnTo: '/', requestCorrelationId: 'unknown-key-login' });
   provider.prepare(unknown);

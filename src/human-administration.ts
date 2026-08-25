@@ -141,6 +141,27 @@ export function evidenceSatisfiesRole(policy: RoleMfaPolicy, role: Role, evidenc
   return methodAccepted && contextAccepted;
 }
 
+export function verifyRecoveryWebhookSignature(
+  config: Pick<HumanAdministrationConfig, 'recoveryWebhookIssuers' | 'recoveryWebhookSecret'>,
+  input: { eventId: string; issuer: string; subject: string; timestamp: number; signature: string },
+  now = Date.now()
+) {
+  const canonical = canonicalRecoveryWebhookEvent(input);
+  const supplied = /^[a-f0-9]{64}$/i.test(input.signature) ? Buffer.from(input.signature, 'hex') : Buffer.alloc(0);
+  const expected = createHmac('sha256', config.recoveryWebhookSecret).update(canonical).digest();
+  const valid = supplied.length === expected.length && timingSafeEqual(supplied, expected)
+    && Number.isSafeInteger(input.timestamp) && Math.abs(now - input.timestamp * 1000) <= WEBHOOK_CLOCK_SKEW_MS
+    && input.eventId.length > 0 && input.eventId.length <= 255 && input.subject.length > 0 && input.subject.length <= 255
+    && config.recoveryWebhookIssuers.has(input.issuer);
+  expected.fill(0);
+  supplied.fill(0);
+  return valid;
+}
+
+function canonicalRecoveryWebhookEvent(input: { timestamp: number; eventId: string; issuer: string; subject: string }) {
+  return `${input.timestamp}.${input.eventId}.${input.issuer}.${input.subject}`;
+}
+
 async function insertAudit(transaction: Prisma.TransactionClient, input: AuditInput) {
   const correlation = input.requestCorrelationId.length <= 128
     ? input.requestCorrelationId
@@ -295,21 +316,14 @@ export function createHumanAdministrationService(client: PrismaClient, config: H
     },
 
     async processRecoveryWebhook(input: { eventId: string; issuer: string; subject: string; timestamp: number; signature: string; requestCorrelationId: string }) {
-      const canonical = `${input.timestamp}.${input.eventId}.${input.issuer}.${input.subject}`;
-      const supplied = /^[a-f0-9]{64}$/i.test(input.signature) ? Buffer.from(input.signature, 'hex') : Buffer.alloc(0);
-      const expected = createHmac('sha256', config.recoveryWebhookSecret).update(canonical).digest();
-      const valid = supplied.length === expected.length && timingSafeEqual(supplied, expected)
-        && Number.isSafeInteger(input.timestamp) && Math.abs(Date.now() - input.timestamp * 1000) <= WEBHOOK_CLOCK_SKEW_MS
-        && input.eventId.length > 0 && input.eventId.length <= 255 && input.subject.length > 0 && input.subject.length <= 255
-        && config.recoveryWebhookIssuers.has(input.issuer);
-      expected.fill(0); supplied.fill(0);
+      const valid = verifyRecoveryWebhookSignature(config, input);
       if (!valid) {
         await client.$transaction((transaction) => insertAudit(transaction, { eventType: 'recovery_webhook_denied', outcome: 'denied',
           actorType: 'anonymous', requestCorrelationId: input.requestCorrelationId, reasonCode: 'invalid_webhook' }));
         return false;
       }
       return client.$transaction(async (transaction) => {
-        const eventDigest = digestSecret(canonical);
+        const eventDigest = digestSecret(canonicalRecoveryWebhookEvent(input));
         const inserted = await transaction.$queryRaw<Array<{ id: string }>>(Prisma.sql`
           INSERT INTO "RecoveryWebhookEvent" (id, "eventId", "eventDigest", issuer, subject, "processedAt")
           VALUES (${randomUUID()}::uuid, ${input.eventId}, ${eventDigest}, ${input.issuer}, ${input.subject}, clock_timestamp())

@@ -51,3 +51,71 @@ jobs:
 
       - name: Build
         run: npm run build
+
+  image-contract:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: office_image
+          POSTGRES_USER: office
+          POSTGRES_PASSWORD: office
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U office -d office_image"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://office:office@127.0.0.1:5432/office_image?schema=public
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Generate ephemeral test secrets
+        run: |
+          for name in INVITATION_TOKEN_SECRET DEVICE_API_KEY_SECRET IDEMPOTENCY_CACHE_SECRET; do
+            value=$(openssl rand -hex 32)
+            echo "::add-mask::$value"
+            echo "$name=$value" >> "$GITHUB_ENV"
+          done
+
+      - name: Build image
+        run: docker build -t office:ci .
+
+      - name: Inspect immutable non-root runtime
+        run: node scripts/verify-image-contract.mjs office:ci
+
+      - name: Run migrations from image
+        run: docker run --rm --network host -e DATABASE_URL --entrypoint npm office:ci run db:migrate:deploy
+
+      - name: Verify startup and readiness on a read-only root filesystem
+        run: |
+          container_id=$(docker run -d --read-only --tmpfs /tmp --network host \
+            -e NODE_ENV=production -e HUMAN_AUTH_ENABLED=false -e HOST=127.0.0.1 -e PORT=3000 \
+            -e DATABASE_URL -e INVITATION_TOKEN_SECRET -e DEVICE_API_KEY_SECRET -e IDEMPOTENCY_CACHE_SECRET \
+            office:ci)
+          trap 'docker logs "$container_id"; docker rm -f "$container_id"' EXIT
+          for attempt in $(seq 1 40); do
+            if curl --fail --silent http://127.0.0.1:3000/ready | grep --fixed-strings '"status":"ready"'; then
+              exit 0
+            fi
+            sleep 1
+          done
+          exit 1
+
+      - name: Verify device-secret drift fails before listen
+        run: |
+          docker run --rm --network host -e DATABASE_URL --entrypoint node office:ci --input-type=module -e \
+            "import { PrismaClient } from '@prisma/client'; const client = new PrismaClient(); await client.securityKey.update({ where: { name: 'device-api-key' }, data: { fingerprint: '0'.repeat(64) } }); await client.\$disconnect();"
+          set +e
+          output=$(docker run --rm --read-only --tmpfs /tmp --network host \
+            -e NODE_ENV=production -e HUMAN_AUTH_ENABLED=false -e HOST=127.0.0.1 -e PORT=3000 \
+            -e DATABASE_URL -e INVITATION_TOKEN_SECRET -e DEVICE_API_KEY_SECRET -e IDEMPOTENCY_CACHE_SECRET \
+            office:ci 2>&1)
+          status=$?
+          set -e
+          test "$status" -ne 0
+          test "$output" = "Startup failed"

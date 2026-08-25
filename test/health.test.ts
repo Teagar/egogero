@@ -17,6 +17,7 @@ test('readiness checks the database and reports only generic state', async () =>
   let databaseAvailable = true;
   const app = createApp({
     readiness: {
+      deviceSecretValidated: true,
       humanAuthEnabled: false,
       oidcMetadataValidated: true,
       requiredServicesComposed: true,
@@ -41,6 +42,7 @@ test('readiness checks the database and reports only generic state', async () =>
 test('human-auth readiness requires cached OIDC validation and complete composition without provider calls', async () => {
   let databaseChecks = 0;
   const readiness = {
+    deviceSecretValidated: true,
     humanAuthEnabled: true,
     oidcMetadataValidated: false,
     requiredServicesComposed: true,
@@ -55,6 +57,9 @@ test('human-auth readiness requires cached OIDC validation and complete composit
   assert.equal((await app.inject({ method: 'GET', url: '/ready' })).statusCode, 503);
   readiness.requiredServicesComposed = true;
   assert.equal((await app.inject({ method: 'GET', url: '/ready' })).statusCode, 200);
+  assert.equal(databaseChecks, 1);
+  readiness.deviceSecretValidated = false;
+  assert.equal((await app.inject({ method: 'GET', url: '/ready' })).statusCode, 503);
   assert.equal(databaseChecks, 1);
   await app.close();
 });

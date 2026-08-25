@@ -18,6 +18,10 @@ function fingerprint(value: string) {
   return createHash('sha256').update(value).digest('hex');
 }
 
+function deviceFingerprint(value: string) {
+  return createHash('sha256').update('device-api-key\0').update(value).digest('hex');
+}
+
 async function reservePort() {
   const server = createServer();
   server.listen(0, '127.0.0.1');
@@ -211,6 +215,25 @@ test('startup fails before listen on an idempotency fingerprint mismatch', { ski
     await prisma.securityKey.update({
       where: { name: 'idempotency-cache-v1' },
       data: { fingerprint: fingerprint(`idempotency-cache:${IDEMPOTENCY_CACHE_SECRET}`) }
+    });
+    await prisma.$disconnect();
+  }
+});
+
+test('startup and cached readiness fail closed on a device secret fingerprint mismatch', { skip: !runDatabaseTests }, async () => {
+  const prisma = new PrismaClient();
+  try {
+    await prisma.securityKey.upsert({
+      where: { name: 'device-api-key' },
+      create: { name: 'device-api-key', fingerprint: '0'.repeat(64) },
+      update: { fingerprint: '0'.repeat(64) }
+    });
+    await assert.rejects(startRuntime('production', false), /Server exited during startup: Startup failed/);
+  } finally {
+    await prisma.securityKey.upsert({
+      where: { name: 'device-api-key' },
+      create: { name: 'device-api-key', fingerprint: deviceFingerprint(DEVICE_API_KEY_SECRET) },
+      update: { fingerprint: deviceFingerprint(DEVICE_API_KEY_SECRET) }
     });
     await prisma.$disconnect();
   }

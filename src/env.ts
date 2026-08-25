@@ -39,6 +39,15 @@ function validateDatabaseUrl(value: string) {
   }
 }
 
+function validateDeploymentSecret(value: string | undefined, name: string) {
+  if (!value || Buffer.byteLength(value) < 32) throw new Error(`${name} must be at least 32 bytes`);
+  if (new Set(value).size < 8 || /^(.)\1{31,}$/s.test(value)
+    || /(change[-_ ]?me|replace[-_ ]?me|placeholder|not[-_ ]?a[-_ ]?secret|dummy[-_ ]?secret)/i.test(value)) {
+    throw new Error(`${name} must not be a placeholder or repeated-character value`);
+  }
+  return value;
+}
+
 export function normalizePublicValidationBaseUrl(value: string) {
   let url: URL;
   try {
@@ -89,19 +98,15 @@ export function getEnv(environment: NodeJS.ProcessEnv = process.env) {
   }
   validateDatabaseUrl(databaseUrl);
 
-  const invitationTokenSecret = environment.INVITATION_TOKEN_SECRET;
-  if (!invitationTokenSecret || Buffer.byteLength(invitationTokenSecret) < 32) {
-    throw new Error('INVITATION_TOKEN_SECRET must be at least 32 bytes');
-  }
-
-  const deviceApiKeySecret = environment.DEVICE_API_KEY_SECRET;
-  if (!deviceApiKeySecret || Buffer.byteLength(deviceApiKeySecret) < 32) {
-    throw new Error('DEVICE_API_KEY_SECRET must be at least 32 bytes');
-  }
-
-  const idempotencyCacheSecret = environment.IDEMPOTENCY_CACHE_SECRET;
-  if (!idempotencyCacheSecret || Buffer.byteLength(idempotencyCacheSecret) < 32) {
-    throw new Error('IDEMPOTENCY_CACHE_SECRET must be at least 32 bytes');
+  const invitationTokenSecret = validateDeploymentSecret(
+    environment.INVITATION_TOKEN_SECRET, 'INVITATION_TOKEN_SECRET'
+  );
+  const deviceApiKeySecret = validateDeploymentSecret(environment.DEVICE_API_KEY_SECRET, 'DEVICE_API_KEY_SECRET');
+  const idempotencyCacheSecret = validateDeploymentSecret(
+    environment.IDEMPOTENCY_CACHE_SECRET, 'IDEMPOTENCY_CACHE_SECRET'
+  );
+  if (new Set([invitationTokenSecret, deviceApiKeySecret, idempotencyCacheSecret]).size !== 3) {
+    throw new Error('INVITATION_TOKEN_SECRET, DEVICE_API_KEY_SECRET, and IDEMPOTENCY_CACHE_SECRET must be distinct');
   }
   const idempotencyTtlSeconds = Number(
     environment.IDEMPOTENCY_REPLAY_TTL_SECONDS ?? DEFAULT_IDEMPOTENCY_TTL_SECONDS
@@ -132,6 +137,11 @@ export function getEnv(environment: NodeJS.ProcessEnv = process.env) {
     }
     if (deployed && trustProxy === false) {
       throw new Error('TRUST_PROXY must identify the HTTPS proxy allowlist when human authentication is enabled');
+    }
+    const oidcKeys = [...oidc.pkceKeys.values()];
+    const csrfKeys = [...sessions.csrfKeys.values()];
+    if (oidcKeys.some((oidcKey) => csrfKeys.some((csrfKey) => oidcKey.equals(csrfKey)))) {
+      throw new Error('OIDC_PKCE_KEYS and SESSION_CSRF_KEYS must not reuse key bytes across domains');
     }
   }
 

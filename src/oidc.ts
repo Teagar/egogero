@@ -233,6 +233,9 @@ function parsePkceKeys(environment: NodeJS.ProcessEnv) {
     if (key.length !== 32 || key.toString('base64url') !== rawKey || keys.has(version)) {
       throw new Error('OIDC_PKCE_KEYS contains an invalid version or key');
     }
+    if ([...keys.values()].some((existing) => existing.equals(key))) {
+      throw new Error('OIDC_PKCE_KEYS must not reuse key bytes across versions');
+    }
     keys.set(version, key);
   }
   if (keys.size === 0) throw new Error('OIDC_PKCE_KEYS must contain at least one active key');

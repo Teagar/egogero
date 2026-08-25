@@ -16,12 +16,13 @@ RUN npm run build
 FROM base AS runner
 ENV NODE_ENV=production
 WORKDIR /app
-COPY --chown=node:node package.json package-lock.json ./
-COPY --chown=node:node --from=build /app/node_modules ./node_modules
-COPY --chown=node:node --from=build /app/dist ./dist
-COPY --chown=node:node --from=build /app/web/dist ./web/dist
-COPY --chown=node:node --from=build /app/prisma ./prisma
-COPY --chown=node:node scripts ./scripts
+COPY package.json package-lock.json ./
+COPY --from=build /app/node_modules ./node_modules
+COPY --from=build /app/dist ./dist
+COPY --from=build /app/web/dist ./web/dist
+COPY --from=build /app/prisma ./prisma
+COPY scripts ./scripts
+RUN chmod -R a-w /app && chmod -R a+rX /app
 USER node
 EXPOSE 3000
-CMD ["sh", "-c", "npm run db:migrate:deploy && node dist/src/server.js"]
+CMD ["node", "dist/src/server.js"]

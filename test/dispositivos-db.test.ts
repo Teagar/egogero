@@ -24,6 +24,7 @@ test('PostgreSQL device credentials are tenant-scoped, revocable, and never stor
 
   try {
     await prisma.securityKey.deleteMany({ where: { name: 'device-api-key' } });
+    await store.verifyConfiguration!();
     await prisma.condominio.createMany({
       data: [
         { id: condominiumId, nome: 'Principal', responsavel: 'Owner', tipo: 'residencial', timezone: 'America/Sao_Paulo' },
@@ -55,6 +56,7 @@ test('PostgreSQL device credentials are tenant-scoped, revocable, and never stor
       prisma,
       'different-database-device-key-secret-32-bytes-minimum'
     );
+    await assert.rejects(mismatchedStore.verifyConfiguration!(), DeviceSecretMismatchError);
     await assert.rejects(
       mismatchedStore.authenticate(created.apiKey, new Date()),
       DeviceSecretMismatchError

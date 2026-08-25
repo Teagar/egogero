@@ -158,6 +158,7 @@ export type CondominioStore = AppStore;
 
 export type Readiness = {
   checkDatabase(): Promise<void>;
+  deviceSecretValidated: boolean;
   humanAuthEnabled: boolean;
   oidcMetadataValidated: boolean;
   requiredServicesComposed: boolean;
@@ -529,6 +530,7 @@ export function createApp(
   app.get('/ready', async (_request, reply) => {
     try {
       if (!readiness) throw new Error('Readiness is not configured');
+      if (!readiness.deviceSecretValidated) throw new Error('Device configuration is not ready');
       if (readiness.humanAuthEnabled
         && (!readiness.oidcMetadataValidated || !readiness.requiredServicesComposed)) {
         throw new Error('Human authentication is not ready');

@@ -29,6 +29,7 @@ export async function startServer(environment: NodeJS.ProcessEnv = process.env) 
     env.invitationTokenSecret,
     { idempotencySecret: env.idempotencyCacheSecret, idempotencyTtlMs: env.idempotencyTtlMs }
   );
+  await deviceStore.verifyConfiguration();
   await invitationStore.verifyIdempotencyConfiguration!();
   const deviceAuthenticator = createDeviceAuthenticator(deviceStore);
   const developmentAuthenticator = env.localDevelopmentAuth
@@ -83,6 +84,7 @@ export async function startServer(environment: NodeJS.ProcessEnv = process.env) 
     authRateLimiter,
     frontendRoot: path.resolve(process.cwd(), 'web/dist'),
     readiness: {
+      deviceSecretValidated: true,
       humanAuthEnabled: env.humanAuthEnabled,
       oidcMetadataValidated: !env.humanAuthEnabled || Boolean(oidcService),
       requiredServicesComposed: humanServicesComposed,

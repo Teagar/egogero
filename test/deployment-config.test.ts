@@ -77,11 +77,13 @@ test('PKCE and CSRF keyrings allow only current plus immediately previous versio
   const base = baseEnvironment();
   const previous = key();
   const current = key();
+  const previousCsrf = key();
+  const currentCsrf = key();
   const valid = getEnv({
     ...base,
     OIDC_PKCE_KEYS: JSON.stringify({ 6: previous, 7: current }),
     OIDC_PKCE_CURRENT_KEY_VERSION: '7',
-    SESSION_CSRF_KEYS: JSON.stringify({ 6: previous, 7: current }),
+    SESSION_CSRF_KEYS: JSON.stringify({ 6: previousCsrf, 7: currentCsrf }),
     SESSION_CSRF_CURRENT_KEY_VERSION: '7'
   });
   assert.deepEqual([...valid.oidc!.pkceKeys.keys()], [6, 7]);
@@ -94,7 +96,30 @@ test('PKCE and CSRF keyrings allow only current plus immediately previous versio
   }), /current and immediately previous/);
   assert.throws(() => getEnv({
     ...base,
-    SESSION_CSRF_KEYS: JSON.stringify({ 5: previous, 7: current }),
+    SESSION_CSRF_KEYS: JSON.stringify({ 5: previousCsrf, 7: currentCsrf }),
     SESSION_CSRF_CURRENT_KEY_VERSION: '7'
   }), /current and immediately previous/);
+  assert.throws(() => getEnv({
+    ...base,
+    OIDC_PKCE_KEYS: JSON.stringify({ 6: current, 7: current }),
+    OIDC_PKCE_CURRENT_KEY_VERSION: '7'
+  }), /reuse key bytes/);
+  assert.throws(() => getEnv({
+    ...base,
+    OIDC_PKCE_KEYS: JSON.stringify({ 7: current }),
+    OIDC_PKCE_CURRENT_KEY_VERSION: '7',
+    SESSION_CSRF_KEYS: JSON.stringify({ 7: current }),
+    SESSION_CSRF_CURRENT_KEY_VERSION: '7'
+  }), /reuse key bytes across domains/);
+});
+
+test('application secrets reject placeholders, repeated values, and cross-purpose reuse', () => {
+  const base = baseEnvironment();
+  assert.throws(() => getEnv({ ...base, INVITATION_TOKEN_SECRET: 'change-me-placeholder-value-that-is-long-enough' }), /placeholder/);
+  assert.throws(() => getEnv({ ...base, DEVICE_API_KEY_SECRET: 'x'.repeat(32) }), /repeated-character/);
+  assert.throws(() => getEnv({ ...base, DEVICE_API_KEY_SECRET: 'ab'.repeat(16) }), /repeated-character/);
+  assert.throws(() => getEnv({
+    ...base,
+    IDEMPOTENCY_CACHE_SECRET: base.INVITATION_TOKEN_SECRET
+  }), /must be distinct/);
 });
