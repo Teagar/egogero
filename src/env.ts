@@ -2,6 +2,7 @@ import { oidcConfigFromEnvironment } from './oidc.js';
 import { sessionConfigFromEnvironment } from './sessions.js';
 import { humanAdministrationConfigFromEnvironment } from './human-administration.js';
 import { trustedProxyFromEnvironment } from './client-ip.js';
+import { assertDistinctSecretMaterial } from './secret-material.js';
 
 const DEFAULT_PORT = 3000;
 const DEFAULT_IDEMPOTENCY_TTL_SECONDS = 24 * 60 * 60;
@@ -105,9 +106,6 @@ export function getEnv(environment: NodeJS.ProcessEnv = process.env) {
   const idempotencyCacheSecret = validateDeploymentSecret(
     environment.IDEMPOTENCY_CACHE_SECRET, 'IDEMPOTENCY_CACHE_SECRET'
   );
-  if (new Set([invitationTokenSecret, deviceApiKeySecret, idempotencyCacheSecret]).size !== 3) {
-    throw new Error('INVITATION_TOKEN_SECRET, DEVICE_API_KEY_SECRET, and IDEMPOTENCY_CACHE_SECRET must be distinct');
-  }
   const idempotencyTtlSeconds = Number(
     environment.IDEMPOTENCY_REPLAY_TTL_SECONDS ?? DEFAULT_IDEMPOTENCY_TTL_SECONDS
   );
@@ -138,12 +136,19 @@ export function getEnv(environment: NodeJS.ProcessEnv = process.env) {
     if (deployed && trustProxy === false) {
       throw new Error('TRUST_PROXY must identify the HTTPS proxy allowlist when human authentication is enabled');
     }
-    const oidcKeys = [...oidc.pkceKeys.values()];
-    const csrfKeys = [...sessions.csrfKeys.values()];
-    if (oidcKeys.some((oidcKey) => csrfKeys.some((csrfKey) => oidcKey.equals(csrfKey)))) {
-      throw new Error('OIDC_PKCE_KEYS and SESSION_CSRF_KEYS must not reuse key bytes across domains');
-    }
   }
+
+  const secretDomains = [invitationTokenSecret, deviceApiKeySecret, idempotencyCacheSecret]
+    .map((value) => Buffer.from(value, 'utf8'));
+  if (humanAuthEnabled) {
+    secretDomains.push(
+      Buffer.from(oidc!.clientSecret, 'utf8'),
+      Buffer.from(humanAdministration!.recoveryWebhookSecret),
+      ...[...oidc!.pkceKeys.values()].map((key) => Buffer.from(key)),
+      ...[...sessions!.csrfKeys.values()].map((key) => Buffer.from(key))
+    );
+  }
+  assertDistinctSecretMaterial(secretDomains);
 
   return {
     nodeEnvironment,

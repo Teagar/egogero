@@ -21,6 +21,11 @@ import { createPrismaAuthRateLimiter } from '../src/auth-rate-limits.js';
 
 type StoredTransaction = Parameters<OidcLoginStore['createTransaction']>[0] & { createdAt: Date; consumed: boolean };
 const runDatabaseTests = process.env.RUN_DATABASE_TESTS === 'true' && Boolean(process.env.DATABASE_URL);
+const pkceTestKeys = new Map([
+  [1, createHash('sha256').update('oidc-test-pkce-key-one').digest()],
+  [2, createHash('sha256').update('oidc-test-pkce-key-two').digest()],
+  [3, createHash('sha256').update('oidc-test-pkce-key-three').digest()]
+]);
 
 const permissiveAuthRateLimiter = {
   async check() { return { allowed: true, retryAfterSeconds: 0, repeatedExcess: false }; },
@@ -29,8 +34,6 @@ const permissiveAuthRateLimiter = {
 } satisfies AuthRateLimiter;
 
 function configuration(overrides: Partial<OidcRuntimeConfig> = {}): OidcRuntimeConfig {
-  const keyOne = Buffer.alloc(32, 1);
-  const keyTwo = Buffer.alloc(32, 2);
   return {
     issuer: 'https://identity.example.test',
     authorizationEndpoint: 'https://identity.example.test/authorize',
@@ -43,7 +46,7 @@ function configuration(overrides: Partial<OidcRuntimeConfig> = {}): OidcRuntimeC
     failurePath: '/auth/error',
     returnToPrefixes: ['/'],
     currentPkceKeyVersion: 2,
-    pkceKeys: new Map([[1, keyOne], [2, keyTwo]]),
+    pkceKeys: new Map([[1, pkceTestKeys.get(1)!], [2, pkceTestKeys.get(2)!]]),
     ...overrides
   };
 }
@@ -601,7 +604,7 @@ test('rotation rehearsal persists PKCE material, emits current, reads overlap, a
   const retirementCandidate = await firstService.startLogin({ returnTo: '/', requestCorrelationId: 'retired-key-login' });
   provider.prepare(retirementCandidate);
   const retiredService = await createOidcService(
-    configuration({ currentPkceKeyVersion: 2, pkceKeys: new Map([[2, Buffer.alloc(32, 2)]]) }),
+    configuration({ currentPkceKeyVersion: 2, pkceKeys: new Map([[2, pkceTestKeys.get(2)!]]) }),
     database.store,
     provider.fetchImplementation
   );
@@ -617,7 +620,7 @@ test('rotation rehearsal persists PKCE material, emits current, reads overlap, a
   provider.prepare(compromisedCandidate);
   const replacementConfig = configuration({
     currentPkceKeyVersion: 3,
-    pkceKeys: new Map([[3, Buffer.alloc(32, 3)]])
+    pkceKeys: new Map([[3, pkceTestKeys.get(3)!]])
   });
   const replacementService = await createOidcService(
     replacementConfig, database.store, provider.fetchImplementation

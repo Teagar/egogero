@@ -14,7 +14,8 @@ if (process.env.RUN_DATABASE_TESTS !== 'true' || !process.env.DATABASE_URL) {
     'tsx',
     'test/oidc.test.ts',
     'test/sessions-db.test.ts',
-    'test/auth-rotation-cutover.test.ts'
+    'test/auth-rotation-cutover.test.ts',
+    'test/deployment-config.test.ts'
   ], { stdio: 'inherit', env: process.env });
   process.exitCode = result.status ?? 1;
 }

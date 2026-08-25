@@ -65,15 +65,18 @@ test('disabled human auth is an exact secret-free rollback state', () => {
       || name === 'PUBLIC_APPLICATION_ORIGIN' || name === 'HUMAN_MFA_ROLE_POLICY') delete common[name];
   }
   common.HUMAN_AUTH_ENABLED = 'false';
-  delete common.TRUST_PROXY;
   assert.equal(getEnv(common).humanAuthEnabled, false);
+  assert.throws(() => getEnv({
+    ...common,
+    DEVICE_API_KEY_SECRET: common.INVITATION_TOKEN_SECRET
+  }), /must not be reused across domains/);
   assert.throws(
     () => getEnv({ ...common, OIDC_CLIENT_SECRET: 'stray-secret-that-must-not-be-accepted' }),
     /must be absent when HUMAN_AUTH_ENABLED=false/
   );
 });
 
-test('PKCE and CSRF keyrings allow only current plus immediately previous versions', () => {
+test('rotation rehearsal configuration allows only distinct current plus immediately previous keys', () => {
   const base = baseEnvironment();
   const previous = key();
   const current = key();
@@ -110,7 +113,7 @@ test('PKCE and CSRF keyrings allow only current plus immediately previous versio
     OIDC_PKCE_CURRENT_KEY_VERSION: '7',
     SESSION_CSRF_KEYS: JSON.stringify({ 7: current }),
     SESSION_CSRF_CURRENT_KEY_VERSION: '7'
-  }), /reuse key bytes across domains/);
+  }), /must not be reused across domains/);
 });
 
 test('application secrets reject placeholders, repeated values, and cross-purpose reuse', () => {
@@ -121,5 +124,49 @@ test('application secrets reject placeholders, repeated values, and cross-purpos
   assert.throws(() => getEnv({
     ...base,
     IDEMPOTENCY_CACHE_SECRET: base.INVITATION_TOKEN_SECRET
-  }), /must be distinct/);
+  }), /must not be reused across domains/);
+});
+
+test('every configured secret domain is pairwise distinct by effective bytes', () => {
+  const shared = Buffer.from('0123456789abcdefghijklmnopqrstuv', 'ascii');
+  const sharedText = shared.toString('utf8');
+  const sharedBase64 = shared.toString('base64url');
+  const domains: Array<(environment: NodeJS.ProcessEnv) => void> = [
+    (environment) => { environment.INVITATION_TOKEN_SECRET = sharedText; },
+    (environment) => { environment.DEVICE_API_KEY_SECRET = sharedText; },
+    (environment) => { environment.IDEMPOTENCY_CACHE_SECRET = sharedText; },
+    (environment) => { environment.OIDC_CLIENT_SECRET = sharedText; },
+    (environment) => { environment.RECOVERY_WEBHOOK_SECRET = sharedText; },
+    (environment) => { environment.OIDC_PKCE_KEYS = JSON.stringify({ 1: sharedBase64 }); },
+    (environment) => { environment.SESSION_CSRF_KEYS = JSON.stringify({ 1: sharedBase64 }); }
+  ];
+
+  for (let left = 0; left < domains.length; left += 1) {
+    for (let right = left + 1; right < domains.length; right += 1) {
+      const environment = baseEnvironment();
+      domains[left]!(environment);
+      domains[right]!(environment);
+      assert.throws(() => getEnv(environment), /must not be reused across domains/, `${left}:${right}`);
+    }
+  }
+
+  const differentlyEncoded = baseEnvironment();
+  differentlyEncoded.INVITATION_TOKEN_SECRET = sharedBase64;
+  differentlyEncoded.OIDC_PKCE_KEYS = JSON.stringify({ 1: sharedBase64 });
+  assert.doesNotThrow(() => getEnv(differentlyEncoded));
+});
+
+test('decoded PKCE and CSRF keys reject low-diversity and known placeholder bytes', () => {
+  const candidates = [
+    Buffer.alloc(32),
+    Buffer.from('01234567'.repeat(4), 'ascii'),
+    Buffer.from('change-me-key-material'.padEnd(32, '!'), 'ascii')
+  ];
+  for (const candidate of candidates) {
+    for (const domain of ['OIDC_PKCE_KEYS', 'SESSION_CSRF_KEYS'] as const) {
+      const environment = baseEnvironment();
+      environment[domain] = JSON.stringify({ 1: candidate.toString('base64url') });
+      assert.throws(() => getEnv(environment), /degenerate or placeholder key material/);
+    }
+  }
 });

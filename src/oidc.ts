@@ -25,6 +25,7 @@ import type { AuthRateLimiter } from './auth-rate-limits.js';
 import { noopAuthAlerts, noopAuthMetrics, safeAuthAlerts, safeAuthMetrics } from './auth-observability.js';
 import type { AuthAlertSink, AuthMetrics } from './auth-observability.js';
 import { requestIpPrefix } from './client-ip.js';
+import { validateDecodedEncryptionKey } from './secret-material.js';
 
 const LOGIN_TRANSACTION_TTL_MS = 10 * 60 * 1000;
 const OIDC_CLOCK_TOLERANCE_SECONDS = 60;
@@ -233,6 +234,7 @@ function parsePkceKeys(environment: NodeJS.ProcessEnv) {
     if (key.length !== 32 || key.toString('base64url') !== rawKey || keys.has(version)) {
       throw new Error('OIDC_PKCE_KEYS contains an invalid version or key');
     }
+    validateDecodedEncryptionKey(key, 'OIDC_PKCE_KEYS');
     if ([...keys.values()].some((existing) => existing.equals(key))) {
       throw new Error('OIDC_PKCE_KEYS must not reuse key bytes across versions');
     }
