@@ -32,12 +32,19 @@ variables:
   HUMAN_MFA_ROLE_POLICY: { required_when: HUMAN_AUTH_ENABLED=true, secret: false, format: role-policy-json }
   OIDC_RECOVERY_URL: { required_when: HUMAN_AUTH_ENABLED=true, secret: false, format: exact-https-url }
   RECOVERY_WEBHOOK_ISSUERS: { required_when: HUMAN_AUTH_ENABLED=true, secret: false, format: exact-issuer-allowlist }
-  RECOVERY_WEBHOOK_SECRET: { required_when: HUMAN_AUTH_ENABLED=true, secret: true, minimum_bytes: 32 }
+  RECOVERY_WEBHOOK_KEYS: { required_when: HUMAN_AUTH_ENABLED=true, secret: true, format: version-to-secret-json, minimum_bytes_each: 32, maximum_keys: 3 }
   AUTH_ALERT_ADAPTER: { required: false, secret: false, allowed: [stdout, https_webhook] }
   AUTH_ALERT_WEBHOOK_URL: { required_when: AUTH_ALERT_ADAPTER=https_webhook, secret: false, format: credential-free-https-url }
   AUTH_ALERT_TIMEOUT_MS: { required: false, secret: false, range: [100, 10000] }
+  RECOVERY_BATCH_SIZE: { required: false, secret: false, range: [1, 100] }
+  RECOVERY_LEASE_MS: { required: false, secret: false, range: [250, 30000] }
+  RECOVERY_POLL_MS: { required: false, secret: false, range: [25, 5000] }
+  RECOVERY_MAX_ATTEMPTS: { required: false, secret: false, range: [1, 20] }
+  RECOVERY_BASE_BACKOFF_MS: { required: false, secret: false, range: [10, 5000] }
+  RECOVERY_MAX_BACKOFF_MS: { required: false, secret: false, range: [10, 5000] }
+  RECOVERY_ADAPTER_TIMEOUT_MS: { required: false, secret: false, range: [50, 4000] }
 disabled_human_auth:
-  must_be_absent: [PUBLIC_APPLICATION_ORIGIN, OIDC_ISSUER, OIDC_AUTHORIZATION_ENDPOINT, OIDC_TOKEN_ENDPOINT, OIDC_JWKS_URI, OIDC_CLIENT_ID, OIDC_CLIENT_SECRET, OIDC_REDIRECT_URI, OIDC_ID_TOKEN_SIGNING_ALG, OIDC_PKCE_KEYS, OIDC_PKCE_CURRENT_KEY_VERSION, OIDC_RETURN_TO_PREFIXES, OIDC_FAILURE_PATH, SESSION_CSRF_KEYS, SESSION_CSRF_CURRENT_KEY_VERSION, HUMAN_MFA_ROLE_POLICY, OIDC_RECOVERY_URL, RECOVERY_WEBHOOK_ISSUERS, RECOVERY_WEBHOOK_SECRET]
+  must_be_absent: [PUBLIC_APPLICATION_ORIGIN, OIDC_ISSUER, OIDC_AUTHORIZATION_ENDPOINT, OIDC_TOKEN_ENDPOINT, OIDC_JWKS_URI, OIDC_CLIENT_ID, OIDC_CLIENT_SECRET, OIDC_REDIRECT_URI, OIDC_ID_TOKEN_SIGNING_ALG, OIDC_PKCE_KEYS, OIDC_PKCE_CURRENT_KEY_VERSION, OIDC_RETURN_TO_PREFIXES, OIDC_FAILURE_PATH, SESSION_CSRF_KEYS, SESSION_CSRF_CURRENT_KEY_VERSION, HUMAN_MFA_ROLE_POLICY, OIDC_RECOVERY_URL, RECOVERY_WEBHOOK_ISSUERS, RECOVERY_WEBHOOK_KEYS]
   may_remain: [TRUST_PROXY, AUTH_ALERT_ADAPTER, AUTH_ALERT_TIMEOUT_MS]
   conditional: [AUTH_ALERT_WEBHOOK_URL requires AUTH_ALERT_ADAPTER=https_webhook]
 rollout_preflight:

@@ -98,7 +98,7 @@ test('recovery initiation is generic, marks recovery intent, and returns Retry-A
       publicApplicationOrigin: 'https://app.example.test',
       recoveryUrl: 'https://identity.example.test/authorize',
       recoveryWebhookIssuers: new Set(['https://identity.example.test']),
-      recoveryWebhookSecret: Buffer.alloc(32),
+      recoveryWebhookSecrets: new Map([[1, Buffer.alloc(32)]]),
       mfaPolicy: {
         provedor: { amr: ['webauthn'], acr: [] },
         sindico: { amr: ['webauthn'], acr: [] },

@@ -342,7 +342,7 @@ test('alert routing delivers only bounded routes and reports nonblocking failure
     routing.sink.emit(type, { token: 'CANARY-secret', accountId: 'CANARY-account' });
     await new Promise((resolve) => setImmediate(resolve));
   }
-  assert.equal(delivered.length, 7);
+  assert.equal(delivered.length, Object.keys(DEFAULT_AUTH_ALERT_ROUTES).length);
   assert.equal(JSON.stringify(delivered).includes('CANARY'), false);
   assert.deepEqual(delivered.map((delivery) => delivery.routes), Object.values(DEFAULT_AUTH_ALERT_ROUTES));
   assert.deepEqual(gaps, []);

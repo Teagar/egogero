@@ -63,5 +63,21 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  recovery-worker:
+    profiles: ["workers"]
+    build: .
+    command: ["sh", "-c", "npm run db:migrate:deploy && npm run recovery:worker"]
+    environment:
+      NODE_ENV: development
+      DATABASE_URL: postgresql://office:office@db:5432/office?schema=public
+      RECOVERY_BATCH_SIZE: "20"
+      RECOVERY_LEASE_MS: "2000"
+      RECOVERY_ADAPTER_TIMEOUT_MS: "1000"
+      AUTH_ALERT_ADAPTER: stdout
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
 volumes:
   postgres_data:

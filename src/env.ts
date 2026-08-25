@@ -24,7 +24,7 @@ const HUMAN_AUTH_VARIABLES = [
   'SESSION_CSRF_CURRENT_KEY_VERSION',
   'OIDC_RECOVERY_URL',
   'RECOVERY_WEBHOOK_ISSUERS',
-  'RECOVERY_WEBHOOK_SECRET',
+  'RECOVERY_WEBHOOK_KEYS',
   'HUMAN_MFA_ROLE_POLICY'
 ] as const;
 
@@ -174,7 +174,7 @@ export function getEnv(environment: NodeJS.ProcessEnv = process.env) {
   if (humanAuthEnabled) {
     secretDomains.push(
       Buffer.from(oidc!.clientSecret, 'utf8'),
-      Buffer.from(humanAdministration!.recoveryWebhookSecret),
+      ...[...humanAdministration!.recoveryWebhookSecrets.values()].map((secret) => Buffer.from(secret)),
       ...[...oidc!.pkceKeys.values()].map((key) => Buffer.from(key)),
       ...[...sessions!.csrfKeys.values()].map((key) => Buffer.from(key))
     );

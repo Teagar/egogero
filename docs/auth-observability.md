@@ -49,7 +49,8 @@ observations have conservative histogram p95 above 20 ms.
 ## Alerts and Redaction
 
 Alerts cover repeated limiter excess, PKCE/CSRF integrity or key failures, state misses and
-replay, issuer mix-up, callback success SLO, and session latency SLO. Alert payloads pass
+replay, issuer mix-up, callback success SLO, session latency SLO, and the critical five-second
+recovery-revocation acknowledgement SLO. Alert payloads pass
 through recursive defensive redaction. Authorization/cookie headers and raw session, OIDC,
 invitation, device, digest, ciphertext, nonce, authentication-tag, client-secret, and code
 fields are replaced. Request bodies are not telemetry payloads.
@@ -90,7 +91,7 @@ Each snapshot contains only:
 | `sequence` | Strictly increasing within one process instance |
 | `counters[]` | Delta counters with allowlisted metric dimensions and safe integer values |
 | `histograms[]` | Delta, non-cumulative bucket counts in seconds; bounds `1,2.5,5,10,20,50,100,250,500,1000ms`, plus overflow |
-| `alerts` | Counts keyed only by the seven bounded `AuthAlertType` routes |
+| `alerts` | Counts keyed only by the eight bounded `AuthAlertType` routes |
 | `criticalIncidentCount` | Crypto integrity/key, replay/state-miss, and issuer mix-up total |
 | `observability` | `healthy` or `degraded`, with bounded sink, routing, clock, and numeric gap code/count pairs |
 
@@ -170,8 +171,9 @@ gaps             = sum(observability.gaps.count) by code
 
 Route `crypto_integrity_failure` and `crypto_key_failure` to the security/on-call channel;
 route `oidc_replay_or_state_miss` and `oidc_issuer_mixup` to security and identity on-call;
-route `rate_limit_repeated_excess` to abuse/on-call; and route both SLO alerts to identity and
-database on-call. A routing smoke test must deliver one sanitized event for every route and
+route `rate_limit_repeated_excess` to abuse/on-call; route callback/session SLO alerts to identity and
+database as configured; and route the critical recovery-revocation SLO to security and identity
+on-call. A routing smoke test must deliver one sanitized event for every route and
 confirm acknowledgement without adding payload dimensions.
 
 `createRoutedAuthAlertSink` validates an exact `AuthAlertType` to bounded route-name map. The

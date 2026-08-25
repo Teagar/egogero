@@ -37,7 +37,7 @@ function baseEnvironment(): NodeJS.ProcessEnv {
     SESSION_CSRF_CURRENT_KEY_VERSION: '1',
     OIDC_RECOVERY_URL: 'https://identity.example/recovery',
     RECOVERY_WEBHOOK_ISSUERS: 'https://identity.example',
-    RECOVERY_WEBHOOK_SECRET: '3hW8mQ2zL9vN5rK7xC1fT6sP0aD4jG8b',
+    RECOVERY_WEBHOOK_KEYS: JSON.stringify({ 1: '3hW8mQ2zL9vN5rK7xC1fT6sP0aD4jG8b' }),
     HUMAN_MFA_ROLE_POLICY: policy
   };
 }
@@ -136,7 +136,7 @@ test('every configured secret domain is pairwise distinct by effective bytes', (
     (environment) => { environment.DEVICE_API_KEY_SECRET = sharedText; },
     (environment) => { environment.IDEMPOTENCY_CACHE_SECRET = sharedText; },
     (environment) => { environment.OIDC_CLIENT_SECRET = sharedText; },
-    (environment) => { environment.RECOVERY_WEBHOOK_SECRET = sharedText; },
+    (environment) => { environment.RECOVERY_WEBHOOK_KEYS = JSON.stringify({ 1: sharedText }); },
     (environment) => { environment.OIDC_PKCE_KEYS = JSON.stringify({ 1: sharedBase64 }); },
     (environment) => { environment.SESSION_CSRF_KEYS = JSON.stringify({ 1: sharedBase64 }); }
   ];

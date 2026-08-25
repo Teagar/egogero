@@ -12,7 +12,7 @@ const policy = JSON.stringify({
   portaria: { amr: ['webauthn'], acr: ['urn:mfa'] }
 });
 
-function environment(clientSecret: string, webhookSecret: string): NodeJS.ProcessEnv {
+function environment(clientSecret: string, webhookSecrets: Record<number, string>): NodeJS.ProcessEnv {
   return {
     HUMAN_AUTH_ENABLED: 'true',
     PUBLIC_APPLICATION_ORIGIN: 'https://app.example.test',
@@ -28,18 +28,19 @@ function environment(clientSecret: string, webhookSecret: string): NodeJS.Proces
     OIDC_PKCE_CURRENT_KEY_VERSION: '1',
     OIDC_RECOVERY_URL: 'https://identity.example.test/recovery',
     RECOVERY_WEBHOOK_ISSUERS: 'https://identity.example.test',
-    RECOVERY_WEBHOOK_SECRET: webhookSecret,
+    RECOVERY_WEBHOOK_KEYS: JSON.stringify(webhookSecrets),
     HUMAN_MFA_ROLE_POLICY: policy
   };
 }
 
-test('credential and webhook cutover rehearsal validates overlap and the external atomic boundary', () => {
+test('credential and webhook cutover rehearsal validates overlap by explicit key version', () => {
   const oldClientSecret = randomBytes(32).toString('base64url');
   const newClientSecret = randomBytes(32).toString('base64url');
   const oldWebhookSecret = randomBytes(32).toString('base64url');
   const newWebhookSecret = randomBytes(32).toString('base64url');
-  const oldEnvironment = environment(oldClientSecret, oldWebhookSecret);
-  const newEnvironment = environment(newClientSecret, newWebhookSecret);
+  const oldEnvironment = environment(oldClientSecret, { 1: oldWebhookSecret });
+  const overlapEnvironment = environment(newClientSecret, { 1: oldWebhookSecret, 2: newWebhookSecret });
+  const newEnvironment = environment(newClientSecret, { 2: newWebhookSecret });
   const oldOidc = oidcConfigFromEnvironment(oldEnvironment)!;
   const nextOidc = oidcConfigFromEnvironment(newEnvironment)!;
   assert.notEqual(oldOidc.clientSecret, nextOidc.clientSecret);
@@ -55,15 +56,18 @@ test('credential and webhook cutover rehearsal validates overlap and the externa
   assert.equal(providerAccepts(nextOidc.clientSecret), true);
 
   const oldWebhook = humanAdministrationConfigFromEnvironment(oldEnvironment)!;
+  const overlapWebhook = humanAdministrationConfigFromEnvironment(overlapEnvironment)!;
   const nextWebhook = humanAdministrationConfigFromEnvironment(newEnvironment)!;
   const timestamp = Math.floor(Date.now() / 1000);
   const event = { eventId: 'rotation-event', issuer: oldOidc.issuer, subject: 'rotation-subject', timestamp };
-  const sign = (secret: Buffer) => createHmac('sha256', secret)
-    .update(`${timestamp}.${event.eventId}.${event.issuer}.${event.subject}`).digest('hex');
-  const oldSigned = { ...event, signature: sign(oldWebhook.recoveryWebhookSecret) };
-  const newSigned = { ...event, signature: sign(nextWebhook.recoveryWebhookSecret) };
+  const sign = (version: number, secret: Buffer) => createHmac('sha256', secret)
+    .update(`${version}.${timestamp}.${event.eventId}.${event.issuer}.${event.subject}`).digest('hex');
+  const oldSigned = { ...event, keyVersion: 1, signature: sign(1, oldWebhook.recoveryWebhookSecrets.get(1)!) };
+  const newSigned = { ...event, keyVersion: 2, signature: sign(2, nextWebhook.recoveryWebhookSecrets.get(2)!) };
   assert.equal(verifyRecoveryWebhookSignature(oldWebhook, oldSigned), true);
   assert.equal(verifyRecoveryWebhookSignature(oldWebhook, newSigned), false);
+  assert.equal(verifyRecoveryWebhookSignature(overlapWebhook, oldSigned), true);
+  assert.equal(verifyRecoveryWebhookSignature(overlapWebhook, newSigned), true);
   assert.equal(verifyRecoveryWebhookSignature(nextWebhook, oldSigned), false);
   assert.equal(verifyRecoveryWebhookSignature(nextWebhook, newSigned), true);
 });

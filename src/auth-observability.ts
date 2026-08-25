@@ -35,7 +35,8 @@ export type AuthAlertType =
   | 'oidc_replay_or_state_miss'
   | 'oidc_issuer_mixup'
   | 'oidc_callback_success_slo'
-  | 'session_lookup_latency_slo';
+  | 'session_lookup_latency_slo'
+  | 'recovery_revocation_slo_breach';
 
 export interface AuthAlertSink {
   emit(type: AuthAlertType, details: Readonly<Record<string, unknown>>): void | Promise<void>;
@@ -110,13 +111,14 @@ export const DEFAULT_AUTH_ALERT_ROUTES: AuthAlertRoutingConfig = {
   oidc_replay_or_state_miss: ['security', 'identity'],
   oidc_issuer_mixup: ['security', 'identity'],
   oidc_callback_success_slo: ['identity'],
-  session_lookup_latency_slo: ['database', 'identity']
+  session_lookup_latency_slo: ['database', 'identity'],
+  recovery_revocation_slo_breach: ['security', 'identity']
 };
 
 const AUTH_ALERT_TYPES: readonly AuthAlertType[] = [
   'rate_limit_repeated_excess', 'crypto_integrity_failure', 'crypto_key_failure',
   'oidc_replay_or_state_miss', 'oidc_issuer_mixup', 'oidc_callback_success_slo',
-  'session_lookup_latency_slo'
+  'session_lookup_latency_slo', 'recovery_revocation_slo_breach'
 ];
 const AUTH_ALERT_ROUTES = new Set<AuthAlertRoute>(['security', 'identity', 'abuse', 'database']);
 

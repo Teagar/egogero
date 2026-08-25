@@ -48,11 +48,30 @@ replace the evidence while preserving the session family and CSRF value.
   increments `sessionVersion`, revokes old sessions, and creates a new family and
   CSRF value in one transaction.
 - `POST /auth/recovery/webhook` accepts only an HMAC-SHA-256 event over
-  `<unix-seconds>.<event-id>.<issuer>.<subject>`. Configure a secret of at least
-  32 bytes and exact issuers with `RECOVERY_WEBHOOK_SECRET` and
-  `RECOVERY_WEBHOOK_ISSUERS`. Timestamps have a five-minute bound. Event IDs are
-  persisted for replay protection; the target is resolved only by signed exact
-  issuer and subject. Responses are generic and idempotent.
+  `<key-version>.<unix-seconds>.<event-id>.<issuer>.<subject>`. Configure one to
+  three versioned secrets of at least 32 bytes with `RECOVERY_WEBHOOK_KEYS`, exact
+  issuers with `RECOVERY_WEBHOOK_ISSUERS`, and send the version in
+  `X-Recovery-Key-Version`. Timestamps have a five-minute bound. A valid event is
+  synchronously and atomically persisted before `202`; database failure returns
+  `503`. Invalid issuer, version, signature, timestamp, or conflicting replay
+  returns a generic failure without an audit or queue mutation. An identical
+  duplicate returns `200` without changing its original queue row.
+- The queue stores only event and subject digests, bounded operational state,
+  issuer, key version, and the already-local account UUID. It never stores the
+  signature, raw provider subject, webhook body, or provider tokens.
+- `npm run recovery:worker` uses PostgreSQL fenced leases, `SKIP LOCKED`, bounded
+  exponential retry, five attempts, and a 15-minute event expiry. Acknowledged,
+  failed, and expired states are durable. A one-shot critical alert is emitted if
+  acknowledgement has not been persisted within five seconds.
+
+The shipped adapter revokes only Egogero PostgreSQL browser sessions. This is not
+an external IdP session-revocation integration. A replacement adapter must keep
+the event UUID as its idempotency key, tolerate retries after timeout, honor
+abort, return acknowledgement only after every in-scope session is durably
+revoked, expose no identity or secret in errors/telemetry, and meet the five-second
+deadline. If it cannot participate in the PostgreSQL transaction, its external
+effect is at-least-once and the destination must enforce idempotency; the
+application cannot manufacture exactly-once semantics across that boundary.
 
 All lifecycle, denial, invitation, MFA, and recovery events use the immutable
 authentication audit ledger. Audit metadata excludes tokens, digests,
