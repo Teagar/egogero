@@ -1,7 +1,10 @@
-import { readFile } from 'node:fs/promises';
+import { createReadStream } from 'node:fs';
+import { readFile, stat } from 'node:fs/promises';
+import { StringDecoder } from 'node:string_decoder';
 import { pathToFileURL } from 'node:url';
 
 export const AUTH_ROLLOUT_CONTRACT = 'egogero.auth-rollout/v1' as const;
+export const AUTH_ROLLOUT_INVENTORY_CONTRACT = 'egogero.auth-rollout-inventory/v1' as const;
 export const AUTH_ROLLOUT_MINIMUM_WINDOW_MS = 24 * 60 * 60 * 1_000;
 export const AUTH_ROLLOUT_MINIMUM_CALLBACKS = 100;
 export const AUTH_ROLLOUT_MINIMUM_SESSION_SAMPLES = 100;
@@ -30,6 +33,22 @@ const CRITICAL_ALERT_TYPES = new Set([
   'crypto_integrity_failure', 'crypto_key_failure', 'oidc_replay_or_state_miss', 'oidc_issuer_mixup'
 ]);
 const INSTANCE_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+export type AuthRolloutInputLimits = {
+  files: number;
+  records: number;
+  lineBytes: number;
+  fileBytes: number;
+  totalBytes: number;
+  inventoryBytes: number;
+};
+export const AUTH_ROLLOUT_INPUT_LIMITS: AuthRolloutInputLimits = {
+  files: 32,
+  records: 100_000,
+  lineBytes: 256 * 1_024,
+  fileBytes: 32 * 1_024 * 1_024,
+  totalBytes: 64 * 1_024 * 1_024,
+  inventoryBytes: 256 * 1_024
+} as const;
 
 export type AuthRolloutCounter = {
   metric: string;
@@ -57,8 +76,18 @@ export type AuthRolloutSnapshot = {
   criticalIncidentCount: number;
   observability: {
     status: 'healthy' | 'degraded';
-    gaps: readonly { code: 'sink_throw' | 'sink_rejected' | 'sink_timeout' | 'sink_backpressure' | 'numeric_saturation' | 'clock_anomaly'; count: number }[];
+    gaps: readonly { code: 'sink_throw' | 'sink_rejected' | 'sink_timeout' | 'sink_backpressure' | 'numeric_saturation' | 'clock_anomaly' | 'clock_drift' | 'alert_route_throw' | 'alert_route_rejected' | 'alert_route_timeout' | 'alert_route_backpressure' | 'alert_route_unacknowledged'; count: number }[];
   };
+};
+
+export type AuthRolloutInventory = {
+  contract: typeof AUTH_ROLLOUT_INVENTORY_CONTRACT;
+  servingInstances: readonly {
+    instanceId: string;
+    expectedStart: string;
+    expectedEnd: string;
+    cadenceMs: number;
+  }[];
 };
 
 export type AuthRolloutEvaluation = {
@@ -91,6 +120,29 @@ function validDimensions(value: unknown, policy: Readonly<Record<string, readonl
   const entries = Object.entries(value);
   return entries.length === Object.keys(policy).length
     && entries.every(([key, dimension]) => typeof dimension === 'string' && policy[key]?.includes(dimension));
+}
+
+function validInventory(value: unknown): value is AuthRolloutInventory {
+  if (!value || typeof value !== 'object') return false;
+  const inventory = value as Partial<AuthRolloutInventory>;
+  if (inventory.contract !== AUTH_ROLLOUT_INVENTORY_CONTRACT
+    || !Array.isArray(inventory.servingInstances)
+    || inventory.servingInstances.length === 0
+    || inventory.servingInstances.length > 1_000) return false;
+  const identifiers = new Set<string>();
+  return inventory.servingInstances.every((instance) => {
+    if (!instance || typeof instance !== 'object'
+      || !INSTANCE_ID.test(instance.instanceId)
+      || identifiers.has(instance.instanceId)
+      || !canonicalInstant(instance.expectedStart)
+      || !canonicalInstant(instance.expectedEnd)
+      || Date.parse(instance.expectedEnd) <= Date.parse(instance.expectedStart)
+      || !safeInteger(instance.cadenceMs)
+      || instance.cadenceMs < 1_000
+      || instance.cadenceMs > 24 * 60 * 60_000) return false;
+    identifiers.add(instance.instanceId);
+    return true;
+  });
 }
 
 function validSnapshot(value: unknown): value is AuthRolloutSnapshot {
@@ -132,7 +184,9 @@ function validSnapshot(value: unknown): value is AuthRolloutSnapshot {
     && Object.entries(alerts).every(([type, count]) => ALERT_TYPES.has(type) && safeInteger(count))
     && criticalCount === BigInt(snapshot.criticalIncidentCount)
     && ['healthy', 'degraded'].includes(snapshot.observability.status)
-    && gaps.every((gap) => ['sink_throw', 'sink_rejected', 'sink_timeout', 'sink_backpressure', 'numeric_saturation', 'clock_anomaly'].includes(gap.code)
+    && gaps.every((gap) => ['sink_throw', 'sink_rejected', 'sink_timeout', 'sink_backpressure', 'numeric_saturation',
+      'clock_anomaly', 'clock_drift', 'alert_route_throw', 'alert_route_rejected', 'alert_route_timeout',
+      'alert_route_backpressure', 'alert_route_unacknowledged'].includes(gap.code)
       && safeInteger(gap.count) && gap.count > 0)
     && (snapshot.observability.status === 'degraded') === (gaps.length > 0);
 }
@@ -142,8 +196,12 @@ function addSafe(left: number, right: number): number | null {
   return Number.isSafeInteger(sum) ? sum : null;
 }
 
-export function evaluateAuthRolloutSnapshots(input: readonly unknown[]): AuthRolloutEvaluation {
-  const reasons = new Set<string>();
+export function evaluateAuthRolloutSnapshots(
+  input: readonly unknown[],
+  inventoryInput?: unknown,
+  inputReasons: readonly string[] = []
+): AuthRolloutEvaluation {
+  const reasons = new Set<string>(inputReasons);
   const snapshots: AuthRolloutSnapshot[] = [];
   for (const value of input) {
     if (validSnapshot(value)) snapshots.push(value);
@@ -168,9 +226,40 @@ export function evaluateAuthRolloutSnapshots(input: readonly unknown[]): AuthRol
     }
   }
 
+  const inventory = validInventory(inventoryInput) ? inventoryInput : null;
+  if (!inventoryInput) reasons.add('expected_inventory_missing');
+  else if (!inventory) reasons.add('expected_inventory_invalid');
+  if (inventory) {
+    const expectedIds = new Set(inventory.servingInstances.map((instance) => instance.instanceId));
+    if (intervals.some((interval) => !expectedIds.has(interval.snapshot.instanceId))) {
+      reasons.add('snapshot_instance_unexpected');
+    }
+    for (const expected of inventory.servingInstances) {
+      const expectedStart = Date.parse(expected.expectedStart);
+      const expectedEnd = Date.parse(expected.expectedEnd);
+      const list = byInstance.get(expected.instanceId) ?? [];
+      let cursor = expectedStart;
+      for (const interval of list) {
+        if (interval.start < expectedStart || interval.end > expectedEnd) {
+          reasons.add('snapshot_outside_expected_lifecycle');
+          continue;
+        }
+        if (interval.end - interval.start > expected.cadenceMs) reasons.add('instance_cadence_exceeded');
+        if (interval.start > cursor) reasons.add('expected_instance_interval_missing');
+        cursor = Math.max(cursor, interval.end);
+      }
+      if (cursor < expectedEnd) reasons.add('expected_instance_interval_missing');
+    }
+  }
+
   let coverageStart: number | null = null;
   let coverageEnd: number | null = null;
-  for (const interval of intervals) {
+  const servingIntervals = inventory
+    ? inventory.servingInstances.map((instance) => ({
+        start: Date.parse(instance.expectedStart), end: Date.parse(instance.expectedEnd)
+      })).sort((left, right) => left.start - right.start || left.end - right.end)
+    : intervals;
+  for (const interval of servingIntervals) {
     if (coverageStart === null) {
       coverageStart = interval.start;
       coverageEnd = interval.end;
@@ -263,23 +352,87 @@ export function evaluateAuthRolloutSnapshots(input: readonly unknown[]): AuthRol
   };
 }
 
-export async function readAuthRolloutJsonl(paths: readonly string[]): Promise<unknown[]> {
-  const sources = paths.length === 0 ? [await new Promise<string>((resolve, reject) => {
-    let input = '';
-    process.stdin.setEncoding('utf8');
-    process.stdin.on('data', (chunk: string) => { input += chunk; });
-    process.stdin.on('end', () => resolve(input));
-    process.stdin.on('error', reject);
-  })] : await Promise.all(paths.map((path) => readFile(path, 'utf8')));
+export class AuthRolloutInputLimitError extends Error {}
+
+export async function readAuthRolloutJsonl(
+  paths: readonly string[],
+  limits: AuthRolloutInputLimits = AUTH_ROLLOUT_INPUT_LIMITS
+): Promise<unknown[]> {
+  if (paths.length > limits.files) throw new AuthRolloutInputLimitError('too many snapshot files');
   const values: unknown[] = [];
-  for (const line of sources.flatMap((source) => source.split(/\r?\n/)).filter((line) => line.trim().length > 0)) {
-    try { values.push(JSON.parse(line)); } catch { values.push(null); }
+  let totalBytes = 0;
+  const sourceNames: Array<string | null> = paths.length === 0 ? [null] : [...paths];
+  for (const name of sourceNames) {
+    const source = { name: name ?? 'stdin', stream: name
+      ? createReadStream(name) as NodeJS.ReadableStream
+      : process.stdin };
+    let fileBytes = 0;
+    let partial = '';
+    const decoder = new StringDecoder('utf8');
+    function consume(line: string) {
+      if (Buffer.byteLength(line, 'utf8') > limits.lineBytes) {
+        throw new AuthRolloutInputLimitError(`snapshot line limit exceeded at ${source.name}`);
+      }
+      if (line.trim().length === 0) return;
+      if (values.length >= limits.records) throw new AuthRolloutInputLimitError('too many snapshot records');
+      try { values.push(JSON.parse(line)); } catch { values.push(null); }
+    }
+    try {
+      for await (const chunk of source.stream) {
+        const bytes = typeof chunk === 'string' ? Buffer.byteLength(chunk, 'utf8') : chunk.length;
+        fileBytes += bytes;
+        totalBytes += bytes;
+        if (fileBytes > limits.fileBytes || totalBytes > limits.totalBytes) {
+          throw new AuthRolloutInputLimitError(`snapshot input limit exceeded at ${source.name}`);
+        }
+        partial += typeof chunk === 'string' ? chunk : decoder.write(chunk);
+        let newline = partial.indexOf('\n');
+        while (newline >= 0) {
+          const line = partial.slice(0, newline).replace(/\r$/, '');
+          partial = partial.slice(newline + 1);
+          consume(line);
+          newline = partial.indexOf('\n');
+        }
+        if (Buffer.byteLength(partial, 'utf8') > limits.lineBytes) {
+          throw new AuthRolloutInputLimitError(`snapshot line limit exceeded at ${source.name}`);
+        }
+      }
+      partial += decoder.end();
+      if (partial.length > 0) consume(partial.replace(/\r$/, ''));
+    } catch (error) {
+      if ('destroy' in source.stream && typeof source.stream.destroy === 'function') source.stream.destroy();
+      throw error;
+    }
   }
   return values;
 }
 
+export async function readAuthRolloutInventory(path: string): Promise<unknown> {
+  const metadata = await stat(path);
+  if (metadata.size > AUTH_ROLLOUT_INPUT_LIMITS.inventoryBytes) {
+    throw new AuthRolloutInputLimitError('inventory input limit exceeded');
+  }
+  return JSON.parse(await readFile(path, 'utf8')) as unknown;
+}
+
 async function main() {
-  const evaluation = evaluateAuthRolloutSnapshots(await readAuthRolloutJsonl(process.argv.slice(2)));
+  const args = process.argv.slice(2);
+  const manifestIndex = args.indexOf('--inventory');
+  const inventoryPath = manifestIndex >= 0 ? args[manifestIndex + 1] : undefined;
+  const paths = manifestIndex < 0
+    ? args
+    : args.filter((_, index) => index !== manifestIndex && index !== manifestIndex + 1);
+  let snapshots: unknown[] = [];
+  let inventory: unknown;
+  const inputReasons: string[] = [];
+  if (manifestIndex >= 0 && !inventoryPath) inputReasons.push('input_read_error');
+  try {
+    snapshots = await readAuthRolloutJsonl(paths);
+    if (inventoryPath) inventory = await readAuthRolloutInventory(inventoryPath);
+  } catch (error) {
+    inputReasons.push(error instanceof AuthRolloutInputLimitError ? 'input_limit_exceeded' : 'input_read_error');
+  }
+  const evaluation = evaluateAuthRolloutSnapshots(snapshots, inventory, inputReasons);
   process.stdout.write(`${JSON.stringify(evaluation)}\n`);
   process.exitCode = evaluation.result === 'pass' ? 0 : evaluation.result === 'fail' ? 1 : 2;
 }

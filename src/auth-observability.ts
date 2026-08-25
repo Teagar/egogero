@@ -1,5 +1,7 @@
 import { randomUUID } from 'node:crypto';
-import { appendFile } from 'node:fs/promises';
+import { constants } from 'node:fs';
+import { open } from 'node:fs/promises';
+import { performance } from 'node:perf_hooks';
 import type { FastifyInstance } from 'fastify';
 
 import {
@@ -89,6 +91,161 @@ export function safeAuthAlerts(sink: AuthAlertSink = noopAuthAlerts): AuthAlertS
   };
 }
 
+export type AuthAlertRoute = 'security' | 'identity' | 'abuse' | 'database';
+export type AuthAlertRoutingConfig = Readonly<Record<AuthAlertType, readonly AuthAlertRoute[]>>;
+export type AuthAlertDelivery = {
+  contract: 'egogero.auth-alert-delivery/v1';
+  type: AuthAlertType;
+  routes: readonly AuthAlertRoute[];
+};
+export type AuthAlertDeliveryResult = { acknowledged: boolean };
+export type AuthAlertDeliveryOperation = Promise<AuthAlertDeliveryResult>
+  | { promise: Promise<AuthAlertDeliveryResult>; cancel?: () => void };
+export type AuthAlertDeliveryAdapter = (delivery: AuthAlertDelivery, signal: AbortSignal) => AuthAlertDeliveryOperation;
+
+export const DEFAULT_AUTH_ALERT_ROUTES: AuthAlertRoutingConfig = {
+  rate_limit_repeated_excess: ['abuse'],
+  crypto_integrity_failure: ['security'],
+  crypto_key_failure: ['security'],
+  oidc_replay_or_state_miss: ['security', 'identity'],
+  oidc_issuer_mixup: ['security', 'identity'],
+  oidc_callback_success_slo: ['identity'],
+  session_lookup_latency_slo: ['database', 'identity']
+};
+
+const AUTH_ALERT_TYPES: readonly AuthAlertType[] = [
+  'rate_limit_repeated_excess', 'crypto_integrity_failure', 'crypto_key_failure',
+  'oidc_replay_or_state_miss', 'oidc_issuer_mixup', 'oidc_callback_success_slo',
+  'session_lookup_latency_slo'
+];
+const AUTH_ALERT_ROUTES = new Set<AuthAlertRoute>(['security', 'identity', 'abuse', 'database']);
+
+export function createRoutedAuthAlertSink(
+  config: AuthAlertRoutingConfig,
+  adapter: AuthAlertDeliveryAdapter,
+  options: {
+    timeoutMs?: number;
+    onGap?: (code: Extract<AuthRolloutSnapshot['observability']['gaps'][number]['code'], `alert_route_${string}`>) => void;
+  } = {}
+) {
+  const timeoutMs = options.timeoutMs ?? 5_000;
+  if (!Number.isFinite(timeoutMs) || timeoutMs < 1
+    || Object.keys(config).length !== AUTH_ALERT_TYPES.length
+    || !AUTH_ALERT_TYPES.every((type) => Array.isArray(config[type])
+      && config[type].length > 0
+      && config[type].length <= AUTH_ALERT_ROUTES.size
+      && new Set(config[type]).size === config[type].length
+      && config[type].every((route) => AUTH_ALERT_ROUTES.has(route)))) {
+    throw new Error('Invalid bounded auth alert routing configuration');
+  }
+  const routes = AUTH_ALERT_TYPES.reduce((bounded, type) => {
+    bounded[type] = [...config[type]];
+    return bounded;
+  }, {} as Record<AuthAlertType, readonly AuthAlertRoute[]>);
+  let active: { controller: AbortController; timedOut: boolean; cancel?: () => void } | null = null;
+  let pending: AuthAlertDelivery | null = null;
+  function gap(code: Parameters<NonNullable<typeof options.onGap>>[0]) {
+    try { options.onGap?.(code); } catch { /* observability cannot affect auth */ }
+  }
+  function dispatch(delivery: AuthAlertDelivery) {
+    const controller = new AbortController();
+    try {
+      const result = adapter(delivery, controller.signal);
+      const operation = result instanceof Promise ? { promise: result } : result;
+      if (!operation?.promise || typeof operation.promise.then !== 'function') {
+        throw new Error('Invalid auth alert adapter operation');
+      }
+      const state = { controller, timedOut: false, cancel: operation.cancel };
+      active = state;
+      const timer = setTimeout(() => {
+        if (active !== state || state.timedOut) return;
+        state.timedOut = true;
+        gap('alert_route_timeout');
+        controller.abort();
+        try { state.cancel?.(); } catch { /* cancellation is best effort */ }
+      }, timeoutMs);
+      timer.unref();
+      void operation.promise.then((ack) => {
+        if (ack?.acknowledged !== true) gap('alert_route_unacknowledged');
+        settle(state);
+      }, () => {
+        gap('alert_route_rejected');
+        settle(state);
+      });
+      function settle(expected: typeof state) {
+        if (active !== expected) return;
+        clearTimeout(timer);
+        active = null;
+        if (pending) {
+          const next = pending;
+          pending = null;
+          dispatch(next);
+        }
+      }
+    } catch {
+      gap('alert_route_throw');
+    }
+  }
+  const sink: AuthAlertSink = {
+    emit(type) {
+      const delivery: AuthAlertDelivery = {
+        contract: 'egogero.auth-alert-delivery/v1', type, routes: [...routes[type]]
+      };
+      if (!active) dispatch(delivery);
+      else if (!pending) pending = delivery;
+      else gap('alert_route_backpressure');
+    }
+  };
+  return { sink, state: () => ({ inFlight: active !== null, pending: pending ? 1 : 0 }) };
+}
+
+export function combineAuthAlertSinks(...sinks: readonly AuthAlertSink[]): AuthAlertSink {
+  return {
+    emit(type, details) {
+      for (const sink of sinks) {
+        try { void Promise.resolve(sink.emit(type, details)).catch(() => {}); } catch { /* non-authoritative */ }
+      }
+    }
+  };
+}
+
+export function createAuthAlertStdoutAdapter(stream: NodeJS.WriteStream = process.stdout): AuthAlertDeliveryAdapter {
+  return async (delivery, signal) => {
+    if (!stream.write(`${JSON.stringify(delivery)}\n`)) {
+      await new Promise<void>((resolve, reject) => {
+        function cleanup() {
+          stream.off('drain', drained);
+          stream.off('error', failed);
+          signal.removeEventListener('abort', aborted);
+        }
+        function drained() { cleanup(); resolve(); }
+        function failed(error: Error) { cleanup(); reject(error); }
+        function aborted() { cleanup(); reject(new Error('Auth alert stdout delivery aborted')); }
+        stream.once('drain', drained);
+        stream.once('error', failed);
+        signal.addEventListener('abort', aborted, { once: true });
+      });
+    }
+    return { acknowledged: true };
+  };
+}
+
+export function createAuthAlertWebhookAdapter(
+  url: string,
+  request: typeof fetch = fetch
+): AuthAlertDeliveryAdapter {
+  const endpoint = new URL(url);
+  if (endpoint.protocol !== 'https:' || endpoint.username || endpoint.password) {
+    throw new Error('Auth alert webhook must be an HTTPS URL without credentials');
+  }
+  return async (delivery, signal) => {
+    const response = await request(endpoint, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(delivery), signal
+    });
+    return { acknowledged: response.ok };
+  };
+}
+
 export type AuthAggregateSnapshot = {
   callbackSuccess: number;
   callbackFailure: number;
@@ -108,12 +265,15 @@ export function evaluateAuthAggregates(snapshot: AuthAggregateSnapshot, sink: Au
   }
 }
 
-export type AuthSnapshotSink = (snapshot: AuthRolloutSnapshot) => void | Promise<void>;
+export type AuthSinkOperation = Promise<void> | { promise: Promise<void>; cancel?: () => void };
+export type AuthSnapshotSink = (snapshot: AuthRolloutSnapshot) => void | AuthSinkOperation;
 
 export type StructuredAuthTelemetry = {
   metrics: AuthMetrics;
   alerts: AuthAlertSink;
   flush(): AuthRolloutSnapshot | undefined;
+  recordObservabilityGap(code: AuthRolloutSnapshot['observability']['gaps'][number]['code']): void;
+  sinkState(): { inFlight: boolean; pending: number };
 };
 
 const CRITICAL_ALERTS = new Set<AuthAlertType>([
@@ -143,30 +303,62 @@ function aggregateKey(name: AuthMetricName, dimensions: Readonly<Record<string, 
 }
 
 export function createAuthSnapshotStdoutSink(stream: NodeJS.WriteStream = process.stdout): AuthSnapshotSink {
+  let waitingDrain: Promise<void> | null = null;
   return (snapshot) => {
     if (stream.write(`${JSON.stringify(snapshot)}\n`)) return;
-    return new Promise<void>((resolve) => stream.once('drain', resolve));
+    waitingDrain ??= new Promise<void>((resolve, reject) => {
+      function cleanup() {
+        stream.off('drain', drained);
+        stream.off('error', failed);
+        waitingDrain = null;
+      }
+      function drained() { cleanup(); resolve(); }
+      function failed(error: Error) { cleanup(); reject(error); }
+      stream.once('drain', drained);
+      stream.once('error', failed);
+    });
+    return waitingDrain;
   };
 }
 
 export function createAuthSnapshotFileSink(path: string): AuthSnapshotSink {
   let writes = Promise.resolve();
   return (snapshot) => {
-    writes = writes.then(() => appendFile(path, `${JSON.stringify(snapshot)}\n`, { encoding: 'utf8', mode: 0o600 }));
+    writes = writes.catch(() => {}).then(async () => {
+      const handle = await open(path,
+        constants.O_APPEND | constants.O_CREAT | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
+      try {
+        const metadata = await handle.stat();
+        if ((metadata.mode & 0o077) !== 0) await handle.chmod(0o600);
+        await handle.appendFile(`${JSON.stringify(snapshot)}\n`, 'utf8');
+      } finally {
+        await handle.close();
+      }
+    });
     return writes;
   };
 }
 
 export function createStructuredAuthTelemetry(
   sink: AuthSnapshotSink = createAuthSnapshotStdoutSink(),
-  options: { instanceId?: string; now?: () => number; sinkTimeoutMs?: number } = {}
+  options: {
+    instanceId?: string;
+    now?: () => number;
+    monotonicNow?: () => number;
+    maxClockDriftMs?: number;
+    sinkTimeoutMs?: number;
+  } = {}
 ): StructuredAuthTelemetry {
   const instanceId = options.instanceId ?? randomUUID();
   if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(instanceId)) {
     throw new Error('Auth telemetry instanceId must be a non-sensitive UUID v4');
   }
   const now = options.now ?? Date.now;
+  const monotonicNow = options.monotonicNow ?? (options.now ? now : performance.now.bind(performance));
+  const maxClockDriftMs = options.maxClockDriftMs ?? 5_000;
   const sinkTimeoutMs = options.sinkTimeoutMs ?? 5_000;
+  if (!Number.isFinite(maxClockDriftMs) || maxClockDriftMs < 0
+    || !Number.isFinite(sinkTimeoutMs) || sinkTimeoutMs < 1) throw new Error('Invalid auth telemetry timing configuration');
   const counters = new Map<string, AuthRolloutCounter>();
   const histograms = new Map<string, { metric: AuthMetricName; dimensions: Record<string, string>; bucketCounts: number[]; count: number }>();
   const alertCounts = new Map<AuthAlertType, number>();
@@ -174,8 +366,10 @@ export function createStructuredAuthTelemetry(
   let callbackSuccess = 0;
   let callbackFailure = 0;
   let intervalStart = now();
+  let monotonicStart = monotonicNow();
   let sequence = 0;
-  let inFlight = false;
+  let active: { timedOut: boolean; cancel?: () => void } | null = null;
+  let pending: AuthRolloutSnapshot | null = null;
   function markGap(code: AuthRolloutSnapshot['observability']['gaps'][number]['code']) {
     const count = gaps.get(code) ?? 0;
     gaps.set(code, count === Number.MAX_SAFE_INTEGER ? count : count + 1);
@@ -186,6 +380,58 @@ export function createStructuredAuthTelemetry(
       return Number.MAX_SAFE_INTEGER;
     }
     return left + right;
+  }
+  function restoreSnapshotGaps(snapshot: AuthRolloutSnapshot) {
+    for (const gap of snapshot.observability.gaps) {
+      gaps.set(gap.code, addBounded(gaps.get(gap.code) ?? 0, gap.count));
+    }
+  }
+  function attachCurrentGaps(snapshot: AuthRolloutSnapshot) {
+    if (gaps.size === 0) return snapshot;
+    const merged = new Map(snapshot.observability.gaps.map((gap) => [gap.code, gap.count]));
+    for (const [code, count] of gaps) merged.set(code, addBounded(merged.get(code) ?? 0, count));
+    gaps.clear();
+    return {
+      ...snapshot,
+      observability: { status: 'degraded' as const, gaps: [...merged].map(([code, count]) => ({ code, count })) }
+    };
+  }
+  function dispatch(snapshot: AuthRolloutSnapshot) {
+    try {
+      const result = sink(snapshot);
+      if (!result) return;
+      const operation = result instanceof Promise ? { promise: result } : result;
+      if (!operation?.promise || typeof operation.promise.then !== 'function') {
+        throw new Error('Invalid auth snapshot sink operation');
+      }
+      const state = { timedOut: false, cancel: operation.cancel };
+      active = state;
+      const timer = setTimeout(() => {
+        if (active !== state || state.timedOut) return;
+        state.timedOut = true;
+        markGap('sink_timeout');
+        try { state.cancel?.(); } catch { /* cancellation is best effort */ }
+      }, sinkTimeoutMs);
+      timer.unref();
+      void operation.promise.then(() => settle(state), () => {
+        restoreSnapshotGaps(snapshot);
+        markGap('sink_rejected');
+        settle(state);
+      });
+      function settle(expected: typeof state) {
+        if (active !== expected) return;
+        clearTimeout(timer);
+        active = null;
+        if (pending) {
+          const next = attachCurrentGaps(pending);
+          pending = null;
+          dispatch(next);
+        }
+      }
+    } catch {
+      restoreSnapshotGaps(snapshot);
+      markGap('sink_throw');
+    }
   }
 
   const alerts: AuthAlertSink = {
@@ -227,10 +473,21 @@ export function createStructuredAuthTelemetry(
   return {
     metrics,
     alerts,
+    recordObservabilityGap: markGap,
+    sinkState() { return { inFlight: active !== null, pending: pending ? 1 : 0 }; },
     flush() {
       const observedEnd = now();
-      if (!Number.isFinite(observedEnd) || observedEnd <= intervalStart) markGap('clock_anomaly');
-      const end = Number.isFinite(observedEnd) && observedEnd > intervalStart ? observedEnd : intervalStart + 1;
+      const observedMonotonicEnd = monotonicNow();
+      const monotonicElapsed = observedMonotonicEnd - monotonicStart;
+      if (!Number.isFinite(observedEnd) || !Number.isFinite(monotonicElapsed) || monotonicElapsed <= 0) markGap('clock_anomaly');
+      const safeMonotonicElapsed = Number.isFinite(monotonicElapsed) && monotonicElapsed > 0 ? monotonicElapsed : 1;
+      const wallElapsed = observedEnd - intervalStart;
+      const drifted = Number.isFinite(wallElapsed) && Math.abs(wallElapsed - safeMonotonicElapsed) > maxClockDriftMs;
+      if (drifted) markGap('clock_drift');
+      const end = Number.isFinite(observedEnd) && wallElapsed > 0 && !drifted
+        ? observedEnd
+        : intervalStart + safeMonotonicElapsed;
+      monotonicStart = Number.isFinite(observedMonotonicEnd) ? observedMonotonicEnd : monotonicStart + safeMonotonicElapsed;
       const sessionBuckets = Array(AUTH_SESSION_HISTOGRAM_BOUNDS_SECONDS.length + 1).fill(0) as number[];
       let sessionCount = 0;
       for (const histogram of histograms.values()) {
@@ -282,42 +539,15 @@ export function createStructuredAuthTelemetry(
       histograms.clear();
       alertCounts.clear();
       gaps.clear();
-      if (inFlight) {
-        for (const gap of snapshotGaps) gaps.set(gap.code, gap.count);
-        markGap('sink_backpressure');
-        return undefined;
-      }
-      try {
-        const result = sink(snapshot);
-        if (result && typeof result.then === 'function') {
-          inFlight = true;
-          let settled = false;
-          const timer = setTimeout(() => {
-            if (settled) return;
-            settled = true;
-            inFlight = false;
-            markGap('sink_timeout');
-          }, sinkTimeoutMs);
-          timer.unref();
-          void Promise.resolve(result).then(() => {
-            if (settled) return;
-            settled = true;
-            inFlight = false;
-            clearTimeout(timer);
-          }, () => {
-            if (settled) return;
-            settled = true;
-            inFlight = false;
-            clearTimeout(timer);
-            for (const gap of snapshotGaps) gaps.set(gap.code, (gaps.get(gap.code) ?? 0) + gap.count);
-            markGap('sink_rejected');
-          });
+      if (active) {
+        if (!pending) pending = snapshot;
+        else {
+          restoreSnapshotGaps(snapshot);
+          markGap('sink_backpressure');
         }
-      } catch {
-        for (const gap of snapshotGaps) gaps.set(gap.code, gap.count);
-        markGap('sink_throw');
-        return undefined;
+        return snapshot;
       }
+      dispatch(snapshot);
       return snapshot;
     }
   };

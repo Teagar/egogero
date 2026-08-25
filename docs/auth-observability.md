@@ -63,12 +63,20 @@ of this implementation and must not be introduced until the ADR's measured migra
 
 `createStructuredAuthTelemetry` emits one JSON object per interval using contract
 `egogero.auth-rollout/v1`. The default sink writes JSONL to stdout. A sink adapter can send the
-same object elsewhere; `createAuthSnapshotFileSink(path)` appends mode-`0600` JSONL. Sink
-promises are never awaited by authentication. Throws, rejection, timeout (default five
-seconds), or backpressure are carried into a later snapshot as a degraded observability gap.
+same object elsewhere. `createAuthSnapshotFileSink(path)` opens with `O_NOFOLLOW`, creates with
+mode `0600`, repairs any existing group/other permission bits to `0600` before append, and
+recovers its serialized promise chain after a failed append. Sink promises are never awaited
+by authentication. Throws, rejection, timeout (default five seconds), or backpressure are
+carried into a later snapshot as a degraded observability gap.
 The affected interval is not silently accepted as evidence. If the only sink remains down,
 there may be no durable record able to report that failure, so absence of contiguous snapshots
 is itself inconclusive.
+
+Only one sink operation and one pending snapshot are retained. Timeout requests cancellation
+when the adapter supports it, but does not release the active slot until the operation really
+settles. Further intervals are dropped with `sink_backpressure`; this bounds memory and stdout
+`drain` listeners. A permanently stuck sole sink may be unable to publish its own gap, which is
+why independent serving inventory is mandatory for rollout evaluation.
 
 Each snapshot contains only:
 
@@ -82,7 +90,7 @@ Each snapshot contains only:
 | `histograms[]` | Delta, non-cumulative bucket counts in seconds; bounds `1,2.5,5,10,20,50,100,250,500,1000ms`, plus overflow |
 | `alerts` | Counts keyed only by the seven bounded `AuthAlertType` routes |
 | `criticalIncidentCount` | Crypto integrity/key, replay/state-miss, and issuer mix-up total |
-| `observability` | `healthy` or `degraded`, with bounded sink/numeric gap code/count pairs |
+| `observability` | `healthy` or `degraded`, with bounded sink, routing, clock, and numeric gap code/count pairs |
 
 Snapshots contain no raw observations or alert details. They must not contain account,
 principal, condominium/tenant, session, IP/prefix, request, token, credential, or arbitrary
@@ -91,18 +99,28 @@ authentication operation.
 
 Multiple instances are summed by bucket and counter. Concurrent intervals from different
 instance IDs are expected. Intervals for one instance must be contiguous, non-overlapping, and
-have increasing sequence numbers. Never average process percentiles: sum non-cumulative bucket
+have increasing sequence numbers. Wall elapsed time is compared with monotonic elapsed time;
+drift over five seconds is marked and the interval uses monotonic elapsed time instead. Never
+average process percentiles: sum non-cumulative bucket
 counts first, then choose the first upper bound whose cumulative count reaches
 `ceil(total * 0.95)`. This deliberately reports the upper bound and treats overflow as
 infinite.
 
 ## Canary Evaluator
 
+Evaluation also requires an independently produced `egogero.auth-rollout-inventory/v1` JSON
+file. Each `servingInstances` entry contains a UUID v4 `instanceId`, canonical UTC
+`expectedStart`/`expectedEnd`, and `cadenceMs`. It must come from deployment inventory or the
+orchestrator, not the telemetry sink or process lifecycle hook. Every expected interval must
+be covered by that instance's snapshots, each no longer than its cadence. Planned replacement
+is represented by ending the old instance and starting the new instance in inventory; a
+replica that silently stops while another remains healthy is inconclusive.
+
 Run against one or more files, or pipe JSONL on stdin:
 
 ```sh
-npm run auth:rollout:evaluate -- snapshots-a.jsonl snapshots-b.jsonl
-cat snapshots.jsonl | npm run auth:rollout:evaluate
+npm run auth:rollout:evaluate -- --inventory serving.json snapshots-a.jsonl snapshots-b.jsonl
+cat snapshots.jsonl | npm run auth:rollout:evaluate -- --inventory serving.json
 ```
 
 The command writes exactly one `egogero.auth-rollout-evaluation/v1` JSON object. Exit `0` is
@@ -114,12 +132,18 @@ The command writes exactly one `egogero.auth-rollout-evaluation/v1` JSON object.
 - session verification histogram p95 at most 20 ms (the exact bucket boundary passes)
 - at least 100 callbacks and 100 session lookup samples
 - no malformed records, unexpected dimensions, sequence errors, same-instance gaps/overlap, global coverage gaps, clock anomalies, numeric overflow, or observability gap markers
+- complete per-instance coverage of the independent expected serving inventory at its declared cadence
 
 An observed critical incident or measured SLO breach is `fail` even if other evidence is
 incomplete. Missing volume/window, malformed data, restarts with ambiguous same-instance
 overlap, and observability gaps are `inconclusive`, never pass. Synthetic snapshots are useful
 only for validating the evaluator and alert plumbing; they are not staging or production
 rollout evidence.
+
+JSONL is processed as a stream. Defaults are at most 32 files, 100,000 records, 256 KiB per
+line, 32 MiB per file, and 64 MiB total; inventory is capped at 256 KiB. Limit or read failures
+produce machine-readable `inconclusive` output and exit `2`, rather than buffering unbounded
+input or crashing with partial output.
 
 ## Dashboards and Routing
 
@@ -142,6 +166,16 @@ route `oidc_replay_or_state_miss` and `oidc_issuer_mixup` to security and identi
 route `rate_limit_repeated_excess` to abuse/on-call; and route both SLO alerts to identity and
 database on-call. A routing smoke test must deliver one sanitized event for every route and
 confirm acknowledgement without adding payload dimensions.
+
+`createRoutedAuthAlertSink` validates an exact `AuthAlertType` to bounded route-name map. The
+default map uses only `security`, `identity`, `abuse`, and `database`. Delivery contract
+`egogero.auth-alert-delivery/v1` contains only alert type and route names; caller details are
+never forwarded. The routing layer holds one active and one pending delivery, supports real
+`AbortSignal` cancellation, and reports throw, reject, timeout, backpressure, and negative
+acknowledgement through `recordObservabilityGap`. `createAuthAlertWebhookAdapter` accepts only
+credential-free HTTPS URLs; `createAuthAlertStdoutAdapter` is the provider-neutral alternative.
+Compose routing with snapshot alert counting through `combineAuthAlertSinks`. No provider is
+authoritative for authentication decisions.
 
 Rollback the canary (disable new human login, preserve existing sessions and device access) on
 any critical incident, callback success below 99.5%, session p95 above 20 ms, or repeated
