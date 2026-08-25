@@ -106,40 +106,56 @@ async function revokeIneligibleSessions(
   transaction: Prisma.TransactionClient,
   changedTenantId: string | null
 ) {
-  const sessions = await transaction.$queryRaw<Array<{
-    sessionId: string;
-    tenantId: string | null;
-    provider: boolean;
-  }>>(Prisma.sql`
-    SELECT session.id AS "sessionId", membership."condominioId" AS "tenantId",
-           membership.role = 'provedor' AS provider
-    FROM "BrowserSession" session
-    JOIN "HumanMembership" membership ON membership.id = session."activeMembershipId"
-      AND membership."accountId" = session."accountId"
-    WHERE session."revokedAt" IS NULL
-      ${changedTenantId ? Prisma.sql`AND membership."condominioId" = ${changedTenantId}` : Prisma.empty}
-    ORDER BY session.id
-    FOR UPDATE OF session
-  `);
-  if (sessions.length === 0) return 0;
-  const tenantScopes = [...new Set(sessions.flatMap((session) =>
-    session.tenantId ? [`tenant:${session.tenantId}`] : []
-  ))];
-  const scopes = ['global', ...tenantScopes];
-  const policies = await transaction.$queryRaw<PolicyRow[]>(Prisma.sql`
-    SELECT scope, "condominioId", state::text, "cohortPercentage", "cohortAlgorithm", version, "updatedAt"
-    FROM "HumanAuthRolloutPolicy" WHERE scope IN (${Prisma.join(scopes)}) ORDER BY scope
-  `);
-  const policyMap = new Map(policies.map((policy) => [policy.scope, policy]));
-  const revokedIds = sessions
-    .filter((session) => !effectiveDecision(policyMap, session.tenantId, session.provider).allowed)
-    .map((session) => session.sessionId);
-  if (revokedIds.length === 0) return 0;
   return transaction.$executeRaw(Prisma.sql`
-    UPDATE "BrowserSession" SET "revokedAt" = clock_timestamp(),
-      "revokeReason" = 'human_auth_policy_change'
-    WHERE id IN (${Prisma.join(revokedIds.map((id) => Prisma.sql`${id}::uuid`))})
-      AND "revokedAt" IS NULL
+    WITH effective AS MATERIALIZED (
+      SELECT session.id,
+        membership.role = 'provedor' AS provider,
+        global_policy.state::text AS global_state,
+        global_policy."cohortPercentage" AS global_percentage,
+        global_policy."cohortAlgorithm" AS global_algorithm,
+        tenant_policy.state::text AS tenant_state,
+        tenant_policy."cohortPercentage" AS tenant_percentage,
+        tenant_policy."cohortAlgorithm" AS tenant_algorithm,
+        CASE WHEN membership."condominioId" IS NULL THEN NULL ELSE
+          (get_byte(sha256(convert_to(${HUMAN_AUTH_COHORT_ALGORITHM}, 'UTF8') || decode('00', 'hex')
+            || convert_to(membership."condominioId", 'UTF8')), 0)::bigint * 16777216
+          + get_byte(sha256(convert_to(${HUMAN_AUTH_COHORT_ALGORITHM}, 'UTF8') || decode('00', 'hex')
+            || convert_to(membership."condominioId", 'UTF8')), 1)::bigint * 65536
+          + get_byte(sha256(convert_to(${HUMAN_AUTH_COHORT_ALGORITHM}, 'UTF8') || decode('00', 'hex')
+            || convert_to(membership."condominioId", 'UTF8')), 2)::bigint * 256
+          + get_byte(sha256(convert_to(${HUMAN_AUTH_COHORT_ALGORITHM}, 'UTF8') || decode('00', 'hex')
+            || convert_to(membership."condominioId", 'UTF8')), 3)::bigint) % 100 + 1
+        END AS cohort
+      FROM "BrowserSession" session
+      JOIN "HumanMembership" membership ON membership.id = session."activeMembershipId"
+        AND membership."accountId" = session."accountId"
+      LEFT JOIN "HumanAuthRolloutPolicy" global_policy ON global_policy.scope = 'global'
+      LEFT JOIN "HumanAuthRolloutPolicy" tenant_policy
+        ON tenant_policy.scope = 'tenant:' || membership."condominioId"
+      WHERE session."revokedAt" IS NULL
+        ${changedTenantId ? Prisma.sql`AND membership."condominioId" = ${changedTenantId}` : Prisma.empty}
+    )
+    UPDATE "BrowserSession" session
+    SET "revokedAt" = clock_timestamp(), "revokeReason" = 'human_auth_policy_change'
+    FROM effective
+    WHERE session.id = effective.id
+      AND NOT (
+        (effective.provider AND effective.global_state IN ('internal_provider', 'pilot', 'enabled'))
+        OR (NOT effective.provider
+          AND (effective.global_state = 'enabled' OR (
+            effective.global_state = 'pilot'
+            AND effective.global_algorithm = ${HUMAN_AUTH_COHORT_ALGORITHM}
+            AND effective.global_percentage IN (10, 50, 100)
+            AND effective.cohort <= effective.global_percentage
+          ))
+          AND (effective.tenant_state = 'enabled' OR (
+            effective.tenant_state = 'pilot'
+            AND effective.tenant_algorithm = ${HUMAN_AUTH_COHORT_ALGORITHM}
+            AND effective.tenant_percentage IN (10, 50, 100)
+            AND effective.cohort <= effective.tenant_percentage
+          ))
+        )
+      )
   `);
 }
 
@@ -284,6 +300,10 @@ export function createHumanAuthRolloutService(client: PrismaClient) {
           )
         `;
         return { scope, state: input.state, cohortPercentage: input.cohortPercentage, version, revokedSessions };
+      }, {
+        // Rollback may update a large active-session set; queue briefly, then allow one bounded atomic scan/update.
+        maxWait: 5_000,
+        timeout: 30_000
       });
     }
   };

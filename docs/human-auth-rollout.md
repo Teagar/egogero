@@ -40,6 +40,10 @@ by the policy row lock. This serializes missing-row creation and gives global/te
 order. OIDC callback binding, invitation acceptance, handoff issue,
 membership switch, session inspection, and request authentication re-evaluate policy in their database
 transaction. Rollback history is protected against update, delete, and truncate by both privileges and triggers.
+Session revocation is one set-based PostgreSQL update; it does not materialize session IDs or construct an `IN`
+bind list. Rollout writes use a 5-second interactive-transaction acquisition limit and a 30-second execution limit:
+ordinary requests are not given longer transactions, while an atomic high-cardinality rollback has bounded time to
+finish or fails without committing a partial policy change.
 
 ## In-flight requests
 
