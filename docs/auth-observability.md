@@ -55,9 +55,11 @@ invitation, device, digest, ciphertext, nonce, authentication-tag, client-secret
 fields are replaced. Request bodies are not telemetry payloads.
 
 An SLO alert means operators should first verify provider health or PostgreSQL query/index
-health, then inspect bounded audit reason codes. Rollback disables new human login while
-preserving existing sessions and the device path; schema additions remain. Redis is not part
-of this implementation and must not be introduced until the ADR's measured migration gate.
+health, then inspect bounded audit reason codes. Rollback changes the applicable rollout policy
+and transactionally revokes every human session made ineligible by the resulting global and
+tenant policies. Device access and public visitor invitations remain available; schema additions
+remain. Redis is not part of this implementation and must not be introduced until the ADR's
+measured migration gate.
 
 ## Rollout Snapshot Contract
 
@@ -196,9 +198,10 @@ HTTP transport, not a claim of integration with any alert provider. Non-2xx ackn
 throw, rejection, timeout, and bounded-queue drops are observability gaps and never affect an
 authentication result.
 
-Rollback the canary (disable new human login, preserve existing sessions and device access) on
-any critical incident, callback success below 99.5%, session p95 above 20 ms, or repeated
-excess that indicates uncontrolled abuse. Pause promotion rather than claiming success for an
-observability gap, insufficient sample/window, or overlap ambiguity. Investigate provider,
-key configuration, PostgreSQL health/indexes, and sink health before resuming the full 24-hour
-evidence window.
+Rollback the canary on any critical incident, callback success below 99.5%, session p95 above
+20 ms, or repeated excess that indicates uncontrolled abuse. A scoped rollback revokes affected
+tenant sessions; global `internal-provider` revokes non-provider human sessions; global
+`disabled` revokes all human sessions. Every rollback preserves device access and public visitor
+invitations. Pause promotion rather than claiming success for an observability gap, insufficient
+sample/window, or overlap ambiguity. Investigate provider, key configuration, PostgreSQL
+health/indexes, and sink health before beginning a new full 24-hour evidence window.
