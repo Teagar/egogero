@@ -89,6 +89,13 @@ async function seedDatabase(invitationToken: string) {
     await prisma.condominio.create({ data: {
       id: IDS.condominium, nome: 'Residencial PC31', responsavel: 'Equipe E2E', tipo: 'residencial', timezone: 'UTC'
     } });
+    await prisma.humanAuthRolloutPolicy.update({
+      where: { scope: 'global' },
+      data: { state: 'enabled', cohortPercentage: null, cohortAlgorithm: null }
+    });
+    await prisma.humanAuthRolloutPolicy.create({
+      data: { scope: `tenant:${IDS.condominium}`, condominioId: IDS.condominium, state: 'enabled' }
+    });
     await prisma.morador.create({ data: {
       id: IDS.resident, condominioId: IDS.condominium, nome: 'Pessoa E2E', enderecoApartamento: '31'
     } });
@@ -245,7 +252,12 @@ function startTlsProxy(key: Buffer, cert: Buffer) {
   const server = createHttpsServer({ key, cert }, (incoming, outgoing) => {
     const upstream = httpRequest({
       hostname: '127.0.0.1', port: 3442, method: incoming.method, path: incoming.url,
-      headers: { ...incoming.headers, host: '127.0.0.1:3443' }
+      headers: {
+        ...incoming.headers,
+        host: '127.0.0.1:3443',
+        'x-forwarded-for': incoming.socket.remoteAddress ?? '127.0.0.1',
+        'x-forwarded-proto': 'https'
+      }
     }, (response) => {
       outgoing.writeHead(response.statusCode ?? 502, response.headers);
       response.pipe(outgoing);
@@ -293,7 +305,8 @@ async function main() {
       cwd: process.cwd(), stdio: ['ignore', 'pipe', 'pipe'],
       env: {
         ...process.env, NODE_ENV: 'production', NODE_EXTRA_CA_CERTS: certPath, DATABASE_URL,
-        HOST: '127.0.0.1', PORT: '3442', HUMAN_AUTH_ENABLED: 'true', PUBLIC_APPLICATION_ORIGIN: APP_ORIGIN,
+        HOST: '127.0.0.1', PORT: '3442', TRUST_PROXY: '127.0.0.1/32', HUMAN_AUTH_ENABLED: 'true',
+        PUBLIC_APPLICATION_ORIGIN: APP_ORIGIN,
         PUBLIC_VALIDATION_BASE_URL: APP_ORIGIN, INVITATION_TOKEN_SECRET: 'pc31-invitation-secret-at-least-32-bytes',
         DEVICE_API_KEY_SECRET: 'pc31-device-secret-at-least-32-bytes', IDEMPOTENCY_CACHE_SECRET: 'pc31-idempotency-secret-at-least-32-bytes',
         OIDC_ISSUER: OIDC_ORIGIN, OIDC_AUTHORIZATION_ENDPOINT: `${OIDC_ORIGIN}/authorize`,
@@ -359,8 +372,9 @@ function pipeSanitized(input: NodeJS.ReadableStream | null, output: NodeJS.Writa
 
 function observeAlert(line: string, alerts: Set<string>) {
   try {
-    const event = JSON.parse(line) as { event?: unknown; type?: unknown };
-    if (event.event === 'auth_alert' && typeof event.type === 'string' && /^[a-z_]{1,100}$/.test(event.type)) {
+    const event = JSON.parse(line) as { contract?: unknown; event?: unknown; type?: unknown };
+    const recognized = event.event === 'auth_alert' || event.contract === 'egogero.auth-alert-delivery/v1';
+    if (recognized && typeof event.type === 'string' && /^[a-z_]{1,100}$/.test(event.type)) {
       alerts.add(event.type);
     }
   } catch { /* non-JSON application output */ }

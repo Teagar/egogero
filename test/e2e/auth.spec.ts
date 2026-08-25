@@ -239,7 +239,9 @@ for (const attack of attacks) {
     await resetRateLimits();
     await control(request, { ...attack.control, amr: ['webauthn'], acr: 'strong' });
     const before = await securitySnapshot();
-    const auditBefore = await databaseRows<{ count: string }>('SELECT COUNT(*)::text AS count FROM "AuthenticationAuditEvent"');
+    const auditBefore = new Set((await databaseRows<{ id: string }>(
+      'SELECT id FROM "AuthenticationAuditEvent"'
+    )).map((row) => row.id));
     const isolated = await browser.newContext();
     const page = await isolated.newPage();
     await page.goto(`${APP_ORIGIN}/auth/login`);
@@ -247,10 +249,13 @@ for (const attack of attacks) {
     await expect(page.getByText('A autenticação está indisponível no momento.')).toBeVisible();
     expect((await isolated.cookies()).some((cookie) => cookie.name === '__Host-eg_session')).toBe(false);
     expect(await securitySnapshot()).toEqual(before);
-    const audits = await databaseRows<{ reasonCode: string }>(`SELECT "reasonCode" FROM "AuthenticationAuditEvent"
-      ORDER BY "createdAt", id OFFSET $1`, [Number(auditBefore[0]!.count)]);
-    expect(audits.map((row) => row.reasonCode)).toContain(attack.reason);
-    if (attack.alert) expect((await providerStats(request)).alerts).toContain(attack.alert);
+    const audits = await databaseRows<{ id: string; reasonCode: string }>(
+      'SELECT id, "reasonCode" FROM "AuthenticationAuditEvent"'
+    );
+    expect(audits.filter((row) => !auditBefore.has(row.id)).map((row) => row.reasonCode)).toContain(attack.reason);
+    if (attack.alert) {
+      await expect.poll(async () => (await providerStats(request)).alerts, { timeout: 2_000 }).toContain(attack.alert);
+    }
     await isolated.close();
   });
 }
@@ -272,9 +277,15 @@ test('invitation fragment is scrubbed before acceptance and invitation failures 
 
   const invalid = await browser.newContext();
   const invalidPage = await invalid.newPage();
+  const invalidBefore = await securitySnapshot();
+  const exchangesBeforeInvalid = (await providerStats(request)).tokenExchanges;
   await invalidPage.goto(`${APP_ORIGIN}/invitation#token=${'Z'.repeat(43)}`);
   await invalidPage.getByRole('button', { name: 'Continuar com identidade corporativa' }).click();
-  await expect(invalidPage.getByRole('heading', { name: 'Acesso indisponível' })).toBeVisible();
+  await expect(invalidPage).toHaveURL(`${APP_ORIGIN}/invitation`);
+  await expect(invalidPage.getByText('Este convite não está disponível. Solicite um novo convite à administração.'))
+    .toBeVisible();
+  expect(await securitySnapshot()).toEqual(invalidBefore);
+  expect((await providerStats(request)).tokenExchanges).toBe(exchangesBeforeInvalid);
   expect(await invalidPage.locator('body').innerText()).not.toMatch(/expired|unknown|email|token/i);
   await invalid.close();
 });

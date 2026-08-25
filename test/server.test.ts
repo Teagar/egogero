@@ -282,11 +282,19 @@ test('auth alert adapter environment is bounded and fails closed', () => {
   assert.throws(() => authAlertConfigFromEnvironment({ AUTH_ALERT_TIMEOUT_MS: '10001' }), /AUTH_ALERT_TIMEOUT_MS/);
 });
 
-test('startServer rejects malformed alert routing before database startup', async () => {
-  await assert.rejects(startRuntime(
-    'production', false, 'postgresql://unused:unused@127.0.0.1:1/unused',
-    { AUTH_ALERT_ADAPTER: 'https_webhook', AUTH_ALERT_WEBHOOK_URL: 'http://alerts.example.test' }
-  ), /AUTH_ALERT_WEBHOOK_URL/);
+test('startServer redacts malformed alert routing failures before database startup', async () => {
+  await assert.rejects(
+    startRuntime(
+      'production', false, 'postgresql://unused:unused@127.0.0.1:1/unused',
+      { AUTH_ALERT_ADAPTER: 'https_webhook', AUTH_ALERT_WEBHOOK_URL: 'http://alerts.example.test' }
+    ),
+    (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.match(error.message, /Server exited during startup: Startup failed/);
+      assert.doesNotMatch(error.message, /AUTH_ALERT_WEBHOOK_URL|alerts\.example\.test/);
+      return true;
+    }
+  );
 });
 
 test('server auth observability composes bounded delivery and records sink failures', async () => {

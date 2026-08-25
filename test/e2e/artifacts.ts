@@ -39,13 +39,18 @@ export async function sanitizeAndVerifyArtifacts(extraSecrets: readonly string[]
   for (const file of remaining) {
     const bytes = await readFile(file);
     const content = bytes.toString('latin1');
-    const knownLeak = [ARTIFACT_CANARY, ...extraSecrets].some((secret) => secret && content.includes(secret));
-    const withoutMarkers = content.replaceAll('[REDACTED]', '');
-    if (knownLeak || FINAL_SECRET.test(withoutMarkers)) {
+    if (hasCredentialLeak(content, extraSecrets)) {
       await rm(file, { force: true });
       throw new Error(`Artifact credential scan failed for ${path.relative(process.cwd(), file)}`);
     }
   }
+}
+
+export function hasCredentialLeak(content: string, extraSecrets: readonly string[] = []) {
+  const knownLeak = [ARTIFACT_CANARY, ...extraSecrets].some((secret) => secret && content.includes(secret));
+  // A quote terminates every credential pattern without joining punctuation onto an empty value.
+  const withoutMarkers = content.replaceAll('[REDACTED]', '"');
+  return Boolean(knownLeak || FINAL_SECRET.test(withoutMarkers));
 }
 
 async function filesBelow(root: string): Promise<string[]> {
