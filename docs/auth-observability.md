@@ -41,8 +41,10 @@ rejected promises are isolated from authentication decisions.
 | `auth_rate_limit_decisions_total` | counter | `operation`, `outcome` |
 
 Labels must never contain an account, principal, tenant, session, IP, token, or arbitrary
-reason text. `evaluateAuthAggregates` alerts when at least 100 callback observations have a
-success rate below 99.5%, or at least 100 session observations have p95 above 20 ms.
+reason text. Export applies a metric-specific key and value allowlist and maps unexpected
+values to `other`; callers cannot create new dimensions. `evaluateAuthAggregates` alerts when
+at least 100 callback observations have a success rate below 99.5%, or at least 100 session
+observations have conservative histogram p95 above 20 ms.
 
 ## Alerts and Redaction
 
@@ -56,3 +58,94 @@ An SLO alert means operators should first verify provider health or PostgreSQL q
 health, then inspect bounded audit reason codes. Rollback disables new human login while
 preserving existing sessions and the device path; schema additions remain. Redis is not part
 of this implementation and must not be introduced until the ADR's measured migration gate.
+
+## Rollout Snapshot Contract
+
+`createStructuredAuthTelemetry` emits one JSON object per interval using contract
+`egogero.auth-rollout/v1`. The default sink writes JSONL to stdout. A sink adapter can send the
+same object elsewhere; `createAuthSnapshotFileSink(path)` appends mode-`0600` JSONL. Sink
+promises are never awaited by authentication. Throws, rejection, timeout (default five
+seconds), or backpressure are carried into a later snapshot as a degraded observability gap.
+The affected interval is not silently accepted as evidence. If the only sink remains down,
+there may be no durable record able to report that failure, so absence of contiguous snapshots
+is itself inconclusive.
+
+Each snapshot contains only:
+
+| Field | Contract |
+| --- | --- |
+| `contract` | Exact version `egogero.auth-rollout/v1` |
+| `interval.start/end` | Half-open UTC interval `[start,end)` for this process |
+| `instanceId` | UUID v4 generated per process by default; non-sensitive and unrelated to hosts or users |
+| `sequence` | Strictly increasing within one process instance |
+| `counters[]` | Delta counters with allowlisted metric dimensions and safe integer values |
+| `histograms[]` | Delta, non-cumulative bucket counts in seconds; bounds `1,2.5,5,10,20,50,100,250,500,1000ms`, plus overflow |
+| `alerts` | Counts keyed only by the seven bounded `AuthAlertType` routes |
+| `criticalIncidentCount` | Crypto integrity/key, replay/state-miss, and issuer mix-up total |
+| `observability` | `healthy` or `degraded`, with bounded sink/numeric gap code/count pairs |
+
+Snapshots contain no raw observations or alert details. They must not contain account,
+principal, condominium/tenant, session, IP/prefix, request, token, credential, or arbitrary
+label values. The telemetry remains evidence only: it never grants, denies, or changes an
+authentication operation.
+
+Multiple instances are summed by bucket and counter. Concurrent intervals from different
+instance IDs are expected. Intervals for one instance must be contiguous, non-overlapping, and
+have increasing sequence numbers. Never average process percentiles: sum non-cumulative bucket
+counts first, then choose the first upper bound whose cumulative count reaches
+`ceil(total * 0.95)`. This deliberately reports the upper bound and treats overflow as
+infinite.
+
+## Canary Evaluator
+
+Run against one or more files, or pipe JSONL on stdin:
+
+```sh
+npm run auth:rollout:evaluate -- snapshots-a.jsonl snapshots-b.jsonl
+cat snapshots.jsonl | npm run auth:rollout:evaluate
+```
+
+The command writes exactly one `egogero.auth-rollout-evaluation/v1` JSON object. Exit `0` is
+`pass`, exit `1` is `fail`, and exit `2` is `inconclusive`. A pass requires all of:
+
+- contiguous real wall-clock coverage of at least 24 hours (the exact boundary passes)
+- zero critical authentication incidents
+- callback success at least 99.5% (integer cross-multiplication; the exact boundary passes)
+- session verification histogram p95 at most 20 ms (the exact bucket boundary passes)
+- at least 100 callbacks and 100 session lookup samples
+- no malformed records, unexpected dimensions, sequence errors, same-instance gaps/overlap, global coverage gaps, clock anomalies, numeric overflow, or observability gap markers
+
+An observed critical incident or measured SLO breach is `fail` even if other evidence is
+incomplete. Missing volume/window, malformed data, restarts with ambiguous same-instance
+overlap, and observability gaps are `inconclusive`, never pass. Synthetic snapshots are useful
+only for validating the evaluator and alert plumbing; they are not staging or production
+rollout evidence.
+
+## Dashboards and Routing
+
+For a dashboard or warehouse, group counter deltas by `metric` and the exact bounded
+`dimensions` object, then `sum(value)`. For latency, verify identical contract/bounds and
+`sum(bucketCounts[index])` across every selected process and interval before computing p95.
+Useful panels/queries are:
+
+```text
+callback_success = sum(auth_oidc_callback_total{outcome="success"})
+callback_total   = sum(auth_oidc_callback_total{outcome in ["success","failure"]})
+callback_slo     = callback_success / callback_total
+session_p95      = first bound where cumulative(sum(bucketCounts)) >= ceil(sum(count) * 0.95)
+critical         = sum(criticalIncidentCount)
+gaps             = sum(observability.gaps.count) by code
+```
+
+Route `crypto_integrity_failure` and `crypto_key_failure` to the security/on-call channel;
+route `oidc_replay_or_state_miss` and `oidc_issuer_mixup` to security and identity on-call;
+route `rate_limit_repeated_excess` to abuse/on-call; and route both SLO alerts to identity and
+database on-call. A routing smoke test must deliver one sanitized event for every route and
+confirm acknowledgement without adding payload dimensions.
+
+Rollback the canary (disable new human login, preserve existing sessions and device access) on
+any critical incident, callback success below 99.5%, session p95 above 20 ms, or repeated
+excess that indicates uncontrolled abuse. Pause promotion rather than claiming success for an
+observability gap, insufficient sample/window, or overlap ambiguity. Investigate provider,
+key configuration, PostgreSQL health/indexes, and sink health before resuming the full 24-hour
+evidence window.

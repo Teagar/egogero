@@ -14,7 +14,8 @@
     "db:generate": "prisma generate",
     "privacy:anonymize": "node dist/src/jobs/anonymize-old-guests.js",
     "idempotency:cleanup": "node dist/src/jobs/cleanup-idempotency.js",
-    "delivery:worker": "node dist/src/jobs/deliver-invitations.js"
+    "delivery:worker": "node dist/src/jobs/deliver-invitations.js",
+    "auth:rollout:evaluate": "tsx src/auth-rollout.ts"
   },
   "dependencies": {
     "@fastify/static": "^10.1.3",
