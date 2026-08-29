@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Fundamentos REV. 07 | Referência Teagar</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@600;700;800;900&amp;family=IBM+Plex+Mono:wght@400;500;600&amp;family=Public+Sans:wght@400;500;600;700;800&amp;display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles/tokens.css">
+  <link rel="stylesheet" href="styles/reference.css">
+</head>
+<body>
+  <a class="skip-link" href="#conteudo">Ir para o conteúdo</a>
+  <header class="site-header">
+    <div class="container topbar">
+      <a class="brand" href="index.html"><img src="assets/brand-mark.svg" alt=""> Teagar / REV. 07</a>
+      <nav class="top-links" aria-label="Navegação do catálogo"><a href="#cor">Cor</a><a href="#tipo">Tipografia</a><a href="#estados">Estados</a><a href="#regras">Anti-slop</a><a href="index.html">Catálogo</a></nav>
+    </div>
+  </header>
+  <main id="conteudo">
+    <header class="page-header blueprint-grid">
+      <div class="container"><p class="eyebrow">F01 / Fundação visual</p><h1>Decisão antes de decoração.</h1><p class="lede">Tokens e limites re-derivados da entrega `(7)`, aplicados ao produto operacional sem importar seus exemplos como contrato funcional.</p></div>
+    </header>
+    <section class="section" id="cor" aria-labelledby="titulo-cor">
+      <div class="container stack">
+        <div><p class="eyebrow">Paleta</p><h2 id="titulo-cor">Neutros dominam. Sinal decide.</h2><p class="lede">Signal é pontual; blueprint orienta navegação e informação; cores semânticas só representam estados reais.</p></div>
+        <div class="swatches">
+          <article class="swatch"><div class="swatch-color" style="--swatch:#2b2a28"></div><div class="swatch-copy"><strong>Charcoal</strong><code>#2B2A28</code><p class="small muted">Estrutura e superfícies escuras.</p></div></article>
+          <article class="swatch"><div class="swatch-color" style="--swatch:#f0f1f3"></div><div class="swatch-copy"><strong>Paper</strong><code>#F0F1F3</code><p class="small muted">Fundo padrão do produto.</p></div></article>
+          <article class="swatch"><div class="swatch-color" style="--swatch:#ff6700"></div><div class="swatch-copy"><strong>Signal</strong><code>#FF6700</code><p class="small muted">Ação ou alerta prioritário.</p></div></article>
+          <article class="swatch"><div class="swatch-color" style="--swatch:#1f4b8c"></div><div class="swatch-copy"><strong>Blueprint</strong><code>#1F4B8C</code><p class="small muted">Navegação, contexto e informação.</p></div></article>
+          <article class="swatch"><div class="swatch-color" style="--swatch:#585c63"></div><div class="swatch-copy"><strong>Steel</strong><code>#585C63</code><p class="small muted">Metadados e texto secundário.</p></div></article>
+          <article class="swatch"><div class="swatch-states" aria-hidden="true"><span></span><span></span><span></span></div><div class="swatch-copy"><strong>Estado</strong><code>SUCCESS / WARNING / DANGER</code><p class="small muted">Nunca decoração.</p></div></article>
+        </div>
+      </div>
+    </section>
+    <section class="section" id="tipo" aria-labelledby="titulo-tipo">
+      <div class="container">
+        <p class="eyebrow">Tipografia e escala</p><h2 id="titulo-tipo">Três famílias. Três funções.</h2>
+        <div class="type-specimen"><strong>Big Shoulders Display / editorial</strong><div class="type-display">Engenharia à mostra.</div></div>
+        <div class="type-specimen"><strong>Public Sans / texto e interface</strong><p class="type-body">Frases diretas, verbos ativos e informação suficiente para decidir sob pressão.</p></div>
+        <div class="type-specimen"><strong>IBM Plex Mono / metadados e estados</strong><p class="type-mono">CONTEXTO: JARDINS_DO_NORTE · PAPEL: SINDICO · ESTADO: ATIVO</p></div>
+        <div class="table-wrap"><div class="scale" role="img" aria-label="Escala tipográfica Fibonacci de 8 a 144 pixels"><span class="scale-step" style="--step:8px"></span><span class="scale-step" style="--step:13px">13</span><span class="scale-step" style="--step:21px">21</span><span class="scale-step" style="--step:34px">34</span><span class="scale-step" style="--step:55px">55</span><span class="scale-step" style="--step:89px">89</span><span class="scale-step" style="--step:144px">144</span></div></div>
+        <p class="small muted">Espaçamento: 8, 16, 24, 32, 48, 64, 96 e 128 px. Raios: 2 e 4 px.</p>
+      </div>
+    </section>
+    <section class="section" id="estados" aria-labelledby="titulo-estados">
+      <div class="container grid grid-2">
+        <div><p class="eyebrow">Estados operacionais</p><h2 id="titulo-estados">Cor confirma texto.</h2><p class="lede">Loading, empty, success, warning, denied, expired e error mantêm rótulo e próximo passo; nunca dependem apenas de cor.</p></div>
+        <div class="stack"><div class="state-strip"><span class="status">Carregando</span><span class="status">Vazio</span><span class="status success">Sucesso</span><span class="status warning">Atenção</span><span class="status danger">Negado</span><span class="status">Expirado</span><span class="status danger">Erro</span></div><div class="notice warning"><strong>Uma cor, um fato.</strong><br>Badges e alertas só aparecem quando um estado do servidor ou da operação os sustenta.</div></div>
+      </div>
+    </section>
+    <section class="section" id="regras" aria-labelledby="titulo-regras">
+      <div class="container grid grid-2">
+        <div><p class="eyebrow">Negative prompts</p><h2 id="titulo-regras">Bloqueios antes de gerar.</h2><p class="lede">A alternativa faz parte da regra: excluir um atalho sem indicar a direção correta apenas desloca a adivinhação.</p></div>
+        <ol class="rule-list">
+          <li><span class="rule-code">R.01</span><span>Sem gradiente decorativo, glassmorphism ou glow. Use superfícies sólidas e grid somente quando intencional.</span></li>
+          <li><span class="rule-code">R.02</span><span>Sem Inter, Roboto, Arial ou Space Grotesk. Preserve as três funções tipográficas.</span></li>
+          <li><span class="rule-code">R.03</span><span>Sem emoji estrutural. Use SVG com `currentColor` ou nenhum ícone.</span></li>
+          <li><span class="rule-code">R.04</span><span>Sem cartão dentro de cartão. Use espaço e hierarquia tipográfica.</span></li>
+          <li><span class="rule-code">R.05</span><span>Sem status decorativo. Toda cor semântica corresponde a um fato.</span></li>
+          <li><span class="rule-code">R.06</span><span>Sem baixo contraste. Texto normal mantém pelo menos 4,5:1.</span></li>
+          <li><span class="rule-code">R.07</span><span>Sem botão-pílula. Cantos técnicos permanecem entre 2 e 4 px.</span></li>
+          <li><span class="rule-code">R.08</span><span>Sem espaçamento aleatório. Use múltiplos de 8 px.</span></li>
+        </ol>
+      </div>
+    </section>
+  </main>
+  <footer class="footer"><div class="container spread cluster"><span>Fundação visual REV. 07 recebida.</span><a href="README.md">Ler decisões de derivação</a></div></footer>
+</body>
+</html>
