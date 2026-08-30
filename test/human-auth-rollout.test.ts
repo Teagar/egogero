@@ -32,7 +32,9 @@ test('rollout admin endpoint is provider-only and validates an exact secret-free
   const calls: unknown[] = [];
   const providerId = '00000000-0000-4000-8000-000000000010';
   const app = createApp({
-    authenticator: { async authenticate() { return { principalType: 'human', authMethod: 'oidc-session',
+    authenticator: { async authenticate(request) { request.browserSessionSnapshot = {
+      authenticatedAt: new Date(), csrfDigest: Buffer.alloc(32)
+    } as never; return { principalType: 'human', authMethod: 'oidc-session',
       id: providerId, accountId: providerId, sessionId: providerId, role: 'provedor', condominioIds: null } as const; } },
     authRateLimiter: { async check() { return { allowed: true, retryAfterSeconds: 0, repeatedExcess: false }; },
       async reserveFailure() { return { allowed: true, retryAfterSeconds: 0, repeatedExcess: false,
@@ -53,6 +55,22 @@ test('rollout admin endpoint is provider-only and validates an exact secret-free
     assert.equal(response.statusCode, 200);
     assert.equal(calls.length, 1);
     assert.equal(JSON.stringify(response.json()).includes('token'), false);
+    const staleApp = createApp({
+      authenticator: { async authenticate(request) { request.browserSessionSnapshot = {
+        authenticatedAt: new Date(Date.now() - 10 * 60_000 - 1), csrfDigest: Buffer.alloc(32)
+      } as never; return { principalType: 'human', authMethod: 'oidc-session', id: providerId, accountId: providerId,
+        sessionId: providerId, role: 'provedor', condominioIds: null } as const; } },
+      authRateLimiter: { async check() { return { allowed: true, retryAfterSeconds: 0, repeatedExcess: false }; },
+        async reserveFailure() { return { allowed: true, retryAfterSeconds: 0, repeatedExcess: false,
+          reservationId: providerId }; }, async finalizeFailure() {} },
+      humanAuthRolloutService: { async getPolicies() { return []; }, async setPolicy() { calls.push('stale'); return null; } } as never
+    });
+    const stale = await staleApp.inject({ method: 'PUT', url: '/admin/human-auth/rollout',
+      payload: { condominioId: null, state: 'disabled' } });
+    assert.equal(stale.statusCode, 403);
+    assert.deepEqual(stale.json(), { error: 'reauthentication_required' });
+    assert.equal(calls.length, 2);
+    await staleApp.close();
   } finally { await app.close(); }
 });
 

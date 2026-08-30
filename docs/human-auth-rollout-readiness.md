@@ -129,7 +129,7 @@ curl --fail --silent --show-error "$PUBLIC_APPLICATION_ORIGIN/health"
 curl --fail --silent --show-error "$PUBLIC_APPLICATION_ORIGIN/ready"
 ```
 
-Expected responses are `{"status":"ok"}` and `{"status":"ready"}`. Before promotion, separately prove provider login, MFA role enforcement, recovery webhook acknowledgement, proxy overwrite, direct-port denial, device validation, and public invitation validation.
+Expected responses are `{"status":"ok"}` and `{"status":"ready"}`. With human auth enabled, process startup and readiness require one valid global rollout policy; missing or inconsistent policy prevents startup/readiness with only generic external failure. Human-auth-disabled deployments do not query that policy. Before promotion, separately prove provider login, MFA role enforcement, recovery webhook acknowledgement, proxy overwrite, direct-port denial, device validation, and public invitation validation.
 
 ## Policy command
 
@@ -153,7 +153,7 @@ node dist/src/jobs/set-human-auth-rollout.js \
 
 Scopes are `global` or `tenant:<uuid>`. States are `disabled`, global-only `internal-provider`, `pilot --cohort 10|50|100`, and `enabled`. Unknown, duplicate, missing, or inapplicable arguments fail without a policy change.
 
-The CLI verifies only that the attributed actor UUID belongs to an active externally bound provider; it does not authenticate the operator. For a real rollout, every image command in this runbook must run through a separately authenticated, approved, least-privileged platform job that binds the human operator and change ticket immutably. Until that control and the recent-auth blocker are fixed, neither direct CLI nor browser policy mutation may be used for a real canary.
+Every command also requires `HUMAN_AUTH_ROLLOUT_AUTHORIZATION_TOKEN` as a masked environment secret. A separately authenticated approval job must insert one `HumanAuthDeploymentAuthorization` row using a database identity that can only insert authorizations, never mutate policy. The row binds the exact provider actor, scope, state, cohort and approval reference, expires within ten minutes, and is consumed atomically once. The application role cannot read or mint approvals or directly mutate policy/history; it can only execute the hardened database function. The approver role can only insert approvals and cannot mutate policy. Never place the token in arguments, logs or evidence. Browser policy mutation requires OIDC authentication within ten minutes and sends stale sessions through the existing reauthentication flow.
 
 ## Promotion sequence
 

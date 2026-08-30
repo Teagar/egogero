@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash } from 'node:crypto';
 
 import { Prisma, type PrismaClient } from '@prisma/client';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
@@ -102,74 +102,6 @@ export const TEST_ONLY_ALLOW_ALL_HUMAN_AUTH_ROLLOUT: HumanAuthRolloutGate = Obje
   async gateMembership() { return { allowed: true, reason: 'test_only_bypass' }; }
 });
 
-async function revokeIneligibleSessions(
-  transaction: Prisma.TransactionClient,
-  changedTenantId: string | null
-) {
-  return transaction.$executeRaw(Prisma.sql`
-    WITH effective AS MATERIALIZED (
-      SELECT session.id,
-        membership.role = 'provedor' AS provider,
-        global_policy.state::text AS global_state,
-        global_policy."cohortPercentage" AS global_percentage,
-        global_policy."cohortAlgorithm" AS global_algorithm,
-        tenant_policy.state::text AS tenant_state,
-        tenant_policy."cohortPercentage" AS tenant_percentage,
-        tenant_policy."cohortAlgorithm" AS tenant_algorithm,
-        CASE WHEN membership."condominioId" IS NULL THEN NULL ELSE
-          (get_byte(sha256(convert_to(${HUMAN_AUTH_COHORT_ALGORITHM}, 'UTF8') || decode('00', 'hex')
-            || convert_to(membership."condominioId", 'UTF8')), 0)::bigint * 16777216
-          + get_byte(sha256(convert_to(${HUMAN_AUTH_COHORT_ALGORITHM}, 'UTF8') || decode('00', 'hex')
-            || convert_to(membership."condominioId", 'UTF8')), 1)::bigint * 65536
-          + get_byte(sha256(convert_to(${HUMAN_AUTH_COHORT_ALGORITHM}, 'UTF8') || decode('00', 'hex')
-            || convert_to(membership."condominioId", 'UTF8')), 2)::bigint * 256
-          + get_byte(sha256(convert_to(${HUMAN_AUTH_COHORT_ALGORITHM}, 'UTF8') || decode('00', 'hex')
-            || convert_to(membership."condominioId", 'UTF8')), 3)::bigint) % 100 + 1
-        END AS cohort
-      FROM "BrowserSession" session
-      JOIN "HumanMembership" membership ON membership.id = session."activeMembershipId"
-        AND membership."accountId" = session."accountId"
-      LEFT JOIN "HumanAuthRolloutPolicy" global_policy ON global_policy.scope = 'global'
-      LEFT JOIN "HumanAuthRolloutPolicy" tenant_policy
-        ON tenant_policy.scope = 'tenant:' || membership."condominioId"
-      WHERE session."revokedAt" IS NULL
-        ${changedTenantId ? Prisma.sql`AND membership."condominioId" = ${changedTenantId}` : Prisma.empty}
-    )
-    UPDATE "BrowserSession" session
-    SET "revokedAt" = clock_timestamp(), "revokeReason" = 'human_auth_policy_change'
-    FROM effective
-    WHERE session.id = effective.id
-      AND (
-        (effective.provider AND effective.global_state IN ('internal_provider', 'pilot', 'enabled'))
-        OR (NOT effective.provider
-          AND (effective.global_state = 'enabled' OR (
-            effective.global_state = 'pilot'
-            AND effective.global_algorithm = ${HUMAN_AUTH_COHORT_ALGORITHM}
-            AND effective.global_percentage IN (10, 50, 100)
-            AND effective.cohort <= effective.global_percentage
-          ))
-          AND (effective.tenant_state = 'enabled' OR (
-            effective.tenant_state = 'pilot'
-            AND effective.tenant_algorithm = ${HUMAN_AUTH_COHORT_ALGORITHM}
-            AND effective.tenant_percentage IN (10, 50, 100)
-            AND effective.cohort <= effective.tenant_percentage
-          ))
-        )
-      ) IS NOT TRUE
-  `);
-}
-
-function potentiallyRestrictive(previous: PolicyRow | undefined, state: StoredState, cohortPercentage: number | null) {
-  if (!previous) return state !== 'enabled';
-  if (state === 'disabled') return previous.state !== 'disabled';
-  if (state === 'internal_provider') return !['disabled', 'internal_provider'].includes(previous.state);
-  if (state === 'pilot') {
-    return previous.state === 'enabled'
-      || previous.state === 'pilot' && (previous.cohortPercentage ?? 0) > (cohortPercentage ?? 0);
-  }
-  return false;
-}
-
 export function createHumanAuthRolloutService(client: PrismaClient) {
   const gate: HumanAuthRolloutGate = {
     async preflightGlobal() {
@@ -227,6 +159,20 @@ export function createHumanAuthRolloutService(client: PrismaClient) {
 
   return {
     ...gate,
+    async verifyGlobalPolicy() {
+      const rows = await client.$queryRaw<Array<{ valid: boolean }>>`
+        SELECT scope = 'global' AND "condominioId" IS NULL AND version > 0
+          AND "updatedAt" <= clock_timestamp()
+          AND ("updatedByAccountId" IS NULL OR EXISTS (
+            SELECT 1 FROM "HumanAccount" account WHERE account.id = "updatedByAccountId"
+          ))
+          AND ((state = 'pilot' AND "cohortPercentage" IN (10, 50, 100)
+            AND "cohortAlgorithm" = ${HUMAN_AUTH_COHORT_ALGORITHM})
+            OR (state <> 'pilot' AND "cohortPercentage" IS NULL AND "cohortAlgorithm" IS NULL)) AS valid
+        FROM "HumanAuthRolloutPolicy" WHERE scope = 'global'
+      `;
+      if (rows.length !== 1 || !rows[0]?.valid) throw new Error('Human authentication rollout policy is unavailable');
+    },
     async getPolicies() {
       const rows = await client.$queryRaw<PolicyRow[]>`
         SELECT scope, "condominioId", state::text, "cohortPercentage", "cohortAlgorithm", version, "updatedAt"
@@ -240,6 +186,7 @@ export function createHumanAuthRolloutService(client: PrismaClient) {
       cohortPercentage: number | null;
       actorAccountId: string;
       requestCorrelationId: string;
+      authorization: { kind: 'browser'; sessionId: string } | { kind: 'deployment'; token: string };
     }) {
       const scope = input.condominioId ? `tenant:${input.condominioId}` : 'global';
       const state = storedState(input.state);
@@ -250,56 +197,21 @@ export function createHumanAuthRolloutService(client: PrismaClient) {
           // Serializes first creation because a row lock cannot lock a missing tenant policy.
           await transaction.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${scope}, 170030))`;
         }
-        const actors = await transaction.$queryRaw<Array<{ id: string }>>`
-          SELECT account.id
-          FROM "HumanAccount" account
-          JOIN "HumanMembership" membership ON membership."accountId" = account.id
-            AND membership.role = 'provedor' AND membership.status = 'active'
-          WHERE account.id = ${input.actorAccountId}::uuid AND account.status = 'active'
-            AND EXISTS (SELECT 1 FROM "ExternalIdentity" identity WHERE identity."accountId" = account.id)
-          FOR SHARE OF account, membership
-        `;
-        if (!actors[0]) return null;
-        const existing = await transaction.$queryRaw<PolicyRow[]>(Prisma.sql`
-          SELECT scope, "condominioId", state::text, "cohortPercentage", "cohortAlgorithm", version, "updatedAt"
-          FROM "HumanAuthRolloutPolicy" WHERE scope = ${scope} FOR UPDATE
-        `);
-        if (input.condominioId && existing.length === 0) {
-          const live = await transaction.$queryRaw<Array<{ id: string }>>`
-            SELECT id FROM "Condominio" WHERE id = ${input.condominioId} AND "deletedAt" IS NULL FOR SHARE
-          `;
-          if (!live[0]) return null;
-        }
-        const previous = existing[0];
-        const cohortAlgorithm = state === 'pilot' ? HUMAN_AUTH_COHORT_ALGORITHM : null;
-        const version = (previous?.version ?? 0) + 1;
-        const restrictiveTransition = potentiallyRestrictive(previous, state, input.cohortPercentage);
-        await transaction.$executeRaw(Prisma.sql`
-          INSERT INTO "HumanAuthRolloutPolicy" (
-            scope, "condominioId", state, "cohortPercentage", "cohortAlgorithm", version, "updatedAt", "updatedByAccountId"
-          ) VALUES (
-            ${scope}, ${input.condominioId}, ${state}::"HumanAuthRolloutState", ${input.cohortPercentage},
-            ${cohortAlgorithm}, ${version}, clock_timestamp(), ${input.actorAccountId}::uuid
-          ) ON CONFLICT (scope) DO UPDATE SET state = EXCLUDED.state,
-            "cohortPercentage" = EXCLUDED."cohortPercentage", "cohortAlgorithm" = EXCLUDED."cohortAlgorithm",
-            version = EXCLUDED.version, "updatedAt" = EXCLUDED."updatedAt",
-            "updatedByAccountId" = EXCLUDED."updatedByAccountId"
-        `);
-        const revokedSessions = await revokeIneligibleSessions(transaction, input.condominioId);
-        const rollback = restrictiveTransition || revokedSessions > 0;
-        await transaction.$executeRaw`
-          INSERT INTO "HumanAuthRolloutHistory" (
-            id, scope, "condominioId", "previousState", "previousCohortPercentage", state,
-            "cohortPercentage", "cohortAlgorithm", "policyVersion", "actorAccountId",
-            "requestCorrelationId", rollback, "revokedSessions"
-          ) VALUES (
-            ${randomUUID()}::uuid, ${scope}, ${input.condominioId}, ${previous?.state ?? null}::"HumanAuthRolloutState",
-            ${previous?.cohortPercentage ?? null}, ${state}::"HumanAuthRolloutState", ${input.cohortPercentage},
-            ${cohortAlgorithm}, ${version}, ${input.actorAccountId}::uuid, ${input.requestCorrelationId},
-            ${rollback}, ${revokedSessions}
+        const browserSessionId = input.authorization.kind === 'browser' ? input.authorization.sessionId : null;
+        const deploymentTokenDigest = input.authorization.kind === 'deployment'
+          ? createHash('sha256').update(input.authorization.token, 'utf8').digest() : null;
+        const rows = await transaction.$queryRaw<Array<{ result_scope: string; result_state: StoredState;
+          resultCohortPercentage: number | null; result_version: number; resultRevokedSessions: number }>>(Prisma.sql`
+          SELECT * FROM set_human_auth_rollout_policy(
+            ${scope}, ${state}::"HumanAuthRolloutState", ${input.cohortPercentage}::integer,
+            ${input.actorAccountId}::uuid, ${input.requestCorrelationId},
+            ${browserSessionId}::uuid, ${deploymentTokenDigest}::bytea
           )
-        `;
-        return { scope, state: input.state, cohortPercentage: input.cohortPercentage, version, revokedSessions };
+        `);
+        const result = rows[0];
+        return result ? { scope: result.result_scope, state: publicState(result.result_state),
+          cohortPercentage: result.resultCohortPercentage, version: result.result_version,
+          revokedSessions: result.resultRevokedSessions } : null;
       }, {
         // Rollback may update a large active-session set; queue briefly, then allow one bounded atomic scan/update.
         maxWait: 5_000,
@@ -311,7 +223,7 @@ export function createHumanAuthRolloutService(client: PrismaClient) {
 
 export type HumanAuthRolloutService = ReturnType<typeof createHumanAuthRolloutService>;
 
-function providerActor(identity: AuthenticatedIdentity | null): identity is AuthenticatedIdentity & { accountId: string } {
+function providerActor(identity: AuthenticatedIdentity | null): identity is AuthenticatedIdentity & { accountId: string; sessionId: string } {
   return Boolean(identity && identity.principalType === 'human' && identity.authMethod === 'oidc-session'
     && identity.role === 'provedor' && identity.condominioIds === null);
 }
@@ -354,7 +266,7 @@ export function registerHumanAuthRolloutRoutes(
     }
     const result = await service.setPolicy({ condominioId, state: state as HumanAuthRolloutState,
       cohortPercentage: cohortPercentage as number | null, actorAccountId: actor.accountId,
-      requestCorrelationId: request.id });
-    return result ? reply.send(result) : reply.status(404).send({ error: 'not_found' });
+      requestCorrelationId: request.id, authorization: { kind: 'browser', sessionId: actor.sessionId } });
+    return result ? reply.send(result) : reply.status(403).send({ error: 'reauthentication_required' });
   });
 }

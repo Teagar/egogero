@@ -53,8 +53,26 @@ model HumanAuthRolloutHistory {
   requestCorrelationId     String
   rollback                 Boolean
   revokedSessions          Int                   @default(0)
+  deploymentAuthorizationId String?               @db.Uuid
+  deploymentOperatorIdentifier String?
+  deploymentApprovalReference String?
 
   @@index([scope, createdAt, id])
+}
+
+model HumanAuthDeploymentAuthorization {
+  id                   String                @id @db.Uuid
+  createdAt            DateTime              @default(now()) @db.Timestamptz(3)
+  expiresAt            DateTime              @db.Timestamptz(3)
+  usedAt               DateTime?             @db.Timestamptz(3)
+  tokenDigest          Bytes                 @unique
+  actorAccountId       String                @db.Uuid
+  scope                 String
+  state                 HumanAuthRolloutState
+  cohortPercentage     Int?
+  operatorIdentifier   String
+  approvalReference    String
+  requestCorrelationId String?
 }
 
 enum HumanAuthRolloutState {

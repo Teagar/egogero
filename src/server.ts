@@ -79,6 +79,7 @@ export async function startServer(environment: NodeJS.ProcessEnv = process.env) 
   const humanAuthRolloutService = env.oidc || env.sessions
     ? createHumanAuthRolloutService(prisma)
     : undefined;
+  if (env.humanAuthEnabled) await humanAuthRolloutService!.verifyGlobalPolicy();
   const oidcService = env.oidc
     ? await createOidcService(env.oidc, createPrismaOidcLoginStore(prisma, humanAuthRolloutService!), fetch, {
         rateLimiter: authRateLimiter,
@@ -132,6 +133,9 @@ export async function startServer(environment: NodeJS.ProcessEnv = process.env) 
       requiredServicesComposed: humanServicesComposed,
       async checkDatabase() {
         await prisma.$queryRaw`SELECT 1`;
+      },
+      async checkHumanAuthRolloutPolicy() {
+        await humanAuthRolloutService!.verifyGlobalPolicy();
       }
     }
   });
