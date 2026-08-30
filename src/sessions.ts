@@ -790,6 +790,9 @@ export function createPrismaBrowserSessionStore(
         if (membership) {
           const rollout = await dependencies.rolloutGate.gateMembership(transaction, membership.id, account.id);
           if (!rollout.allowed) {
+            if (rollout.reason === 'policy_inconsistent') {
+              alerts.emit('cross_tenant_access_denied', { reason: rollout.reason, operation: 'session_issue' });
+            }
             await insertAudit(transaction, {
               eventType: 'session_issue_denied', outcome: 'denied', reasonCode: 'rollout_disabled',
               requestCorrelationId: input.requestCorrelationId, accountId: account.id,
@@ -903,6 +906,7 @@ export function createPrismaBrowserSessionStore(
         }
         const creationLimit = await rateLimiter.check('session_creation_account', account.id, true, transaction);
         if (!creationLimit.allowed) {
+          alerts.emit('unusual_session_creation', { operation: 'session_issue', outcome: 'rate_limited' });
           await insertAudit(transaction, {
             eventType: 'session_issue_denied', outcome: 'denied', reasonCode: 'session_creation_rate_limited',
             requestCorrelationId: input.requestCorrelationId, accountId: account.id,
@@ -1263,7 +1267,9 @@ export function createPrismaBrowserSessionStore(
         });
         return 'revoked';
       });
-      metrics.observe('auth_session_revocation_seconds', (performance.now() - startedAt) / 1000, { operation: 'current', outcome: result });
+      const revocationSeconds = (performance.now() - startedAt) / 1000;
+      metrics.observe('auth_session_revocation_seconds', revocationSeconds, { operation: 'current', outcome: result });
+      if (revocationSeconds > 5) alerts.emit('session_revocation_slo', { operation: 'current', thresholdSeconds: 5 });
       if (result === 'revoked') metrics.increment('auth_database_writes_total', { operation: 'session_revoke', outcome: 'success' });
       return result;
     },

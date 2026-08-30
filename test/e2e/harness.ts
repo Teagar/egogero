@@ -46,9 +46,9 @@ type AuthorizationCode = {
 
 function assertIsolatedDatabase() {
   const url = new URL(DATABASE_URL);
-  if (url.protocol !== 'postgresql:' || url.hostname !== '127.0.0.1' || url.port !== '5432'
+  if (url.protocol !== 'postgresql:' || url.hostname !== '127.0.0.1' || !/^\d+$/.test(url.port)
     || url.pathname !== '/office_pc31_e2e' || url.searchParams.get('schema') !== 'public') {
-    throw new Error('E2E reset refused: DATABASE_URL must target the isolated office_pc31_e2e database');
+    throw new Error('E2E reset refused: DATABASE_URL must target the isolated loopback office_pc31_e2e database');
   }
 }
 

@@ -20,6 +20,7 @@
     "delivery:worker": "node dist/src/jobs/deliver-invitations.js",
     "auth:rollout": "tsx src/jobs/set-human-auth-rollout.ts",
     "auth:rotation:rehearse": "node scripts/rehearse-auth-key-rotation.mjs",
+    "auth:alerts:smoke": "tsx src/auth-alert-smoke.ts",
     "auth:rollout:evaluate": "tsx src/auth-rollout.ts"
   },
   "dependencies": {

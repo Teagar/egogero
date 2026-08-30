@@ -1,4 +1,3 @@
-import { randomUUID } from 'node:crypto';
 import { constants } from 'node:fs';
 import { open } from 'node:fs/promises';
 import { performance } from 'node:perf_hooks';
@@ -35,7 +34,11 @@ export type AuthAlertType =
   | 'oidc_replay_or_state_miss'
   | 'oidc_issuer_mixup'
   | 'oidc_callback_success_slo'
-  | 'session_lookup_latency_slo';
+  | 'session_lookup_latency_slo'
+  | 'cross_tenant_access_denied'
+  | 'provider_configuration_drift'
+  | 'session_revocation_slo'
+  | 'unusual_session_creation';
 
 export interface AuthAlertSink {
   emit(type: AuthAlertType, details: Readonly<Record<string, unknown>>): void | Promise<void>;
@@ -110,13 +113,18 @@ export const DEFAULT_AUTH_ALERT_ROUTES: AuthAlertRoutingConfig = {
   oidc_replay_or_state_miss: ['security', 'identity'],
   oidc_issuer_mixup: ['security', 'identity'],
   oidc_callback_success_slo: ['identity'],
-  session_lookup_latency_slo: ['database', 'identity']
+  session_lookup_latency_slo: ['database', 'identity'],
+  cross_tenant_access_denied: ['security'],
+  provider_configuration_drift: ['security', 'identity'],
+  session_revocation_slo: ['security', 'identity'],
+  unusual_session_creation: ['security', 'abuse']
 };
 
 const AUTH_ALERT_TYPES: readonly AuthAlertType[] = [
   'rate_limit_repeated_excess', 'crypto_integrity_failure', 'crypto_key_failure',
   'oidc_replay_or_state_miss', 'oidc_issuer_mixup', 'oidc_callback_success_slo',
-  'session_lookup_latency_slo'
+  'session_lookup_latency_slo', 'cross_tenant_access_denied', 'provider_configuration_drift',
+  'session_revocation_slo', 'unusual_session_creation'
 ];
 const AUTH_ALERT_ROUTES = new Set<AuthAlertRoute>(['security', 'identity', 'abuse', 'database']);
 
@@ -277,7 +285,8 @@ export type StructuredAuthTelemetry = {
 };
 
 const CRITICAL_ALERTS = new Set<AuthAlertType>([
-  'crypto_integrity_failure', 'crypto_key_failure', 'oidc_replay_or_state_miss', 'oidc_issuer_mixup'
+  'crypto_integrity_failure', 'crypto_key_failure', 'oidc_replay_or_state_miss', 'oidc_issuer_mixup',
+  'cross_tenant_access_denied', 'provider_configuration_drift', 'session_revocation_slo', 'unusual_session_creation'
 ]);
 const DIMENSIONS: Record<AuthMetricName, Readonly<Record<string, readonly string[]>>> = {
   auth_oidc_callback_total: { outcome: ['success', 'failure'], reason: ['none', 'state', 'issuer', 'crypto', 'account', 'validation'] },
@@ -321,16 +330,21 @@ export function createAuthSnapshotStdoutSink(stream: NodeJS.WriteStream = proces
   };
 }
 
-export function createAuthSnapshotFileSink(path: string): AuthSnapshotSink {
+export function createAuthSnapshotFileSink(path: string, options: { maxBytes?: number } = {}): AuthSnapshotSink {
+  const maxBytes = options.maxBytes ?? 32 * 1_024 * 1_024;
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 1) throw new Error('Invalid auth snapshot sink limit');
   let writes = Promise.resolve();
   return (snapshot) => {
     writes = writes.catch(() => {}).then(async () => {
-      const handle = await open(path,
-        constants.O_APPEND | constants.O_CREAT | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
+      const encoded = Buffer.from(`${JSON.stringify(snapshot)}\n`, 'utf8');
+      const handle = await open(path, constants.O_APPEND | constants.O_CREAT | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
       try {
         const metadata = await handle.stat();
-        if ((metadata.mode & 0o077) !== 0) await handle.chmod(0o600);
-        await handle.appendFile(`${JSON.stringify(snapshot)}\n`, 'utf8');
+        if (!metadata.isFile()) throw new Error('Auth snapshot sink must be a regular file');
+        if ((metadata.mode & 0o777) !== 0o600) await handle.chmod(0o600);
+        if (metadata.size > maxBytes - encoded.length) throw new Error('Auth snapshot sink limit exceeded');
+        await handle.write(encoded);
+        await handle.sync();
       } finally {
         await handle.close();
       }
@@ -339,19 +353,37 @@ export function createAuthSnapshotFileSink(path: string): AuthSnapshotSink {
   };
 }
 
+export async function prepareAuthSnapshotFile(path: string, maxBytes = 32 * 1_024 * 1_024) {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 1) throw new Error('Invalid auth snapshot sink limit');
+  const handle = await open(path, constants.O_APPEND | constants.O_CREAT | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
+  try {
+    const metadata = await handle.stat();
+    if (!metadata.isFile()) throw new Error('Auth snapshot sink must be a regular file');
+    if (metadata.size > maxBytes) throw new Error('Auth snapshot sink limit exceeded');
+    if ((metadata.mode & 0o777) !== 0o600) await handle.chmod(0o600);
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+
 export function createStructuredAuthTelemetry(
   sink: AuthSnapshotSink = createAuthSnapshotStdoutSink(),
   options: {
-    instanceId?: string;
+    instanceId: string;
+    stageId: string;
     now?: () => number;
     monotonicNow?: () => number;
     maxClockDriftMs?: number;
     sinkTimeoutMs?: number;
-  } = {}
+  }
 ): StructuredAuthTelemetry {
-  const instanceId = options.instanceId ?? randomUUID();
+  const { instanceId, stageId } = options;
   if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(instanceId)) {
-    throw new Error('Auth telemetry instanceId must be a non-sensitive UUID v4');
+    throw new Error('Auth telemetry instanceId must be an injected non-sensitive UUID v4');
+  }
+  if (!/^(?:staging|production):[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?$/.test(stageId)) {
+    throw new Error('Auth telemetry stageId must be an injected bounded deployment stage');
   }
   const now = options.now ?? Date.now;
   const monotonicNow = options.monotonicNow ?? (options.now ? now : performance.now.bind(performance));
@@ -518,6 +550,7 @@ export function createStructuredAuthTelemetry(
         contract: AUTH_ROLLOUT_CONTRACT,
         interval: { start: new Date(intervalStart).toISOString(), end: new Date(end).toISOString() },
         instanceId,
+        stageId,
         sequence: sequence += 1,
         counters: [...counters.values()],
         histograms: [...histograms.values()].map((histogram): AuthRolloutHistogram => ({

@@ -843,6 +843,7 @@ export async function createOidcService(
     await keySet.reload();
     validateJwksDocument(config, keySet.jwks());
   } catch {
+    alerts.emit('provider_configuration_drift', { operation: 'oidc_initialization', outcome: 'contract_mismatch' });
     alerts.emit('crypto_key_failure', { operation: 'oidc_initialization' });
     try {
       await store.appendAudit({

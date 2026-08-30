@@ -52,11 +52,37 @@ function validateDeploymentSecret(value: string | undefined, name: string) {
 const DEFAULT_AUTH_ALERT_TIMEOUT_MS = 5_000;
 
 export type AuthAlertEnvironmentConfig =
-  | { adapter: 'stdout'; timeoutMs: number }
-  | { adapter: 'https_webhook'; timeoutMs: number; url: string };
+  | { adapter: 'stdout'; timeoutMs: number; rolloutMode: 'off'; instanceId: string; stageId: string; snapshotPath?: string }
+  | { adapter: 'https_webhook'; timeoutMs: number; rolloutMode: 'off' | 'canary'; url: string; instanceId: string; stageId: string; snapshotPath?: string };
 
 export function authAlertConfigFromEnvironment(environment: NodeJS.ProcessEnv): AuthAlertEnvironmentConfig {
   const adapter = environment.AUTH_ALERT_ADAPTER ?? 'stdout';
+  const instanceId = environment.AUTH_ROLLOUT_INSTANCE_ID ?? '00000000-0000-4000-8000-000000000000';
+  const stageId = environment.AUTH_ROLLOUT_STAGE_ID ?? 'staging:non-canary';
+  const snapshotPath = environment.AUTH_ROLLOUT_SNAPSHOT_PATH;
+  const rawRolloutMode = environment.AUTH_ROLLOUT_MODE ?? 'off';
+  if (rawRolloutMode !== 'off' && rawRolloutMode !== 'canary') throw new Error('AUTH_ROLLOUT_MODE must be off or canary');
+  const rolloutMode: 'off' | 'canary' = rawRolloutMode;
+  if (rolloutMode === 'off' && ['AUTH_ROLLOUT_INSTANCE_ID', 'AUTH_ROLLOUT_STAGE_ID',
+    'AUTH_ROLLOUT_SNAPSHOT_PATH', 'AUTH_ALERT_SMOKE_ACK_ID'].some((name) => environment[name] !== undefined)) {
+    throw new Error('Canary rollout identity, snapshot, and acknowledgement variables require AUTH_ROLLOUT_MODE=canary');
+  }
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(instanceId)) {
+    throw new Error('AUTH_ROLLOUT_INSTANCE_ID must be an injected UUID v4');
+  }
+  if (!stageId || !/^(?:staging|production):[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?$/.test(stageId)) {
+    throw new Error('AUTH_ROLLOUT_STAGE_ID must identify a bounded staging or production partition');
+  }
+  if (snapshotPath !== undefined && (!snapshotPath.startsWith('/') || snapshotPath.includes('\0'))) {
+    throw new Error('AUTH_ROLLOUT_SNAPSHOT_PATH must be an absolute path');
+  }
+  if (rolloutMode === 'canary' && (adapter !== 'https_webhook' || !environment.AUTH_ALERT_SMOKE_ACK_ID
+    || !/^[A-Za-z0-9._-]{8,128}$/.test(environment.AUTH_ALERT_SMOKE_ACK_ID) || !snapshotPath
+    || instanceId === '00000000-0000-4000-8000-000000000000' || stageId.endsWith(':non-canary')
+    || environment.AUTH_ROLLOUT_INSTANCE_ID === undefined
+    || environment.AUTH_ROLLOUT_STAGE_ID === undefined)) {
+    throw new Error('Canary requires HTTPS alerts, acknowledged smoke evidence, durable snapshots, instance ID, and stage ID');
+  }
   const timeoutMs = Number(environment.AUTH_ALERT_TIMEOUT_MS ?? DEFAULT_AUTH_ALERT_TIMEOUT_MS);
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 100 || timeoutMs > 10_000) {
     throw new Error('AUTH_ALERT_TIMEOUT_MS must be an integer between 100 and 10000');
@@ -65,7 +91,7 @@ export function authAlertConfigFromEnvironment(environment: NodeJS.ProcessEnv): 
     if (environment.AUTH_ALERT_WEBHOOK_URL !== undefined) {
       throw new Error('AUTH_ALERT_WEBHOOK_URL is only valid with AUTH_ALERT_ADAPTER=https_webhook');
     }
-    return { adapter, timeoutMs };
+    return { adapter, timeoutMs, rolloutMode: 'off', instanceId, stageId, snapshotPath };
   }
   if (adapter !== 'https_webhook') {
     throw new Error('AUTH_ALERT_ADAPTER must be stdout or https_webhook');
@@ -77,7 +103,7 @@ export function authAlertConfigFromEnvironment(environment: NodeJS.ProcessEnv): 
   if (url.protocol !== 'https:' || !url.hostname || url.username || url.password || url.search || url.hash) {
     throw new Error('AUTH_ALERT_WEBHOOK_URL must be HTTPS without credentials, query, or fragment');
   }
-  return { adapter, timeoutMs, url: url.toString() };
+  return { adapter, timeoutMs, rolloutMode, url: url.toString(), instanceId, stageId, snapshotPath };
 }
 
 export function normalizePublicValidationBaseUrl(value: string) {
@@ -181,6 +207,11 @@ export function getEnv(environment: NodeJS.ProcessEnv = process.env) {
   }
   assertDistinctSecretMaterial(secretDomains);
 
+  const authAlerts = authAlertConfigFromEnvironment(environment);
+  if (authAlerts.rolloutMode === 'canary' && !humanAuthEnabled) {
+    throw new Error('AUTH_ROLLOUT_MODE=canary requires HUMAN_AUTH_ENABLED=true');
+  }
+
   return {
     nodeEnvironment,
     humanAuthEnabled,
@@ -194,7 +225,7 @@ export function getEnv(environment: NodeJS.ProcessEnv = process.env) {
     host: environment.HOST ?? (environment.LOCAL_DEVELOPMENT_AUTH === 'true' ? '127.0.0.1' : '0.0.0.0'),
     localDevelopmentAuth: environment.LOCAL_DEVELOPMENT_AUTH === 'true',
     secureValidationTransport: deployed,
-    authAlerts: authAlertConfigFromEnvironment(environment),
+    authAlerts,
     trustProxy,
     oidc,
     sessions,

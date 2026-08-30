@@ -154,7 +154,9 @@ test('aggregate observer emits callback and session SLO alerts with bounded deta
 
 test('structured telemetry periodically evaluates bounded aggregates and stops with Fastify', async () => {
   const records: Parameters<AuthSnapshotSink>[0][] = [];
-  const telemetry = createStructuredAuthTelemetry((record) => { records.push(record); });
+  const telemetry = createStructuredAuthTelemetry((record) => { records.push(record); }, {
+    instanceId: '00000000-0000-4000-8000-000000000011', stageId: 'staging:test'
+  });
   const app = createApp();
   const timer = registerAuthTelemetryLifecycle(app, telemetry, 10);
   assert.equal(timer.hasRef(), false);

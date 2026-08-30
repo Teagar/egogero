@@ -37,12 +37,17 @@ variables:
   AUTH_ALERT_WEBHOOK_URL: { required_when: AUTH_ALERT_ADAPTER=https_webhook, secret: false, format: credential-free-https-url }
   AUTH_ALERT_TIMEOUT_MS: { required: false, secret: false, range: [100, 10000] }
   HUMAN_AUTH_ROLLOUT_AUTHORIZATION_TOKEN: { required_for_job: auth:rollout, secret: true, format: single-use-random-token }
+  AUTH_ROLLOUT_MODE: { required: false, secret: false, allowed: [off, canary], default: off }
+  AUTH_ROLLOUT_INSTANCE_ID: { required_when: AUTH_ROLLOUT_MODE=canary, secret: false, format: uuid-v4 }
+  AUTH_ROLLOUT_STAGE_ID: { required_when: AUTH_ROLLOUT_MODE=canary, secret: false, format: staging-or-production-colon-partition }
+  AUTH_ROLLOUT_SNAPSHOT_PATH: { required_when: AUTH_ROLLOUT_MODE=canary, secret: false, format: absolute-protected-durable-jsonl-path }
+  AUTH_ALERT_SMOKE_ACK_ID: { required_when: AUTH_ROLLOUT_MODE=canary, secret: false, format: external-acknowledgement-id }
 disabled_human_auth:
   must_be_absent: [PUBLIC_APPLICATION_ORIGIN, OIDC_ISSUER, OIDC_AUTHORIZATION_ENDPOINT, OIDC_TOKEN_ENDPOINT, OIDC_JWKS_URI, OIDC_CLIENT_ID, OIDC_CLIENT_SECRET, OIDC_REDIRECT_URI, OIDC_ID_TOKEN_SIGNING_ALG, OIDC_PKCE_KEYS, OIDC_PKCE_CURRENT_KEY_VERSION, OIDC_RETURN_TO_PREFIXES, OIDC_FAILURE_PATH, SESSION_CSRF_KEYS, SESSION_CSRF_CURRENT_KEY_VERSION, HUMAN_MFA_ROLE_POLICY, OIDC_RECOVERY_URL, RECOVERY_WEBHOOK_ISSUERS, RECOVERY_WEBHOOK_SECRET]
   may_remain: [TRUST_PROXY, AUTH_ALERT_ADAPTER, AUTH_ALERT_TIMEOUT_MS]
   conditional: [AUTH_ALERT_WEBHOOK_URL requires AUTH_ALERT_ADAPTER=https_webhook]
 rollout_preflight:
-  require: [AUTH_ALERT_ADAPTER=https_webhook, externally-acknowledged-route-smoke-test]
+  require: [HUMAN_AUTH_ENABLED=true, AUTH_ROLLOUT_MODE=canary, AUTH_ALERT_ADAPTER=https_webhook, AUTH_ALERT_SMOKE_ACK_ID, AUTH_ROLLOUT_INSTANCE_ID, AUTH_ROLLOUT_STAGE_ID, AUTH_ROLLOUT_SNAPSHOT_PATH, auth:alerts:smoke=acknowledged]
 secret_domain_rules:
   effective_bytes: { application_oidc_webhook: utf8, pkce_csrf: canonical-base64url-decoded }
   pairwise_reuse: forbidden
