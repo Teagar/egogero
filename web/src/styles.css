@@ -19,10 +19,13 @@
   --line-dark: rgba(255, 255, 255, 0.14);
   --on-dark: #ffffff;
   --success: #1f7a52;
+  --success-text: #17613f;
   --success-tint: #dcece5;
   --warning: #a66a00;
+  --warning-text: #754900;
   --warning-tint: #f8ebcf;
   --danger: #b8352a;
+  --danger-text: #9d2b23;
   --danger-tint: #f5deda;
   --font-display: 'Big Shoulders Display', sans-serif;
   --font-body: 'Public Sans', sans-serif;
@@ -293,7 +296,11 @@ caption,
 .status.success {
   border-color: var(--success);
   background: var(--success-tint);
-  color: var(--success);
+  color: var(--success-text);
+}
+
+.status.success::before {
+  background: var(--success);
 }
 
 .status.info {
@@ -305,13 +312,21 @@ caption,
 .status.warning {
   border-color: var(--warning);
   background: var(--warning-tint);
-  color: var(--warning);
+  color: var(--warning-text);
+}
+
+.status.warning::before {
+  background: var(--warning);
 }
 
 .status.danger {
   border-color: var(--danger);
   background: var(--danger-tint);
-  color: var(--danger);
+  color: var(--danger-text);
+}
+
+.status.danger::before {
+  background: var(--danger);
 }
 
 .notice {
@@ -465,6 +480,9 @@ caption,
 }
 
 .auth-help a {
+  display: inline-flex;
+  min-height: 44px;
+  align-items: center;
   text-transform: none;
 }
 
@@ -1082,6 +1100,7 @@ td {
   }
 
   table,
+  caption,
   thead,
   tbody,
   tr,
@@ -1089,6 +1108,10 @@ td {
   td {
     display: block;
     width: 100%;
+  }
+
+  caption {
+    min-width: 100%;
   }
 
   thead {
