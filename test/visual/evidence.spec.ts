@@ -53,6 +53,7 @@ test.describe('sanitized REV. 07 visual evidence', () => {
       await expect(heading).toBeVisible();
       expect(unexpectedRequests).toEqual([]);
       await assertResponsiveLayout(page, surface.state);
+      await assertSingleSignalCta(page, surface.state);
       await assertReducedMotion(page);
       await assertWcagTokenContrast(page);
       await assertSanitized(page, requestedUrls);
@@ -165,6 +166,28 @@ async function assertKeyboardFocus(page: Page) {
   expect(Number.parseFloat(focus!.outlineWidth)).toBeGreaterThanOrEqual(3);
   expect(focus!.bottom).toBeGreaterThan(0);
   expect(focus!.top).toBeLessThan(page.viewportSize()!.height);
+}
+
+async function assertSingleSignalCta(page: Page, state: Surface['state']) {
+  if (state !== 'sindico' && state !== 'morador') return;
+  const priorities = await page.evaluate(() => {
+    const signal = getComputedStyle(document.documentElement).getPropertyValue('--signal').trim();
+    const signalRgb = (() => {
+      const channels = signal.match(/[a-f\d]{2}/gi)!.map((channel) => Number.parseInt(channel, 16));
+      return `rgb(${channels.join(', ')})`;
+    })();
+    const isSignal = (element: Element) => getComputedStyle(element).backgroundColor === signalRgb;
+    const priorityActions = [...document.querySelectorAll('.page-content .panel.signal .form-grid > button')]
+      .filter(isSignal)
+      .map((element) => element.textContent?.trim());
+    const auxiliaryActions = [...document.querySelectorAll('.page-content > .split > .panel:not(.signal) .form-grid > button')]
+      .map((element) => ({ signal: isSignal(element), minHeight: getComputedStyle(element).minHeight }));
+    return { priorityActions, auxiliaryActions };
+  });
+  expect(priorities.priorityActions).toHaveLength(1);
+  expect(priorities.auxiliaryActions).toEqual([{ signal: false, minHeight: '44px' }]);
+  await expect(page.locator('.page-title')).toBeFocused();
+  await expect(page.locator('.page-title')).toHaveCSS('outline-style', 'none');
 }
 
 async function assertReducedMotion(page: Page) {

@@ -208,11 +208,13 @@ describe('application transitions', () => {
     expect(container.textContent).toContain('Condomínios');
     expect(container.textContent).not.toContain('Entrar na plataforma');
     expect(document.activeElement?.textContent).toBe('Operações da rede');
+    expect(document.activeElement?.classList.contains('page-title')).toBe(true);
 
     const contextNavigation = [...container.querySelectorAll('button')]
       .find((button) => button.textContent?.trim() === '02Contexto')!;
     await act(async () => contextNavigation.click());
     expect(document.activeElement?.textContent).toBe('Trocar contexto');
+    expect(document.activeElement?.classList.contains('page-title')).toBe(true);
   });
 
   it('starts an invalid or missing invitation as unavailable without a continue action', async () => {

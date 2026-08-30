@@ -160,6 +160,11 @@ h1 {
   font-size: clamp(42px, 7vw, 72px);
 }
 
+/* Page titles receive programmatic focus for announcements, not as actions. */
+.page-title:focus {
+  outline: none;
+}
+
 h2 {
   margin: 0 0 var(--s-3);
   font-size: clamp(28px, 4vw, var(--fib-3));
@@ -258,6 +263,19 @@ caption,
 
 .secondary:hover {
   background: var(--ink);
+  color: var(--on-dark);
+}
+
+/* Registration is secondary to issuing an operational access credential. */
+.page-content > .split > .panel:not(.signal) .form-grid > .primary {
+  border-color: var(--blueprint);
+  background: transparent;
+  color: var(--blueprint);
+}
+
+.page-content > .split > .panel:not(.signal) .form-grid > .primary:hover {
+  border-color: var(--blueprint-deep);
+  background: var(--blueprint-deep);
   color: var(--on-dark);
 }
 
