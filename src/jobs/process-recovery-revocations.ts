@@ -235,12 +235,14 @@ export async function runRecoveryBatch(input: {
   config: RecoveryWorkerConfig;
   random?: () => number;
 }) {
+  await alertOverdueRecoveryRevocations(input.client, input.alerts);
   const claims = await claimRecoveryRevocations(input.client, {
     workerId: input.workerId, batchSize: input.config.batchSize,
     leaseMs: input.config.leaseMs, maxAttempts: input.config.maxAttempts
   });
-  const outcomes = [];
-  for (const claim of claims) outcomes.push(await processRecoveryClaim(input.client, input.adapter, claim, input.config, input.random));
+  const outcomes = await Promise.all(
+    claims.map((claim) => processRecoveryClaim(input.client, input.adapter, claim, input.config, input.random))
+  );
   await alertOverdueRecoveryRevocations(input.client, input.alerts);
   return outcomes;
 }
