@@ -104,6 +104,53 @@ describe('visitor invitations', () => {
 });
 
 describe('application transitions', () => {
+  it('keeps identity, condominium, role, and equivalent navigation explicit across the shell', async () => {
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      if (String(input) === '/auth/session') return new Response(JSON.stringify(oldSession), { status: 200 });
+      if (String(input) === '/condominios') return new Response(JSON.stringify([]), { status: 200 });
+      throw new Error(`Unexpected request: ${String(input)}`);
+    });
+    const container = await renderApp('/app');
+    const topbar = container.querySelector('header.topbar')!;
+    expect(topbar.textContent).toContain('Pessoa');
+    expect(topbar.textContent).toContain('Todos os condomínios');
+    expect(topbar.textContent).toContain('Provedor');
+
+    const desktopDestinations = [...container.querySelectorAll('.sidebar [data-destination]')]
+      .map((item) => item.getAttribute('data-destination'));
+    const mobileDestinations = [...container.querySelectorAll('.mobile-nav [data-destination]')]
+      .map((item) => item.getAttribute('data-destination'));
+    expect(mobileDestinations).toEqual(desktopDestinations);
+
+    const contextNavigation = container.querySelector<HTMLButtonElement>('.sidebar [data-destination="context"]')!;
+    await act(async () => contextNavigation.click());
+    const activeContext = container.querySelector<HTMLButtonElement>('.context-card[aria-pressed="true"]')!;
+    expect(activeContext.textContent).toContain('Rede global');
+    expect(activeContext.textContent).toContain('Ativo nesta sessão');
+  });
+
+  it('offers only OIDC entry and handles an account without active memberships safely', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch');
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ error: 'authentication_required' }), { status: 401 }));
+    let container = await renderApp('/app');
+    expect(container.textContent).toContain('Continuar com identidade corporativa');
+    expect(container.querySelector('input[type="password"]')).toBeNull();
+
+    await act(async () => root?.unmount());
+    root = null;
+    document.body.replaceChildren();
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({
+      ...oldSession,
+      memberships: [],
+      activeMembershipId: '',
+      activeTenantId: null
+    }), { status: 200 }));
+    container = await renderApp('/app');
+    expect(container.textContent).toContain('Contexto indisponível');
+    expect(container.textContent).toContain('Verificar novamente');
+    expect(container.querySelector('input[type="password"]')).toBeNull();
+  });
+
   it.each(['500', 'network'] as const)('never restores the old role after a successful rotation and %s bootstrap failure', async (failure) => {
     let sessionCalls = 0;
     let settleBootstrap!: () => void;
@@ -160,7 +207,7 @@ describe('application transitions', () => {
     const container = await renderApp('/login');
     expect(container.textContent).toContain('Condomínios');
     expect(container.textContent).not.toContain('Entrar na plataforma');
-    expect(document.activeElement?.textContent).toBe('Condomínios');
+    expect(document.activeElement?.textContent).toBe('Operações da rede');
 
     const contextNavigation = [...container.querySelectorAll('button')]
       .find((button) => button.textContent?.trim() === '02Contexto')!;
