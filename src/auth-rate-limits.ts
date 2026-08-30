@@ -6,21 +6,45 @@ import { noopAuthAlerts, noopAuthMetrics, safeAuthAlerts, safeAuthMetrics } from
 import type { AuthAlertSink, AuthMetrics } from './auth-observability.js';
 
 export const AUTH_RATE_LIMIT_POLICIES = {
-  login_ip: { limit: 5, windowMs: 10 * 60_000 },
-  callback_failure_ip: { limit: 10, windowMs: 15 * 60_000 },
-  session_creation_account: { limit: 10, windowMs: 15 * 60_000, backoffMs: 15 * 60_000 },
-  recovery_ip: { limit: 3, windowMs: 30 * 60_000 },
-  reauthentication_account: { limit: 5, windowMs: 10 * 60_000 },
-  human_validation_account: { limit: 20, windowMs: 60_000 },
-  authentication_failure_ip: { limit: 60, windowMs: 60_000 }
+  login_ip: { limit: 5, windowMs: 10 * 60_000, operation: 'Login initiation', dimension: 'IP prefix', behavior: 'Generic 429; bounded Retry-After' },
+  callback_failure_ip: { limit: 10, windowMs: 15 * 60_000, operation: 'Failed OIDC callback', dimension: 'IP prefix', behavior: 'Consume state before provider exchange; reserve failure budget' },
+  session_creation_account: { limit: 10, windowMs: 15 * 60_000, backoffMs: 15 * 60_000, operation: 'Session creation or rotation', dimension: 'Account', behavior: 'Deny; progressive backoff; repeated-excess alert' },
+  recovery_ip: { limit: 3, windowMs: 30 * 60_000, operation: 'Recovery initiation', dimension: 'IP prefix', behavior: 'Generic 429; no account signal' },
+  reauthentication_account: { limit: 5, windowMs: 10 * 60_000, operation: 'Reauthentication initiation', dimension: 'Account', behavior: 'Generic 429 after authenticated validation' },
+  invitation_acceptance_ip: { limit: 10, windowMs: 60 * 60_000, backoffMs: 60_000, operation: 'Administrative invitation acceptance', dimension: 'IP prefix', behavior: 'Generic denial; exponential backoff; repeated-excess alert' },
+  invitation_acceptance_digest: { limit: 5, windowMs: 60 * 60_000, backoffMs: 60_000, operation: 'Administrative invitation acceptance', dimension: 'Invitation digest', behavior: 'Generic denial; exponential backoff; repeated-excess alert' },
+  human_validation_account: { limit: 20, windowMs: 60_000, operation: 'Human gate validation', dimension: 'Account', behavior: 'Generic 429 after authenticated validation' },
+  authentication_failure_ip: { limit: 60, windowMs: 60_000, operation: 'CSRF or authentication failure', dimension: 'IP prefix', behavior: 'Generic 429 on sustained abuse' }
 } as const;
 
 export type AuthRateLimitAction = keyof typeof AUTH_RATE_LIMIT_POLICIES;
-export type AuthFailureRateLimitAction = Extract<AuthRateLimitAction, 'callback_failure_ip' | 'authentication_failure_ip'>;
+export type AuthReservationRateLimitAction = Extract<AuthRateLimitAction,
+  'callback_failure_ip' | 'authentication_failure_ip' | 'invitation_acceptance_ip' | 'invitation_acceptance_digest'>;
 export type AuthRateLimitDecision = { allowed: boolean; retryAfterSeconds: number; repeatedExcess: boolean };
 export type AuthRateLimitReservation =
   | { allowed: true; retryAfterSeconds: 0; repeatedExcess: false; reservationId: string }
   | { allowed: false; retryAfterSeconds: number; repeatedExcess: boolean; reservationId?: never };
+
+function policyWindow(windowMs: number) {
+  if (windowMs % 3_600_000 === 0) {
+    const hours = windowMs / 3_600_000;
+    return `${hours} ${hours === 1 ? 'hour' : 'hours'}`;
+  }
+  if (windowMs % 60_000 === 0) {
+    const minutes = windowMs / 60_000;
+    return `${minutes} ${minutes === 1 ? 'minute' : 'minutes'}`;
+  }
+  const seconds = windowMs / 1000;
+  return `${seconds} ${seconds === 1 ? 'second' : 'seconds'}`;
+}
+
+export const AUTH_RATE_LIMIT_POLICY_TABLE = [
+  '| Operation | Dimension | Limit | External behavior |',
+  '| --- | --- | --- | --- |',
+  ...Object.values(AUTH_RATE_LIMIT_POLICIES).map((policy) =>
+    `| ${policy.operation} | ${policy.dimension} | ${policy.limit} per ${policyWindow(policy.windowMs)} | ${policy.behavior} |`
+  )
+].join('\n');
 
 export interface AuthRateLimiter {
   check(
@@ -29,8 +53,8 @@ export interface AuthRateLimiter {
     consume?: boolean,
     transaction?: Prisma.TransactionClient
   ): Promise<AuthRateLimitDecision>;
-  reserveFailure(action: AuthFailureRateLimitAction, subject: string): Promise<AuthRateLimitReservation>;
-  finalizeFailure(reservationId: string, outcome: 'success' | 'failure'): Promise<void>;
+  reserve(action: AuthReservationRateLimitAction, subject: string): Promise<AuthRateLimitReservation>;
+  finalize(reservationId: string, outcome: 'consume' | 'release'): Promise<void>;
   cleanup?(): Promise<number>;
 }
 
@@ -111,7 +135,7 @@ export function createPrismaAuthRateLimiter(
       observeDecision(action, decision);
       return decision;
     },
-    async reserveFailure(action, rawSubject) {
+    async reserve(action, rawSubject) {
       const policy = AUTH_RATE_LIMIT_POLICIES[action];
       const subject = boundedSubject(rawSubject);
       const reservationId = randomUUID();
@@ -156,15 +180,22 @@ export function createPrismaAuthRateLimiter(
         }
         const blocked = row.blockedUntil !== null && row.blockedUntil > row.databaseNow;
         if (blocked || row.count + row.reservedCount >= policy.limit) {
-          const denied = await transaction.$queryRaw<Array<{ deniedCount: number }>>(Prisma.sql`
+          const denied = await transaction.$queryRaw<Array<{ deniedCount: number; blockedUntil: Date | null }>>(Prisma.sql`
             UPDATE "AuthenticationRateLimit"
-            SET "deniedCount" = "deniedCount" + 1, "updatedAt" = clock_timestamp()
+            SET "deniedCount" = "deniedCount" + 1,
+                "blockedUntil" = CASE WHEN ${'backoffMs' in policy ? policy.backoffMs : 0} > 0
+                  THEN LEAST(
+                    "windowStartedAt" + (${policy.windowMs} * interval '1 millisecond'),
+                    clock_timestamp() + (POWER(2, LEAST(4, "deniedCount"))
+                      * ${'backoffMs' in policy ? policy.backoffMs : 0} * interval '1 millisecond')
+                  ) ELSE "blockedUntil" END,
+                "updatedAt" = clock_timestamp()
             WHERE action = ${action} AND subject = ${subject}
-            RETURNING "deniedCount"
+            RETURNING "deniedCount", "blockedUntil"
           `);
           const retryAt = Math.max(
             row.windowStartedAt.getTime() + policy.windowMs,
-            row.blockedUntil?.getTime() ?? 0
+            denied[0]!.blockedUntil?.getTime() ?? 0
           );
           return {
             allowed: false,
@@ -187,7 +218,7 @@ export function createPrismaAuthRateLimiter(
       observeDecision(action, result);
       return result;
     },
-    async finalizeFailure(reservationId, outcome) {
+    async finalize(reservationId, outcome) {
       await client.$transaction(async (transaction) => {
         const reservations = await transaction.$queryRaw<Array<{
           action: string;
@@ -214,24 +245,49 @@ export function createPrismaAuthRateLimiter(
           RETURNING id
         `);
         if (!deleted[0]) return;
-        const policy = AUTH_RATE_LIMIT_POLICIES[reservation.action as AuthFailureRateLimitAction];
-        const failureInCurrentWindow = policy !== undefined && outcome === 'failure'
+        const policy = AUTH_RATE_LIMIT_POLICIES[reservation.action as AuthReservationRateLimitAction];
+        const consumeInCurrentWindow = policy !== undefined && outcome === 'consume'
           && reservation.expiresAt > bucket.databaseNow
           && bucket.windowStartedAt.getTime() + policy.windowMs > bucket.databaseNow.getTime();
         await transaction.$executeRaw`
           UPDATE "AuthenticationRateLimit"
           SET "reservedCount" = GREATEST(0, "reservedCount" - 1),
-              count = count + ${failureInCurrentWindow ? 1 : 0},
+              count = count + ${consumeInCurrentWindow ? 1 : 0},
               "updatedAt" = clock_timestamp()
           WHERE action = ${reservation.action} AND subject = ${reservation.subject}
         `;
       });
     },
     async cleanup() {
-      return client.$executeRaw`
-        DELETE FROM "AuthenticationRateLimit"
-        WHERE "updatedAt" < clock_timestamp() - interval '24 hours'
-      `;
+      return client.$transaction(async (transaction) => {
+        await transaction.$queryRaw`
+          SELECT bucket.action, bucket.subject
+          FROM "AuthenticationRateLimit" bucket
+          WHERE EXISTS (
+            SELECT 1 FROM "AuthenticationRateLimitReservation" reservation
+            WHERE reservation.action = bucket.action AND reservation.subject = bucket.subject
+              AND reservation."expiresAt" <= clock_timestamp()
+          )
+          FOR UPDATE
+        `;
+        await transaction.$executeRaw`
+          WITH expired AS (
+            DELETE FROM "AuthenticationRateLimitReservation"
+            WHERE "expiresAt" <= clock_timestamp()
+            RETURNING action, subject
+          ), totals AS (
+            SELECT action, subject, count(*)::integer AS count FROM expired GROUP BY action, subject
+          )
+          UPDATE "AuthenticationRateLimit" bucket
+          SET "reservedCount" = GREATEST(0, bucket."reservedCount" - totals.count),
+              "updatedAt" = clock_timestamp()
+          FROM totals WHERE bucket.action = totals.action AND bucket.subject = totals.subject
+        `;
+        return transaction.$executeRaw`
+          DELETE FROM "AuthenticationRateLimit"
+          WHERE "updatedAt" < clock_timestamp() - interval '24 hours'
+        `;
+      });
     }
   };
 }

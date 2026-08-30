@@ -51,8 +51,8 @@ test('human gatehouse uses its own tenant/operator audit contract and leaves the
   const app = Fastify({ logger: false });
   registerConviteRoutes(app, {} as AppStore, store, authenticator, undefined, undefined, undefined, undefined, false, {
     async check() { return { allowed: true, retryAfterSeconds: 0, repeatedExcess: false }; },
-    async reserveFailure() { return { allowed: true, retryAfterSeconds: 0, repeatedExcess: false, reservationId: randomUUID() }; },
-    async finalizeFailure() {}
+    async reserve() { return { allowed: true, retryAfterSeconds: 0, repeatedExcess: false, reservationId: randomUUID() }; },
+    async finalize() {}
   });
   const human = await app.inject({ method: 'POST', url: '/portaria/human/convites/validar', payload: { token: '123456', tipoAcesso: 'pedestre' } });
   assert.equal(human.statusCode, 200);

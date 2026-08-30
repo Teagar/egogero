@@ -49,8 +49,8 @@ test('Fastify only derives minimized forwarded IP through an explicitly trusted 
         subject = value;
         return { allowed: false, retryAfterSeconds: 1, repeatedExcess: false };
       },
-      async reserveFailure() { return { allowed: true, retryAfterSeconds: 0, repeatedExcess: false, reservationId: randomUUID() }; },
-      async finalizeFailure() {}
+      async reserve() { return { allowed: true, retryAfterSeconds: 0, repeatedExcess: false, reservationId: randomUUID() }; },
+      async finalize() {}
     };
     const app = createApp({
       trustProxy,
@@ -72,6 +72,56 @@ test('Fastify only derives minimized forwarded IP through an explicitly trusted 
   assert.equal(await observed('127.0.0.1', 'malformed, 198.51.100.77'), 'unknown');
 });
 
+test('invitation acceptance uses the unknown proxy bucket and only a token digest', async () => {
+  const token = 'A'.repeat(43);
+  const reservations: Array<{ action: string; subject: string }> = [];
+  let finalized = 0;
+  const app = createApp({
+    trustProxy: '127.0.0.1',
+    authRateLimiter: {
+      async check() { return { allowed: true, retryAfterSeconds: 0, repeatedExcess: false }; },
+      async reserve(action, subject) {
+        reservations.push({ action, subject });
+        return { allowed: true, retryAfterSeconds: 0, repeatedExcess: false, reservationId: randomUUID() };
+      },
+      async finalize(_reservationId, outcome) {
+        assert.equal(outcome, 'consume');
+        finalized += 1;
+      }
+    },
+    oidcService: {
+      failurePath: '/auth/error',
+      async startLogin() { return new URL('https://identity.example.test/authorize'); },
+      async completeCallback() { throw new Error('unused'); }
+    },
+    browserSessionStore: {
+      publicApplicationOrigin: 'https://app.example.test',
+      async issueFromHandoff() { return null; }, async authenticate() { return null; }, async inspect() { return null; },
+      async isRevoked() { return false; }, async rotate() { return { status: 'denied' as const }; },
+      async revoke() { return 'unavailable' as const; }, async revokeAll() { return 'unavailable' as const; },
+      async recordAmbiguousCredentials() {}
+    },
+    testOnlyBypassHumanAuthRollout: true
+  });
+  const response = await app.inject({
+    method: 'POST', url: '/auth/invitations/accept',
+    headers: {
+      origin: 'https://app.example.test', 'content-type': 'application/json',
+      'x-forwarded-for': 'malformed, 198.51.100.77'
+    },
+    payload: { token }
+  });
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(reservations.map(({ action, subject }) => ({ action, subject: action.endsWith('_ip') ? subject : '<digest>' })), [
+    { action: 'invitation_acceptance_ip', subject: 'unknown' },
+    { action: 'invitation_acceptance_digest', subject: '<digest>' }
+  ]);
+  assert.equal(reservations[1]!.subject.length, 64);
+  assert.ok(!reservations.some(({ subject }) => subject.includes(token)));
+  assert.equal(finalized, 2);
+  await app.close();
+});
+
 test('recovery initiation is generic, marks recovery intent, and returns Retry-After on denial', async () => {
   let recovery = false;
   let attempts = 0;
@@ -82,8 +132,8 @@ test('recovery initiation is generic, marks recovery intent, and returns Retry-A
         attempts += 1;
         return { allowed: attempts <= 3, retryAfterSeconds: 60, repeatedExcess: attempts > 5 };
       },
-      async reserveFailure() { return { allowed: true, retryAfterSeconds: 0, repeatedExcess: false, reservationId: randomUUID() }; },
-      async finalizeFailure() {}
+      async reserve() { return { allowed: true, retryAfterSeconds: 0, repeatedExcess: false, reservationId: randomUUID() }; },
+      async finalize() {}
     },
     oidcService: {
       failurePath: '/auth/error',
@@ -189,9 +239,9 @@ test('human authentication routes fail construction without the distributed limi
   assert.throws(() => createApp({ oidcService }), /require an AuthRateLimiter/);
   assert.throws(() => createApp({ oidcService, authRateLimiter: {
     async check() { return { allowed: true, retryAfterSeconds: 0, repeatedExcess: false }; },
-    async reserveFailure() { return { allowed: true, retryAfterSeconds: 0, repeatedExcess: false,
+    async reserve() { return { allowed: true, retryAfterSeconds: 0, repeatedExcess: false,
       reservationId: randomUUID() }; },
-    async finalizeFailure() {}
+    async finalize() {}
   } }), /require a HumanAuthRolloutService/);
   const deviceOnlyApp = createApp();
   await deviceOnlyApp.close();
@@ -201,8 +251,8 @@ test('session lookup metrics distinguish database failure from a credential miss
   const collectors = createAuthTestCollectors();
   const rateLimiter: AuthRateLimiter = {
     async check() { return { allowed: true, retryAfterSeconds: 0, repeatedExcess: false }; },
-    async reserveFailure() { return { allowed: true, retryAfterSeconds: 0, repeatedExcess: false, reservationId: randomUUID() }; },
-    async finalizeFailure() {}
+    async reserve() { return { allowed: true, retryAfterSeconds: 0, repeatedExcess: false, reservationId: randomUUID() }; },
+    async finalize() {}
   };
   const failingClient = {
     async $transaction() { throw new Error('database unavailable'); }

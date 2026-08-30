@@ -6,19 +6,30 @@ application processes. The cleanup operation removes rows inactive for 24 hours 
 `AuthenticationRateLimit_updatedAt_idx`. IP subjects contain only IPv4 `/24` or IPv6 `/64`
 prefixes. An unparseable trusted-proxy result shares the fail-closed `unknown` bucket.
 
-| Operation | Limit | External behavior |
-| --- | --- | --- |
-| Login initiation | 5/IP/10 minutes | Generic `429`, bounded `Retry-After` |
-| Failed OIDC callback | 10/IP/15 minutes | State is consumed, then an exact PostgreSQL exchange reservation is acquired before provider I/O |
-| Session creation/rotation | 10/account/15 minutes | Denial, progressive PostgreSQL backoff, repeated-excess alert; recovery revocation happens first |
-| Recovery initiation | 3/IP/30 minutes | Generic `429`, no account input or signal |
-| Reauthentication initiation | 5/account/10 minutes | Generic `429` after authenticated request validation |
-| CSRF/authentication failure | 60/IP/minute | Generic `429` on sustained abuse |
+The normative table is `AUTH_RATE_LIMIT_POLICIES` in `src/auth-rate-limits.ts`;
+automated parity rejects documentation drift.
 
-Callback reservations are finalized exactly once. Success releases the reservation without
-consuming failure budget; failure converts it into a counted failure. This caps concurrent
-provider exchanges at the remaining failure budget without eventually denying successful
-callbacks. Reservations expire with the counter window and are deleted with their bucket.
+<!-- auth-rate-limits:start -->
+| Operation | Dimension | Limit | External behavior |
+| --- | --- | --- | --- |
+| Login initiation | IP prefix | 5 per 10 minutes | Generic 429; bounded Retry-After |
+| Failed OIDC callback | IP prefix | 10 per 15 minutes | Consume state before provider exchange; reserve failure budget |
+| Session creation or rotation | Account | 10 per 15 minutes | Deny; progressive backoff; repeated-excess alert |
+| Recovery initiation | IP prefix | 3 per 30 minutes | Generic 429; no account signal |
+| Reauthentication initiation | Account | 5 per 10 minutes | Generic 429 after authenticated validation |
+| Administrative invitation acceptance | IP prefix | 10 per 1 hour | Generic denial; exponential backoff; repeated-excess alert |
+| Administrative invitation acceptance | Invitation digest | 5 per 1 hour | Generic denial; exponential backoff; repeated-excess alert |
+| Human gate validation | Account | 20 per 1 minute | Generic 429 after authenticated validation |
+| CSRF or authentication failure | IP prefix | 60 per 1 minute | Generic 429 on sustained abuse |
+<!-- auth-rate-limits:end -->
+
+Reservations are finalized exactly once under row locks. Callback success releases its
+reservation and callback failure consumes it. Invitation acceptance reserves the normalized
+trusted IP prefix and invitation digest independently, consumes both before OIDC transaction
+creation, and fails closed if either operation cannot commit. This caps concurrent work at the
+remaining budget across service instances without creating a transaction or session for denied
+attempts. Reservations expire with the counter window; cleanup removes expired reservations,
+repairs reserved counts, and removes inactive buckets through indexed scans.
 
 `TRUST_PROXY` accepts only a comma-separated IP/CIDR allowlist. Wildcard `/0` networks and invalid configuration stop
 startup. Forwarded addresses are interpreted only by Fastify after the direct peer matches

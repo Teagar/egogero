@@ -34,8 +34,8 @@ test(
     };
     const permissiveRateLimiter = {
       async check() { return { allowed: true, retryAfterSeconds: 0, repeatedExcess: false }; },
-      async reserveFailure() { return { allowed: true, retryAfterSeconds: 0, repeatedExcess: false, reservationId: randomUUID() }; },
-      async finalizeFailure() {}
+      async reserve() { return { allowed: true, retryAfterSeconds: 0, repeatedExcess: false, reservationId: randomUUID() }; },
+      async finalize() {}
     } satisfies AuthRateLimiter;
     const store = createPrismaBrowserSessionStore(prisma, config, { rateLimiter: permissiveRateLimiter,
       rolloutGate: TEST_ONLY_ALLOW_ALL_HUMAN_AUTH_ROLLOUT });

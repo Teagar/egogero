@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict';
-import { randomBytes, randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import test from 'node:test';
 
 import { PrismaClient } from '@prisma/client';
 
 import { createPrismaAuthRateLimiter } from '../src/auth-rate-limits.js';
 import { createApp } from '../src/app.js';
+import { createAuthTestCollectors } from '../src/auth-observability.js';
 import { createBrowserSessionService, generateSessionToken, SESSION_COOKIE_NAME } from '../src/sessions.js';
 import type { BrowserSessionStore } from '../src/sessions.js';
 
@@ -97,11 +98,11 @@ test('callback exchange reservations are exact across stores and successful call
   const failureSubject = `203.0.113.0/24-${randomUUID()}`;
   try {
     const concurrent = await Promise.all(Array.from({ length: 16 }, (_, index) =>
-      (index % 2 ? first : second).reserveFailure('callback_failure_ip', concurrentSubject)
+      (index % 2 ? first : second).reserve('callback_failure_ip', concurrentSubject)
     ));
     assert.equal(concurrent.filter((decision) => decision.allowed).length, 10);
     await Promise.all(concurrent.flatMap((decision, index) => decision.reservationId
-      ? [(index % 2 ? first : second).finalizeFailure(decision.reservationId, 'success')]
+      ? [(index % 2 ? first : second).finalize(decision.reservationId, 'release')]
       : []));
     assert.deepEqual(await firstClient.authenticationRateLimit.findUniqueOrThrow({
       where: { action_subject: { action: 'callback_failure_ip', subject: concurrentSubject } },
@@ -109,9 +110,9 @@ test('callback exchange reservations are exact across stores and successful call
     }), { count: 0, reservedCount: 0 });
 
     for (let index = 0; index < 25; index += 1) {
-      const reservation = await (index % 2 ? first : second).reserveFailure('callback_failure_ip', successSubject);
+      const reservation = await (index % 2 ? first : second).reserve('callback_failure_ip', successSubject);
       assert.equal(reservation.allowed, true, 'successful callbacks must not consume the failure budget');
-      await (index % 2 ? second : first).finalizeFailure(reservation.reservationId!, 'success');
+      await (index % 2 ? second : first).finalize(reservation.reservationId!, 'release');
     }
     assert.deepEqual(await firstClient.authenticationRateLimit.findUniqueOrThrow({
       where: { action_subject: { action: 'callback_failure_ip', subject: successSubject } },
@@ -119,11 +120,11 @@ test('callback exchange reservations are exact across stores and successful call
     }), { count: 0, reservedCount: 0 });
 
     for (let index = 0; index < 10; index += 1) {
-      const reservation = await (index % 2 ? first : second).reserveFailure('callback_failure_ip', failureSubject);
+      const reservation = await (index % 2 ? first : second).reserve('callback_failure_ip', failureSubject);
       assert.equal(reservation.allowed, true);
-      await (index % 2 ? second : first).finalizeFailure(reservation.reservationId!, 'failure');
+      await (index % 2 ? second : first).finalize(reservation.reservationId!, 'consume');
     }
-    assert.equal((await first.reserveFailure('callback_failure_ip', failureSubject)).allowed, false);
+    assert.equal((await first.reserve('callback_failure_ip', failureSubject)).allowed, false);
     assert.deepEqual(await firstClient.authenticationRateLimit.findUniqueOrThrow({
       where: { action_subject: { action: 'callback_failure_ip', subject: failureSubject } },
       select: { count: true, reservedCount: true }
@@ -132,6 +133,119 @@ test('callback exchange reservations are exact across stores and successful call
     await firstClient.authenticationRateLimit.deleteMany({
       where: { subject: { in: [concurrentSubject, successSubject, failureSubject] } }
     });
+    await Promise.all([firstClient.$disconnect(), secondClient.$disconnect()]);
+  }
+});
+
+test('administrative invitation limits serialize both dimensions across services without denied OIDC mutation', { skip: !runDatabaseTests }, async () => {
+  const firstClient = new PrismaClient();
+  const secondClient = new PrismaClient();
+  const telemetry = createAuthTestCollectors();
+  const token = randomBytes(32).toString('base64url');
+  const tokenDigest = createHash('sha256').update(token).digest('hex');
+  let loginTransactions = 0;
+  const browserStore = {
+    publicApplicationOrigin: 'https://app.example.test',
+    async issueFromHandoff() { return null; },
+    async authenticate() { return null; },
+    async inspect() { return null; },
+    async isRevoked() { return false; },
+    async rotate() { return { status: 'denied' as const }; },
+    async revoke() { return 'unavailable' as const; },
+    async revokeAll() { return 'unavailable' as const; },
+    async recordAmbiguousCredentials() {}
+  } satisfies BrowserSessionStore;
+  const oidcService = {
+    failurePath: '/auth/error',
+    async startLogin() {
+      loginTransactions += 1;
+      return new URL('https://identity.example.test/authorize');
+    },
+    async completeCallback() { throw new Error('unused'); }
+  };
+  const firstApp = createApp({
+    oidcService, browserSessionStore: browserStore,
+    authRateLimiter: createPrismaAuthRateLimiter(firstClient, telemetry.metricSink, telemetry.alertSink),
+    testOnlyBypassHumanAuthRollout: true
+  });
+  const secondApp = createApp({
+    oidcService, browserSessionStore: browserStore,
+    authRateLimiter: createPrismaAuthRateLimiter(secondClient, telemetry.metricSink, telemetry.alertSink),
+    testOnlyBypassHumanAuthRollout: true
+  });
+  const request = (index: number) => (index % 2 ? firstApp : secondApp).inject({
+    method: 'POST', url: '/auth/invitations/accept',
+    headers: { origin: browserStore.publicApplicationOrigin, 'content-type': 'application/json' },
+    payload: { token }
+  });
+  try {
+    await firstClient.authenticationRateLimit.deleteMany({
+      where: { action: { in: ['invitation_acceptance_ip', 'invitation_acceptance_digest'] } }
+    });
+    const responses = await Promise.all(Array.from({ length: 12 }, (_, index) => request(index)));
+    assert.equal(responses.filter((response) => response.statusCode === 200).length, 5);
+    assert.equal(responses.filter((response) => response.statusCode === 429).length, 7);
+    assert.ok(responses.filter((response) => response.statusCode === 429).every((response) =>
+      response.json().error === 'authentication_temporarily_unavailable' && Number(response.headers['retry-after']) > 0
+    ));
+    assert.equal(loginTransactions, 5, 'denied attempts must not create an OIDC transaction');
+
+    const buckets = await firstClient.authenticationRateLimit.findMany({
+      where: { action: { in: ['invitation_acceptance_ip', 'invitation_acceptance_digest'] } },
+      select: { action: true, subject: true, count: true, deniedCount: true, reservedCount: true }
+    });
+    assert.deepEqual(buckets.sort((left, right) => left.action.localeCompare(right.action)), [
+      { action: 'invitation_acceptance_digest', subject: tokenDigest, count: 5, deniedCount: 5, reservedCount: 0 },
+      { action: 'invitation_acceptance_ip', subject: '127.0.0.0/24', count: 10, deniedCount: 2, reservedCount: 0 }
+    ]);
+    assert.ok(buckets.every((bucket) => !bucket.subject.includes(token)));
+    assert.ok(telemetry.alerts.filter((alert) => alert.type === 'rate_limit_repeated_excess').length >= 2);
+
+    await firstClient.authenticationRateLimit.updateMany({
+      where: { action: { in: ['invitation_acceptance_ip', 'invitation_acceptance_digest'] } },
+      data: { windowStartedAt: new Date(Date.now() - 3_600_001), blockedUntil: null }
+    });
+    const afterBoundary = await request(0);
+    assert.equal(afterBoundary.statusCode, 200, 'the first attempt strictly after the one-hour window is allowed');
+    assert.equal(loginTransactions, 6);
+  } finally {
+    await Promise.all([firstApp.close(), secondApp.close()]);
+    await firstClient.authenticationRateLimit.deleteMany({
+      where: { action: { in: ['invitation_acceptance_ip', 'invitation_acceptance_digest'] } }
+    });
+    await Promise.all([firstClient.$disconnect(), secondClient.$disconnect()]);
+  }
+});
+
+test('reservation finalization and cleanup are exactly once under races', { skip: !runDatabaseTests }, async () => {
+  const firstClient = new PrismaClient();
+  const secondClient = new PrismaClient();
+  const subject = randomUUID();
+  const first = createPrismaAuthRateLimiter(firstClient);
+  const second = createPrismaAuthRateLimiter(secondClient);
+  try {
+    const reservation = await first.reserve('invitation_acceptance_digest', subject);
+    assert.equal(reservation.allowed, true);
+    await Promise.all(Array.from({ length: 12 }, (_, index) =>
+      (index % 2 ? first : second).finalize(reservation.reservationId!, 'consume')
+    ));
+    assert.deepEqual(await firstClient.authenticationRateLimit.findUniqueOrThrow({
+      where: { action_subject: { action: 'invitation_acceptance_digest', subject } },
+      select: { count: true, reservedCount: true }
+    }), { count: 1, reservedCount: 0 });
+
+    const expiring = await second.reserve('invitation_acceptance_digest', subject);
+    assert.equal(expiring.allowed, true);
+    await firstClient.authenticationRateLimitReservation.update({
+      where: { id: expiring.reservationId! }, data: { expiresAt: new Date(Date.now() - 1) }
+    });
+    assert.equal(await first.cleanup!(), 0);
+    assert.equal(await firstClient.authenticationRateLimitReservation.count({ where: { subject } }), 0);
+    assert.equal((await firstClient.authenticationRateLimit.findUniqueOrThrow({
+      where: { action_subject: { action: 'invitation_acceptance_digest', subject } }
+    })).reservedCount, 0);
+  } finally {
+    await firstClient.authenticationRateLimit.deleteMany({ where: { subject } });
     await Promise.all([firstClient.$disconnect(), secondClient.$disconnect()]);
   }
 });
