@@ -102,6 +102,7 @@ test('signed recovery webhook atomically queues once without persisting its subj
   const externalIdentityId = randomUUID();
   const sessionId = randomUUID();
   const eventId = randomUUID();
+  const legacyEventId = randomUUID();
   const subject = `recovery-${accountId}`;
   const trailingSubject = `trailing-${accountId}`;
   try {
@@ -147,8 +148,20 @@ test('signed recovery webhook atomically queues once without persisting its subj
     assert.equal(serialized.includes(signature), false);
     assert.equal(serialized.includes(subject), false);
     assert.equal(serialized.includes(trailingSubject), false);
+
+    const legacySubject = `legacy-${accountId}`;
+    await prisma.$executeRaw`
+      INSERT INTO "RecoveryWebhookEvent" (id, "eventId", "eventDigest", issuer, subject, "processedAt")
+      VALUES (${randomUUID()}::uuid, ${legacyEventId}, ${randomBytes(32)}, ${issuer}, ${legacySubject}, clock_timestamp())
+    `;
+    const legacy = await prisma.recoveryWebhookEvent.findFirstOrThrow({ where: { eventId: legacyEventId } });
+    assert.equal(legacy.subject, null);
+    assert.equal(legacy.status, 'acknowledged');
+    assert.equal(legacy.keyVersion, 1);
+    assert.equal(Buffer.from(legacy.subjectDigest).length, 32);
+    assert.ok(legacy.acknowledgedAt && legacy.expiresAt > legacy.acknowledgedAt);
   } finally {
-    await prisma.recoveryWebhookEvent.deleteMany({ where: { eventId } });
+    await prisma.recoveryWebhookEvent.deleteMany({ where: { eventId: { in: [eventId, legacyEventId] } } });
     await prisma.browserSession.deleteMany({ where: { accountId } });
     await prisma.humanMembership.deleteMany({ where: { accountId } });
     await prisma.externalIdentity.deleteMany({ where: { accountId } });

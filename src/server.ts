@@ -30,6 +30,7 @@ import {
   prepareAuthSnapshotFile,
   registerAuthTelemetryLifecycle,
   type AuthAlertDeliveryAdapter,
+  type AuthAlertSink,
   type AuthSnapshotSink
 } from './auth-observability.js';
 import type { AuthAlertEnvironmentConfig } from './env.js';
@@ -43,11 +44,13 @@ export function createServerAuthObservability(
     request?: typeof fetch;
   } = {}
 ) {
+  const aggregateAlerts: { current?: AuthAlertSink } = {};
   const snapshotSink = dependencies.snapshotSink ?? (config.snapshotPath
     ? createAuthSnapshotFileSink(config.snapshotPath)
     : undefined);
   const telemetry = createStructuredAuthTelemetry(snapshotSink, {
-    instanceId: config.instanceId, stageId: config.stageId
+    instanceId: config.instanceId, stageId: config.stageId,
+    aggregateAlertSink: { emit(type, details) { return aggregateAlerts.current?.emit(type, details); } }
   });
   const adapter = dependencies.alertAdapter ?? (config.adapter === 'stdout'
     ? createAuthAlertStdoutAdapter()
@@ -56,6 +59,7 @@ export function createServerAuthObservability(
     timeoutMs: config.timeoutMs,
     onGap: telemetry.recordObservabilityGap
   });
+  aggregateAlerts.current = routed.sink;
   return {
     telemetry,
     alerts: combineAuthAlertSinks(telemetry.alerts, routed.sink),

@@ -19,12 +19,34 @@ ALTER TABLE "RecoveryWebhookEvent"
   ADD COLUMN "lastError" TEXT,
   ADD COLUMN "sloAlertedAt" TIMESTAMPTZ(3);
 
+CREATE FUNCTION prepare_legacy_recovery_webhook_event() RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog, public
+AS $$
+BEGIN
+  IF NEW."subjectDigest" IS NULL AND NEW.subject IS NOT NULL AND NEW."processedAt" IS NOT NULL THEN
+    NEW."subjectDigest" := sha256(convert_to(NEW.issuer, 'UTF8') || decode('00', 'hex') || convert_to(NEW.subject, 'UTF8'));
+    NEW."keyVersion" := 1;
+    NEW.status := 'acknowledged';
+    NEW."expiresAt" := NEW."processedAt" + interval '15 minutes';
+    NEW."acknowledgedAt" := NEW."processedAt";
+    NEW.subject := NULL;
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER "RecoveryWebhookEvent_prepare_legacy_insert"
+  BEFORE INSERT ON "RecoveryWebhookEvent"
+  FOR EACH ROW EXECUTE FUNCTION prepare_legacy_recovery_webhook_event();
+
 UPDATE "RecoveryWebhookEvent"
-SET "subjectDigest" = "eventDigest",
+SET "subjectDigest" = sha256(convert_to(issuer, 'UTF8') || decode('00', 'hex') || convert_to(subject, 'UTF8')),
     "keyVersion" = 1,
     status = 'acknowledged',
     "expiresAt" = "processedAt" + interval '15 minutes',
-    "acknowledgedAt" = "processedAt";
+    "acknowledgedAt" = "processedAt",
+    subject = NULL;
 
 ALTER TABLE "RecoveryWebhookEvent"
   ALTER COLUMN subject DROP NOT NULL,
@@ -61,6 +83,8 @@ CREATE INDEX "RecoveryWebhookEvent_claim_idx"
   ON "RecoveryWebhookEvent" (status, "nextAttemptAt", "createdAt", id);
 CREATE INDEX "RecoveryWebhookEvent_lease_idx"
   ON "RecoveryWebhookEvent" (status, "leaseExpiresAt", id);
+CREATE INDEX "RecoveryWebhookEvent_expiry_idx"
+  ON "RecoveryWebhookEvent" (status, "expiresAt", id);
 CREATE INDEX "RecoveryWebhookEvent_slo_idx"
   ON "RecoveryWebhookEvent" (status, "createdAt", "sloAlertedAt");
 

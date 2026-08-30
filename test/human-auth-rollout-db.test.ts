@@ -156,6 +156,14 @@ test('PostgreSQL rollout serializes changes, fails closed, isolates tenants, and
       assert.equal(await rawService.setPolicy({ condominioId: null, state: 'internal-provider', cohortPercentage: null,
         actorAccountId, requestCorrelationId: 'deployment-expired',
         authorization: { kind: 'deployment', token: expiredToken } }), null);
+      const futureToken = randomBytes(32).toString('base64url');
+      await prisma.humanAuthDeploymentAuthorization.create({ data: { id: randomUUID(),
+        createdAt: new Date(Date.now() + 60 * 60_000), expiresAt: new Date(Date.now() + 61 * 60_000),
+        tokenDigest: createHash('sha256').update(futureToken).digest(), actorAccountId, scope: 'global',
+        state: 'internal_provider', operatorIdentifier: 'operator.test', approvalReference: 'PC-36-future' } });
+      assert.equal(await rawService.setPolicy({ condominioId: null, state: 'internal-provider', cohortPercentage: null,
+        actorAccountId, requestCorrelationId: 'deployment-future',
+        authorization: { kind: 'deployment', token: futureToken } }), null);
       const concurrentToken = randomBytes(32).toString('base64url');
       await prisma.humanAuthDeploymentAuthorization.create({ data: { id: randomUUID(),
         expiresAt: new Date(Date.now() + 60_000), tokenDigest: createHash('sha256').update(concurrentToken).digest(),

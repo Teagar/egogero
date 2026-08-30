@@ -43,12 +43,14 @@ variables:
   AUTH_ROLLOUT_SNAPSHOT_PATH: { required_when: AUTH_ROLLOUT_MODE=canary, secret: false, format: absolute-protected-durable-jsonl-path }
   AUTH_ALERT_SMOKE_ACK_ID: { required_when: AUTH_ROLLOUT_MODE=canary, secret: false, format: external-acknowledgement-id }
   RECOVERY_BATCH_SIZE: { required: false, secret: false, range: [1, 100] }
+  RECOVERY_CONCURRENCY: { required: false, secret: false, range: [1, 20], maximum: RECOVERY_BATCH_SIZE }
   RECOVERY_LEASE_MS: { required: false, secret: false, range: [250, 30000] }
   RECOVERY_POLL_MS: { required: false, secret: false, range: [25, 5000] }
   RECOVERY_MAX_ATTEMPTS: { required: false, secret: false, range: [1, 20] }
   RECOVERY_BASE_BACKOFF_MS: { required: false, secret: false, range: [10, 5000] }
   RECOVERY_MAX_BACKOFF_MS: { required: false, secret: false, range: [10, 5000] }
   RECOVERY_ADAPTER_TIMEOUT_MS: { required: false, secret: false, range: [50, 4000] }
+  RECOVERY_LEASE_TIMEOUT_MARGIN_MS: { invariant: RECOVERY_LEASE_MS>=RECOVERY_ADAPTER_TIMEOUT_MS+250 }
 disabled_human_auth:
   must_be_absent: [PUBLIC_APPLICATION_ORIGIN, OIDC_ISSUER, OIDC_AUTHORIZATION_ENDPOINT, OIDC_TOKEN_ENDPOINT, OIDC_JWKS_URI, OIDC_CLIENT_ID, OIDC_CLIENT_SECRET, OIDC_REDIRECT_URI, OIDC_ID_TOKEN_SIGNING_ALG, OIDC_PKCE_KEYS, OIDC_PKCE_CURRENT_KEY_VERSION, OIDC_RETURN_TO_PREFIXES, OIDC_FAILURE_PATH, SESSION_CSRF_KEYS, SESSION_CSRF_CURRENT_KEY_VERSION, HUMAN_MFA_ROLE_POLICY, OIDC_RECOVERY_URL, RECOVERY_WEBHOOK_ISSUERS, RECOVERY_WEBHOOK_KEYS]
   may_remain: [TRUST_PROXY, AUTH_ALERT_ADAPTER, AUTH_ALERT_TIMEOUT_MS]

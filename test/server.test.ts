@@ -336,6 +336,23 @@ test('server auth observability composes bounded delivery and records sink failu
   assert.equal(snapshots[0].alerts.crypto_key_failure, 1);
   assert.ok(snapshots[0].observability.gaps.some((gap) => gap.code === 'alert_route_rejected'));
 
+  const aggregateDeliveries: string[] = [];
+  const aggregates = createServerAuthObservability({
+    adapter: 'stdout', timeoutMs: 100, rolloutMode: 'off',
+    instanceId: '00000000-0000-4000-8000-000000000014', stageId: 'staging:test'
+  }, {
+    snapshotSink: () => {},
+    alertAdapter: async (delivery) => { aggregateDeliveries.push(delivery.type); return { acknowledged: true }; }
+  });
+  for (let index = 0; index < 100; index += 1) {
+    aggregates.telemetry.metrics.increment('auth_oidc_callback_total', { outcome: 'failure', reason: 'validation' });
+    aggregates.telemetry.metrics.observe('auth_session_lookup_seconds', 0.025, { operation: 'inspect', outcome: 'miss' });
+  }
+  aggregates.telemetry.flush();
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(aggregateDeliveries, ['oidc_callback_success_slo', 'session_lookup_latency_slo']);
+
   const timedOut = createServerAuthObservability({
     adapter: 'stdout', timeoutMs: 5, rolloutMode: 'off',
     instanceId: '00000000-0000-4000-8000-000000000012', stageId: 'staging:test'

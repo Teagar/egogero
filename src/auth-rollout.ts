@@ -16,7 +16,11 @@ const COUNTER_DIMENSIONS: Readonly<Record<string, Readonly<Record<string, readon
   auth_session_lookup_total: { operation: ['authenticate', 'inspect', 'other'], outcome: ['hit', 'miss', 'failure', 'other'] },
   auth_database_writes_total: { operation: ['recovery', 'session_issue', 'session_rotate', 'session_revoke', 'other'], outcome: ['success', 'failure', 'other'] },
   auth_rate_limit_decisions_total: {
-    operation: ['login_ip', 'callback_failure_ip', 'session_issue_account', 'recovery_ip', 'reauthentication_account', 'authentication_failure_ip', 'other'],
+    operation: [
+      'login_ip', 'callback_failure_ip', 'session_creation_account', 'recovery_ip',
+      'reauthentication_account', 'invitation_acceptance_ip', 'invitation_acceptance_digest',
+      'human_validation_account', 'authentication_failure_ip', 'other'
+    ],
     outcome: ['allowed', 'denied', 'other']
   }
 };

@@ -54,4 +54,15 @@ test('recovery revocation queue migration remains additive', async () => {
   assert.doesNotMatch(sql, /DROP (?:COLUMN|INDEX)/);
   assert.match(sql, /ALTER COLUMN subject DROP NOT NULL/);
   assert.match(sql, /ALTER COLUMN "processedAt" DROP NOT NULL/);
+  assert.match(sql, /prepare_legacy_recovery_webhook_event/);
+  assert.match(sql, /NEW\.subject := NULL/);
+  assert.match(sql, /subject = NULL/);
+});
+
+test('deployment authorization rejects future-dated approvals at consumption', async () => {
+  const sql = await readFile(new URL(
+    '../prisma/migrations/0026_add_rollout_deployment_authorization/migration.sql',
+    import.meta.url
+  ), 'utf8');
+  assert.match(sql, /deployment_auth\."createdAt" <= clock_timestamp\(\)/);
 });

@@ -10,6 +10,7 @@ import {
   claimRecoveryRevocations,
   createPostgresRecoveryRevocationAdapter,
   processRecoveryClaim,
+  recoveryWorkerConfig,
   runRecoveryBatch,
   type RecoveryRevocationAdapter,
   type RecoveryWorkerConfig
@@ -18,6 +19,7 @@ import {
 const run = process.env.RUN_DATABASE_TESTS === 'true' && Boolean(process.env.DATABASE_URL);
 const config: RecoveryWorkerConfig = {
   batchSize: 20,
+  concurrency: 2,
   leaseMs: 500,
   pollMs: 25,
   maxAttempts: 3,
@@ -26,8 +28,20 @@ const config: RecoveryWorkerConfig = {
   maxBackoffMs: 40
 };
 
+test('recovery worker configuration bounds concurrency and lease safety', () => {
+  assert.equal(recoveryWorkerConfig({}).concurrency, 5);
+  assert.throws(() => recoveryWorkerConfig({ RECOVERY_BATCH_SIZE: '1', RECOVERY_CONCURRENCY: '2' }),
+    /must not exceed/);
+  assert.throws(() => recoveryWorkerConfig({ RECOVERY_LEASE_MS: '1000', RECOVERY_ADAPTER_TIMEOUT_MS: '1000' }),
+    /must exceed/);
+});
+
 test('recovery workers retry nack and timeout, fence stale leases, expire work, alert at five seconds, and revoke exactly once', { skip: !run }, async () => {
   const prisma = new PrismaClient();
+  const databaseUrl = process.env.DATABASE_URL!;
+  const constrained = new PrismaClient({
+    datasourceUrl: `${databaseUrl}${databaseUrl.includes('?') ? '&' : '?'}connection_limit=1&pool_timeout=2`
+  });
   const issuer = 'https://recovery-worker.example.test';
   const accountIds: string[] = [];
   const eventIds: string[] = [];
@@ -73,6 +87,28 @@ test('recovery workers retry nack and timeout, fence stale leases, expire work, 
     }
     assert.deepEqual(await claimRecoveryRevocations(prisma, { workerId: 'duplicate', batchSize: 20, leaseMs: 500, maxAttempts: 3 }), []);
 
+    const bounded = await Promise.all(Array.from({ length: 6 }, (_, index) => fixture(`bounded-${index}`)));
+    let active = 0;
+    let maximumActive = 0;
+    const boundedAdapter: RecoveryRevocationAdapter = {
+      supportsIdempotency: true,
+      async revoke(input) {
+        active += 1;
+        maximumActive = Math.max(maximumActive, active);
+        try {
+          await new Promise((resolve) => setTimeout(resolve, 30));
+          return await postgres.revoke(input);
+        } finally { active -= 1; }
+      }
+    };
+    const boundedOutcomes = await runRecoveryBatch({
+      client: constrained, adapter: boundedAdapter, alerts: alertSink, workerId: 'bounded',
+      config: { ...config, batchSize: bounded.length, concurrency: 2 }
+    });
+    assert.ok(maximumActive >= 1 && maximumActive <= 2);
+    assert.equal(boundedOutcomes.length, bounded.length);
+    assert.ok(boundedOutcomes.every(({ outcome }) => outcome === 'acknowledged'));
+
     const nack = await fixture('nack');
     let nackCalls = 0;
     const nackThenAck: RecoveryRevocationAdapter = {
@@ -117,6 +153,8 @@ test('recovery workers retry nack and timeout, fence stale leases, expire work, 
 
     const overdue = await fixture('slo', false);
     await prisma.recoveryWebhookEvent.update({ where: { id: overdue.id }, data: { createdAt: new Date(Date.now() - 5_100) } });
+    assert.equal(await alertOverdueRecoveryRevocations(prisma, { emit() { throw new Error('unavailable'); } }), 0);
+    assert.equal((await prisma.recoveryWebhookEvent.findUniqueOrThrow({ where: { id: overdue.id } })).sloAlertedAt, null);
     assert.equal(await alertOverdueRecoveryRevocations(prisma, alertSink), 1);
     assert.equal(await alertOverdueRecoveryRevocations(prisma, alertSink), 0);
     const breach = alerts.find(({ type }) => type === 'recovery_revocation_slo_breach');
@@ -131,6 +169,7 @@ test('recovery workers retry nack and timeout, fence stale leases, expire work, 
     await prisma.browserSession.deleteMany({ where: { accountId: { in: accountIds } } });
     await prisma.humanMembership.deleteMany({ where: { accountId: { in: accountIds } } });
     await prisma.humanAccount.deleteMany({ where: { id: { in: accountIds } } });
+    await constrained.$disconnect();
     await prisma.$disconnect();
   }
 });

@@ -157,6 +157,45 @@ export function createRoutedAuthAlertSink(
   function gap(code: Parameters<NonNullable<typeof options.onGap>>[0]) {
     try { options.onGap?.(code); } catch { /* observability cannot affect auth */ }
   }
+  function deliveryFor(type: AuthAlertType): AuthAlertDelivery {
+    return { contract: 'egogero.auth-alert-delivery/v1', type, routes: [...routes[type]] };
+  }
+  async function deliver(type: AuthAlertType) {
+    const controller = new AbortController();
+    let cancel: (() => void) | undefined;
+    let timedOut = false;
+    let rejectTimeout!: (error: Error) => void;
+    const timeout = new Promise<never>((_resolve, reject) => { rejectTimeout = reject; });
+    const timer = setTimeout(() => {
+      timedOut = true;
+      gap('alert_route_timeout');
+      controller.abort();
+      try { cancel?.(); } catch { /* cancellation is best effort */ }
+      rejectTimeout(new Error('Auth alert delivery timed out'));
+    }, timeoutMs);
+    timer.unref();
+    try {
+      const result = adapter(deliveryFor(type), controller.signal);
+      const operation = result instanceof Promise ? { promise: result } : result;
+      if (!operation?.promise || typeof operation.promise.then !== 'function') {
+        gap('alert_route_throw');
+        throw new Error('Invalid auth alert adapter operation');
+      }
+      cancel = operation.cancel;
+      const acknowledgement = await Promise.race([operation.promise, timeout]);
+      if (acknowledgement?.acknowledged !== true) {
+        gap('alert_route_unacknowledged');
+        throw new Error('Auth alert delivery was not acknowledged');
+      }
+    } catch (error) {
+      if (!timedOut && !(error instanceof Error && error.message === 'Auth alert delivery was not acknowledged')) {
+        gap('alert_route_rejected');
+      }
+      throw error;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
   function dispatch(delivery: AuthAlertDelivery) {
     const controller = new AbortController();
     try {
@@ -198,15 +237,13 @@ export function createRoutedAuthAlertSink(
   }
   const sink: AuthAlertSink = {
     emit(type) {
-      const delivery: AuthAlertDelivery = {
-        contract: 'egogero.auth-alert-delivery/v1', type, routes: [...routes[type]]
-      };
+      const delivery = deliveryFor(type);
       if (!active) dispatch(delivery);
       else if (!pending) pending = delivery;
       else gap('alert_route_backpressure');
     }
   };
-  return { sink, state: () => ({ inFlight: active !== null, pending: pending ? 1 : 0 }) };
+  return { sink, deliver, state: () => ({ inFlight: active !== null, pending: pending ? 1 : 0 }) };
 }
 
 export function combineAuthAlertSinks(...sinks: readonly AuthAlertSink[]): AuthAlertSink {
@@ -299,7 +336,11 @@ const DIMENSIONS: Record<AuthMetricName, Readonly<Record<string, readonly string
   auth_session_revocation_seconds: { operation: ['current'], outcome: ['revoked', 'already-revoked', 'unavailable'] },
   auth_database_writes_total: { operation: ['recovery', 'session_issue', 'session_rotate', 'session_revoke'], outcome: ['success', 'failure'] },
   auth_rate_limit_decisions_total: {
-    operation: ['login_ip', 'callback_failure_ip', 'session_issue_account', 'recovery_ip', 'reauthentication_account', 'authentication_failure_ip'],
+    operation: [
+      'login_ip', 'callback_failure_ip', 'session_creation_account', 'recovery_ip',
+      'reauthentication_account', 'invitation_acceptance_ip', 'invitation_acceptance_digest',
+      'human_validation_account', 'authentication_failure_ip'
+    ],
     outcome: ['allowed', 'denied']
   }
 };
@@ -379,6 +420,7 @@ export function createStructuredAuthTelemetry(
     monotonicNow?: () => number;
     maxClockDriftMs?: number;
     sinkTimeoutMs?: number;
+    aggregateAlertSink?: AuthAlertSink;
   }
 ): StructuredAuthTelemetry {
   const { instanceId, stageId } = options;
@@ -392,6 +434,7 @@ export function createStructuredAuthTelemetry(
   const monotonicNow = options.monotonicNow ?? (options.now ? now : performance.now.bind(performance));
   const maxClockDriftMs = options.maxClockDriftMs ?? 5_000;
   const sinkTimeoutMs = options.sinkTimeoutMs ?? 5_000;
+  const aggregateAlerts = safeAuthAlerts(options.aggregateAlertSink);
   if (!Number.isFinite(maxClockDriftMs) || maxClockDriftMs < 0
     || !Number.isFinite(sinkTimeoutMs) || sinkTimeoutMs < 1) throw new Error('Invalid auth telemetry timing configuration');
   const counters = new Map<string, AuthRolloutCounter>();
@@ -535,6 +578,7 @@ export function createStructuredAuthTelemetry(
       const callbacks = BigInt(callbackSuccess) + BigInt(callbackFailure);
       if (callbacks >= 100n && BigInt(callbackSuccess) * 1_000n < callbacks * 995n) {
         alerts.emit('oidc_callback_success_slo', { outcome: 'below_threshold', thresholdPermille: 995 });
+        aggregateAlerts.emit('oidc_callback_success_slo', { outcome: 'below_threshold', thresholdPermille: 995 });
       }
       if (sessionCount >= 100) {
         const rank = Number((BigInt(sessionCount) * 95n + 99n) / 100n);
@@ -542,6 +586,7 @@ export function createStructuredAuthTelemetry(
         const bucket = sessionBuckets.findIndex((count) => (cumulative += count) >= rank);
         if (bucket >= AUTH_SESSION_HISTOGRAM_BOUNDS_SECONDS.findIndex((bound) => bound === 0.02) + 1) {
           alerts.emit('session_lookup_latency_slo', { outcome: 'above_threshold', thresholdMs: 20 });
+          aggregateAlerts.emit('session_lookup_latency_slo', { outcome: 'above_threshold', thresholdMs: 20 });
         }
       }
       let criticalIncidentCount = 0;

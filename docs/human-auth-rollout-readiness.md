@@ -110,6 +110,13 @@ node scripts/verify-image-contract.mjs "$IMAGE"
 
 Run migrations as a separate platform job from the immutable image. The placeholder below is not a standalone shell command: the orchestrator must inject `DATABASE_URL` from its secret reference without placing the value in arguments, logs, shell history, or evidence.
 
+Migration `0026` is an intentional authorization boundary, not a mixed-version policy-write deployment. Freeze all
+rollout policy mutations, drain every pre-`0026` policy writer, apply migrations, and then admit the new revision
+before unfreezing mutations. Existing authentication reads may continue during this control-plane window, but old
+and new policy writers must never overlap: old writers lose direct table grants at `0026`, while new writers require
+the hardened function introduced by that migration. Record the freeze, drain, migration, revision, and unfreeze in
+the release evidence.
+
 ```text
 platform-job run --image "$IMAGE" --secret-ref DATABASE_URL --entrypoint npm -- run db:migrate:deploy
 ```

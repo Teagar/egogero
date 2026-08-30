@@ -110,6 +110,7 @@ BEGIN
     SET "usedAt" = clock_timestamp(), "requestCorrelationId" = correlation_id
     WHERE deployment_auth."tokenDigest" = deployment_token_digest
       AND deployment_auth."usedAt" IS NULL AND deployment_auth."expiresAt" > clock_timestamp()
+      AND deployment_auth."createdAt" <= clock_timestamp()
       AND deployment_auth."actorAccountId" = requested_actor AND deployment_auth.scope = requested_scope
       AND deployment_auth.state = requested_state
       AND deployment_auth."cohortPercentage" IS NOT DISTINCT FROM requested_cohort

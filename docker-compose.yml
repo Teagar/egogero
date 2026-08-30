@@ -71,6 +71,7 @@ services:
       NODE_ENV: development
       DATABASE_URL: postgresql://office:office@db:5432/office?schema=public
       RECOVERY_BATCH_SIZE: "20"
+      RECOVERY_CONCURRENCY: "5"
       RECOVERY_LEASE_MS: "2000"
       RECOVERY_ADAPTER_TIMEOUT_MS: "1000"
       AUTH_ALERT_ADAPTER: stdout

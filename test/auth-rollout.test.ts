@@ -28,6 +28,7 @@ import {
   type AuthSnapshotSink
 } from '../src/auth-observability.js';
 import { AUTH_ALERT_SMOKE_CONTRACT, runAuthAlertSmoke } from '../src/auth-alert-smoke.js';
+import { AUTH_RATE_LIMIT_POLICIES } from '../src/auth-rate-limits.js';
 
 const start = Date.parse('2026-08-01T00:00:00.000Z');
 
@@ -228,6 +229,24 @@ test('all incident and SLO routes are represented by bounded alert counters', ()
   assert.equal(records[0].criticalIncidentCount, 9);
 });
 
+test('every normative auth limiter action remains a bounded rollout dimension', () => {
+  const records: AuthRolloutSnapshot[] = [];
+  let clock = start;
+  const telemetry = createStructuredAuthTelemetry((record) => { records.push(record); }, {
+    stageId: 'staging:pc-38', instanceId: '00000000-0000-4000-8000-000000000014', now: () => clock
+  });
+  for (const operation of Object.keys(AUTH_RATE_LIMIT_POLICIES)) {
+    telemetry.metrics.increment('auth_rate_limit_decisions_total', { operation, outcome: 'allowed' });
+  }
+  clock += 60_000;
+  telemetry.flush();
+  const dimensions = records[0].counters
+    .filter(({ metric }) => metric === 'auth_rate_limit_decisions_total')
+    .map(({ dimensions: labels }) => labels.operation).sort();
+  assert.deepEqual(dimensions, Object.keys(AUTH_RATE_LIMIT_POLICIES).sort());
+  assert.equal(dimensions.includes('other'), false);
+});
+
 test('throwing and rejecting snapshot sinks recover with explicit gap evidence', async () => {
   let clock = start;
   const recovered: AuthRolloutSnapshot[] = [];
@@ -377,6 +396,16 @@ test('alert routing delivers only bounded routes and reports nonblocking failure
   noAck.sink.emit('oidc_callback_success_slo', {});
   await new Promise((resolve) => setImmediate(resolve));
   assert.deepEqual(unacknowledged, ['alert_route_unacknowledged']);
+
+  const acknowledged = createRoutedAuthAlertSink(DEFAULT_AUTH_ALERT_ROUTES,
+    async () => ({ acknowledged: true }), { timeoutMs: 20 });
+  await acknowledged.deliver('recovery_revocation_slo_breach');
+  await assert.rejects(() => noAck.deliver('recovery_revocation_slo_breach'), /not acknowledged/);
+  const deliveryGaps: string[] = [];
+  const neverSettles = createRoutedAuthAlertSink(DEFAULT_AUTH_ALERT_ROUTES,
+    () => new Promise(() => {}), { timeoutMs: 5, onGap: (gap) => deliveryGaps.push(gap) });
+  await assert.rejects(() => neverSettles.deliver('recovery_revocation_slo_breach'), /timed out/);
+  assert.deepEqual(deliveryGaps, ['alert_route_timeout']);
 
   const telemetry = createStructuredAuthTelemetry(() => {}, {
     stageId: 'staging:pc-37', instanceId: '00000000-0000-4000-8000-000000000010', now: () => start

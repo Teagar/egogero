@@ -60,7 +60,10 @@ replace the evidence while preserving the session family and CSRF value.
   issuer, key version, and the already-local account UUID. It never stores the
   signature, raw provider subject, webhook body, or provider tokens.
 - `npm run recovery:worker` uses PostgreSQL fenced leases, `SKIP LOCKED`, bounded
-  exponential retry, five attempts, and a 15-minute event expiry. Acknowledged,
+  exponential retry, five attempts, and a 15-minute event expiry. Each claim page
+  is no larger than `RECOVERY_CONCURRENCY` (default 5), concurrency cannot exceed
+  `RECOVERY_BATCH_SIZE`, and the lease must exceed the adapter timeout by at least
+  250 ms so work never waits behind its own expired lease. Acknowledged,
   failed, and expired states are durable. A one-shot critical alert is emitted if
   acknowledgement has not been persisted within five seconds.
 
