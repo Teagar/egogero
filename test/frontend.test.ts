@@ -42,10 +42,42 @@ test('frontend serves only exact documents and assets with strict security and c
   }
 });
 
-test('app shell uses the authoritative viewport breakpoint instead of querying itself', async () => {
+test('app shell uses the authoritative viewport breakpoints instead of querying itself', async () => {
   const css = await readFile(new URL('../web/src/styles.css', import.meta.url), 'utf8');
-  assert.doesNotMatch(css, /@container\s*\(max-width:\s*680px\)/);
-  assert.match(css, /@media\s*\(max-width:\s*680px\)\s*\{[\s\S]*?\.shell\s*\{\s*display:\s*block/);
-  assert.match(css, /@media\s*\(max-width:\s*680px\)\s*\{[\s\S]*?\.sidebar\s*\{\s*display:\s*none/);
-  assert.match(css, /@media\s*\(max-width:\s*680px\)\s*\{[\s\S]*?\.mobile-nav\s*\{[\s\S]*?display:\s*grid/);
+  assert.doesNotMatch(css, /@container\s*\(max-width:/);
+  assert.match(css, /@media\s*\(max-width:\s*900px\)\s*\{[\s\S]*?\.shell\s*\{\s*display:\s*block/);
+  assert.match(css, /@media\s*\(max-width:\s*900px\)\s*\{[\s\S]*?\.sidebar\s*\{\s*display:\s*none/);
+  assert.match(css, /@media\s*\(max-width:\s*900px\)\s*\{[\s\S]*?\.mobile-nav\s*\{[\s\S]*?display:\s*grid/);
+  assert.match(css, /@media\s*\(max-width:\s*640px\)\s*\{[\s\S]*?\.split\s*\{\s*grid-template-columns:\s*minmax\(0, 1fr\)/);
+  assert.match(css, /@media\s*\(prefers-reduced-motion:\s*reduce\)/);
+});
+
+test('frontend foundation tracks REV. 07 tokens, fonts, brand, and light theme decision', async () => {
+  const [css, main, app, html, mark] = await Promise.all([
+    readFile(new URL('../web/src/styles.css', import.meta.url), 'utf8'),
+    readFile(new URL('../web/src/main.tsx', import.meta.url), 'utf8'),
+    readFile(new URL('../web/src/App.tsx', import.meta.url), 'utf8'),
+    readFile(new URL('../web/index.html', import.meta.url), 'utf8'),
+    readFile(new URL('../web/src/assets/brand-mark.svg', import.meta.url), 'utf8')
+  ]);
+
+  const requiredTokens = [
+    '--charcoal: #2b2a28', '--paper: #f0f1f3', '--signal: #ff6700',
+    '--blueprint: #1f4b8c', '--steel: #585c63', '--success: #1f7a52',
+    '--warning: #a66a00', '--danger: #b8352a', '--s-1: 8px',
+    '--s-8: 128px', '--r-sm: 2px', '--r-md: 4px'
+  ];
+  for (const token of requiredTokens) assert.ok(css.includes(token), `missing ${token}`);
+
+  assert.match(main, /big-shoulders-display\/latin-800/);
+  assert.match(main, /public-sans\/latin-400/);
+  assert.match(main, /public-sans\/latin-700/);
+  assert.match(main, /ibm-plex-mono\/latin-500/);
+  assert.match(main, /ibm-plex-mono\/latin-600/);
+  assert.match(app, /import brandMark from '\.\/assets\/brand-mark\.svg\?no-inline'/);
+  assert.match(app, /<img src=\{brandMark\} alt="" \/>/);
+  assert.match(mark, /<svg[\s\S]*<title[^>]*>Marca Teagar<\/title>/);
+  assert.match(html, /<meta name="color-scheme" content="light" \/>/);
+  assert.match(css, /color-scheme:\s*light/);
+  assert.doesNotMatch(css, /data-theme|box-shadow/);
 });

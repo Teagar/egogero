@@ -14,6 +14,7 @@ import {
   setAuthFailureHandler,
   takeInvitationToken
 } from './api';
+import brandMark from './assets/brand-mark.svg?no-inline';
 
 type Condominium = { id: string; nome: string; responsavel: string; tipo: string; timezone: string };
 type Resident = { id: string; nome: string; endereco: Record<string, string | null> };
@@ -86,7 +87,7 @@ function useResource<T>(key: string, loader: (signal: AbortSignal) => Promise<T>
   return { state, retry: () => setAttempt((value) => value + 1) };
 }
 
-function Brand() { return <span className="brand"><span className="brand-mark" aria-hidden="true">T</span> Teagar</span>; }
+function Brand() { return <span className="brand"><img src={brandMark} alt="" />Teagar</span>; }
 function Notice({ children, kind = 'error' }: { children: ReactNode; kind?: 'error' | 'success' }) { return <div className={`notice ${kind}`} role="alert">{children}</div>; }
 function Empty({ children }: { children: ReactNode }) { return <div className="empty"><span className="registration" aria-hidden="true" />{children}</div>; }
 function LoadingBlock({ label = 'Carregando dados autorizados...' }: { label?: string }) { return <div className="empty" aria-busy="true">{label}</div>; }
