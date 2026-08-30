@@ -316,7 +316,7 @@ async function main() {
         OIDC_PKCE_CURRENT_KEY_VERSION: '1', OIDC_RETURN_TO_PREFIXES: '/,/app,/logout-all/continue',
         SESSION_CSRF_KEYS: JSON.stringify({ 1: randomBytes(32).toString('base64url') }), SESSION_CSRF_CURRENT_KEY_VERSION: '1',
         OIDC_RECOVERY_URL: `${OIDC_ORIGIN}/recovery`, RECOVERY_WEBHOOK_ISSUERS: OIDC_ORIGIN,
-        RECOVERY_WEBHOOK_SECRET: 'pc31-recovery-webhook-secret-at-least-32-bytes',
+        RECOVERY_WEBHOOK_KEYS: JSON.stringify({ 1: 'pc31-recovery-webhook-secret-at-least-32-bytes' }),
         HUMAN_MFA_ROLE_POLICY: JSON.stringify({
           provedor: { amr: ['webauthn'], acr: ['strong'] }, sindico: { amr: ['webauthn'], acr: ['strong'] },
           morador: { amr: ['otp', 'webauthn'], acr: [] }, portaria: { amr: ['webauthn'], acr: ['strong'] }

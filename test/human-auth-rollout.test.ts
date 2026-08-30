@@ -61,8 +61,8 @@ test('rollout admin endpoint is provider-only and validates an exact secret-free
       } as never; return { principalType: 'human', authMethod: 'oidc-session', id: providerId, accountId: providerId,
         sessionId: providerId, role: 'provedor', condominioIds: null } as const; } },
       authRateLimiter: { async check() { return { allowed: true, retryAfterSeconds: 0, repeatedExcess: false }; },
-        async reserveFailure() { return { allowed: true, retryAfterSeconds: 0, repeatedExcess: false,
-          reservationId: providerId }; }, async finalizeFailure() {} },
+        async reserve() { return { allowed: true, retryAfterSeconds: 0, repeatedExcess: false,
+          reservationId: providerId }; }, async finalize() {} },
       humanAuthRolloutService: { async getPolicies() { return []; }, async setPolicy() { calls.push('stale'); return null; } } as never
     });
     const stale = await staleApp.inject({ method: 'PUT', url: '/admin/human-auth/rollout',

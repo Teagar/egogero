@@ -38,7 +38,8 @@ export type AuthAlertType =
   | 'cross_tenant_access_denied'
   | 'provider_configuration_drift'
   | 'session_revocation_slo'
-  | 'unusual_session_creation';
+  | 'unusual_session_creation'
+  | 'recovery_revocation_slo_breach';
 
 export interface AuthAlertSink {
   emit(type: AuthAlertType, details: Readonly<Record<string, unknown>>): void | Promise<void>;
@@ -117,14 +118,15 @@ export const DEFAULT_AUTH_ALERT_ROUTES: AuthAlertRoutingConfig = {
   cross_tenant_access_denied: ['security'],
   provider_configuration_drift: ['security', 'identity'],
   session_revocation_slo: ['security', 'identity'],
-  unusual_session_creation: ['security', 'abuse']
+  unusual_session_creation: ['security', 'abuse'],
+  recovery_revocation_slo_breach: ['security', 'identity']
 };
 
 const AUTH_ALERT_TYPES: readonly AuthAlertType[] = [
   'rate_limit_repeated_excess', 'crypto_integrity_failure', 'crypto_key_failure',
   'oidc_replay_or_state_miss', 'oidc_issuer_mixup', 'oidc_callback_success_slo',
   'session_lookup_latency_slo', 'cross_tenant_access_denied', 'provider_configuration_drift',
-  'session_revocation_slo', 'unusual_session_creation'
+  'session_revocation_slo', 'unusual_session_creation', 'recovery_revocation_slo_breach'
 ];
 const AUTH_ALERT_ROUTES = new Set<AuthAlertRoute>(['security', 'identity', 'abuse', 'database']);
 
@@ -286,7 +288,8 @@ export type StructuredAuthTelemetry = {
 
 const CRITICAL_ALERTS = new Set<AuthAlertType>([
   'crypto_integrity_failure', 'crypto_key_failure', 'oidc_replay_or_state_miss', 'oidc_issuer_mixup',
-  'cross_tenant_access_denied', 'provider_configuration_drift', 'session_revocation_slo', 'unusual_session_creation'
+  'cross_tenant_access_denied', 'provider_configuration_drift', 'session_revocation_slo',
+  'unusual_session_creation', 'recovery_revocation_slo_breach'
 ]);
 const DIMENSIONS: Record<AuthMetricName, Readonly<Record<string, readonly string[]>>> = {
   auth_oidc_callback_total: { outcome: ['success', 'failure'], reason: ['none', 'state', 'issuer', 'crypto', 'account', 'validation'] },

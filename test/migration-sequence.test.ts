@@ -32,7 +32,8 @@ test('migrations form one exact contiguous immutable sequence', async () => {
     '0023_add_human_gatehouse_access_audit',
     '0024_add_reauthentication_start_intent',
     '0025_add_human_auth_rollout',
-    '0026_add_rollout_deployment_authorization'
+    '0026_add_rollout_deployment_authorization',
+    '0027_add_recovery_revocation_queue'
   ]);
 });
 
@@ -43,4 +44,14 @@ test('reauthentication migration binds trusted intent to a UUID family in both h
   ), 'utf8');
   assert.equal((sql.match(/"reauthenticationFamilyId" UUID/g) ?? []).length, 2);
   assert.equal((sql.match(/"reauthenticationIntent" = \("reauthenticationFamilyId" IS NOT NULL\)/g) ?? []).length, 2);
+});
+
+test('recovery revocation queue migration remains additive', async () => {
+  const sql = await readFile(new URL(
+    '../prisma/migrations/0027_add_recovery_revocation_queue/migration.sql',
+    import.meta.url
+  ), 'utf8');
+  assert.doesNotMatch(sql, /DROP (?:COLUMN|INDEX)/);
+  assert.match(sql, /ALTER COLUMN subject DROP NOT NULL/);
+  assert.match(sql, /ALTER COLUMN "processedAt" DROP NOT NULL/);
 });

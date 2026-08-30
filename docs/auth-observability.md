@@ -61,7 +61,8 @@ observations have conservative histogram p95 above 20 ms.
 
 Alerts cover repeated limiter excess, PKCE/CSRF integrity or key failures, state misses and
 replay, issuer mix-up, callback/session SLOs, cross-tenant policy inconsistency, provider
-configuration drift, revocation over five seconds, and unusual rate-limited session creation. Alert payloads pass
+configuration drift, session revocation over five seconds, unusual rate-limited session creation,
+and the critical five-second recovery-revocation acknowledgement SLO. Alert payloads pass
 through recursive defensive redaction. Authorization/cookie headers and raw session, OIDC,
 invitation, device, digest, ciphertext, nonce, authentication-tag, client-secret, and code
 fields are replaced. Request bodies are not telemetry payloads.
@@ -106,8 +107,8 @@ Each snapshot contains only:
 | `sequence` | Strictly increasing within one process instance |
 | `counters[]` | Delta counters with allowlisted metric dimensions and safe integer values |
 | `histograms[]` | Delta, non-cumulative bucket counts in seconds; bounds `1,2.5,5,10,20,50,100,250,500,1000ms`, plus overflow |
-| `alerts` | Counts keyed only by the eleven bounded `AuthAlertType` routes |
-| `criticalIncidentCount` | Crypto integrity/key, replay/state-miss, issuer mix-up, cross-tenant denial, provider drift, revocation-SLO, and unusual-session total |
+| `alerts` | Counts keyed only by the twelve bounded `AuthAlertType` routes |
+| `criticalIncidentCount` | Crypto integrity/key, replay/state-miss, issuer mix-up, cross-tenant denial, provider drift, session/recovery revocation-SLO, and unusual-session total |
 | `observability` | `healthy` or `degraded`, with bounded sink, routing, clock, and numeric gap code/count pairs |
 
 Snapshots contain no raw observations or alert details. They must not contain account,

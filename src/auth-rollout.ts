@@ -28,11 +28,13 @@ const HISTOGRAM_DIMENSIONS: Readonly<Record<string, Readonly<Record<string, read
 const ALERT_TYPES = new Set([
   'rate_limit_repeated_excess', 'crypto_integrity_failure', 'crypto_key_failure', 'oidc_replay_or_state_miss',
   'oidc_issuer_mixup', 'oidc_callback_success_slo', 'session_lookup_latency_slo',
-  'cross_tenant_access_denied', 'provider_configuration_drift', 'session_revocation_slo', 'unusual_session_creation'
+  'cross_tenant_access_denied', 'provider_configuration_drift', 'session_revocation_slo',
+  'unusual_session_creation', 'recovery_revocation_slo_breach'
 ]);
 const CRITICAL_ALERT_TYPES = new Set([
   'crypto_integrity_failure', 'crypto_key_failure', 'oidc_replay_or_state_miss', 'oidc_issuer_mixup',
-  'cross_tenant_access_denied', 'provider_configuration_drift', 'session_revocation_slo', 'unusual_session_creation'
+  'cross_tenant_access_denied', 'provider_configuration_drift', 'session_revocation_slo',
+  'unusual_session_creation', 'recovery_revocation_slo_breach'
 ]);
 const INSTANCE_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const EVIDENCE_STAGE_ID = /^(?:staging|production):(?!non-canary$)[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?$/;

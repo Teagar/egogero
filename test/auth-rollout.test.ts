@@ -222,9 +222,10 @@ test('all incident and SLO routes are represented by bounded alert counters', ()
     'cross_tenant_access_denied',
     'crypto_integrity_failure', 'crypto_key_failure', 'oidc_callback_success_slo', 'oidc_issuer_mixup',
     'oidc_replay_or_state_miss', 'provider_configuration_drift', 'rate_limit_repeated_excess',
-    'session_lookup_latency_slo', 'session_revocation_slo', 'unusual_session_creation'
+    'recovery_revocation_slo_breach', 'session_lookup_latency_slo', 'session_revocation_slo',
+    'unusual_session_creation'
   ]);
-  assert.equal(records[0].criticalIncidentCount, 8);
+  assert.equal(records[0].criticalIncidentCount, 9);
 });
 
 test('throwing and rejecting snapshot sinks recover with explicit gap evidence', async () => {
@@ -366,7 +367,6 @@ test('alert routing delivers only bounded routes and reports nonblocking failure
     await new Promise((resolve) => setImmediate(resolve));
   }
   assert.equal(delivered.length, Object.keys(DEFAULT_AUTH_ALERT_ROUTES).length);
-  assert.deepEqual(delivered.map((delivery) => delivery.routes), Object.values(DEFAULT_AUTH_ALERT_ROUTES));
   assert.equal(JSON.stringify(delivered).includes('CANARY'), false);
   assert.deepEqual(delivered.map((delivery) => delivery.routes), Object.values(DEFAULT_AUTH_ALERT_ROUTES));
   assert.deepEqual(gaps, []);
