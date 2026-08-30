@@ -27,8 +27,8 @@ SET "subjectDigest" = "eventDigest",
     "acknowledgedAt" = "processedAt";
 
 ALTER TABLE "RecoveryWebhookEvent"
-  DROP COLUMN subject,
-  DROP COLUMN "processedAt",
+  ALTER COLUMN subject DROP NOT NULL,
+  ALTER COLUMN "processedAt" DROP NOT NULL,
   ALTER COLUMN "subjectDigest" SET NOT NULL,
   ALTER COLUMN "keyVersion" SET NOT NULL,
   ALTER COLUMN status SET NOT NULL,
@@ -57,7 +57,6 @@ ALTER TABLE "RecoveryWebhookEvent"
     OR (status IN ('pending', 'processing', 'retry') AND "acknowledgedAt" IS NULL AND "failedAt" IS NULL)
   );
 
-DROP INDEX "RecoveryWebhookEvent_createdAt_idx";
 CREATE INDEX "RecoveryWebhookEvent_claim_idx"
   ON "RecoveryWebhookEvent" (status, "nextAttemptAt", "createdAt", id);
 CREATE INDEX "RecoveryWebhookEvent_lease_idx"

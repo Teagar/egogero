@@ -429,6 +429,8 @@ model RecoveryWebhookEvent {
   eventId        String
   eventDigest    Bytes                    @unique
   issuer         String
+  subject        String?
+  processedAt    DateTime?                @db.Timestamptz(3)
   subjectDigest  Bytes
   keyVersion     Int
   accountId      String?                  @db.Uuid

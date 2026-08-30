@@ -44,3 +44,13 @@ test('reauthentication migration binds trusted intent to a UUID family in both h
   assert.equal((sql.match(/"reauthenticationFamilyId" UUID/g) ?? []).length, 2);
   assert.equal((sql.match(/"reauthenticationIntent" = \("reauthenticationFamilyId" IS NOT NULL\)/g) ?? []).length, 2);
 });
+
+test('recovery revocation queue migration remains additive', async () => {
+  const sql = await readFile(new URL(
+    '../prisma/migrations/0026_add_recovery_revocation_queue/migration.sql',
+    import.meta.url
+  ), 'utf8');
+  assert.doesNotMatch(sql, /DROP (?:COLUMN|INDEX)/);
+  assert.match(sql, /ALTER COLUMN subject DROP NOT NULL/);
+  assert.match(sql, /ALTER COLUMN "processedAt" DROP NOT NULL/);
+});
