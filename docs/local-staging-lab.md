@@ -20,7 +20,7 @@ npm run local-staging:login-check
 npm run local-staging:credentials
 ```
 
-The first command generates local credentials if necessary, builds one application image for this worktree, runs the migrations once, seeds one synthetic provider account, and starts the long-running services. Application and worker containers use the restricted `office_application` database role; the one-shot migration and seed containers use the database owner. A path-derived Compose project name isolates containers, images, networks, and volumes from other worktrees.
+The first command generates local credentials if necessary, builds one application image for this worktree, runs the migrations once, seeds one synthetic condominium and separate provider, manager, resident, and gatehouse accounts, and starts the long-running services. Application and worker containers use the restricted `office_application` database role; the one-shot migration and seed containers use the database owner. A path-derived Compose project name isolates containers, images, networks, and volumes from other worktrees.
 
 The lab role inherits `egogero_application` and receives an additional column-level `UPDATE` grant only on `HumanAuthRolloutPolicy.updatedAt`. PostgreSQL requires update privilege on at least one column for the application's `SELECT ... FOR SHARE` rollout gate, even though the query does not mutate the row. The role cannot use this exception to change rollout state, cohort, algorithm, or version. This local grant does not change a migration or claim that the production role wiring has been validated.
 
@@ -32,7 +32,7 @@ The check exports Caddy's local root certificate to `.local-staging/caddy-root.c
 - successful HTTPS probes for the three documented targets and running delivery/recovery worker processes;
 - Grafana's provisioned Prometheus datasource and local-staging dashboard.
 
-`local-staging:login-check` uses the installed Playwright Chromium and the generated synthetic operator credential to complete authorization code + PKCE, validate the ID token callback, and require an authenticated application session. Install the browser once with `npm run test:e2e:install` if it is unavailable.
+`local-staging:login-check` uses the installed Playwright Chromium and all four generated synthetic credentials to complete authorization code + PKCE, validate each ID token callback, and require an authenticated application session with the expected role and screen. It clears only the disposable lab's authentication rate-limit counters before and after this synthetic batch so the check is repeatable and does not consume the manual test allowance. Install the browser once with `npm run test:e2e:install` if it is unavailable.
 
 Endpoints:
 
@@ -47,7 +47,7 @@ The generated usernames and passwords are printed only by `npm run local-staging
 
 Caddy issues certificates from a per-lab local CA. Import `.local-staging/caddy-root.crt` into a disposable browser profile before testing login. Do not install it as a broad organizational or production trust anchor. Remove the imported CA when the lab is discarded.
 
-Open the application, choose login, and use the generated `operator` password. The realm emits a hard-coded `amr=["webauthn"]` claim solely to exercise the application's strict role-MFA parsing and session path without physical hardware. This is synthetic protocol plumbing, not proof that Keycloak performed phishing-resistant MFA. The realm also does not provide the real external recovery webhook or prove external session revocation.
+Open the application, choose login, and use one of the generated `provedor`, `sindico`, `morador`, or `portaria` credentials. Each account exposes its corresponding role screen against the same synthetic condominium. The realm emits a hard-coded `amr=["webauthn"]` claim solely to exercise the application's strict role-MFA parsing and session path without physical hardware. This is synthetic protocol plumbing, not proof that Keycloak performed phishing-resistant MFA. The realm also does not provide the real external recovery webhook or prove external session revocation.
 
 ## Observability scope
 
