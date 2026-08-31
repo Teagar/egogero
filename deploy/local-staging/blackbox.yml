@@ -1,0 +1,10 @@
+modules:
+  local_https_2xx:
+    prober: http
+    timeout: 5s
+    http:
+      method: GET
+      preferred_ip_protocol: ip4
+      follow_redirects: false
+      tls_config:
+        ca_file: /local-ca/root.crt

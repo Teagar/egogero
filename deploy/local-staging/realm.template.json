@@ -1,0 +1,73 @@
+{
+  "realm": "office",
+  "enabled": true,
+  "displayName": "Egogero Local Staging",
+  "sslRequired": "external",
+  "registrationAllowed": false,
+  "resetPasswordAllowed": true,
+  "loginWithEmailAllowed": true,
+  "clients": [
+    {
+      "clientId": "office-local-staging",
+      "name": "Office local staging",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "secret": "__OIDC_CLIENT_SECRET__",
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "redirectUris": ["https://office.localhost:8443/auth/callback"],
+      "webOrigins": ["https://office.localhost:8443"],
+      "attributes": {
+        "pkce.code.challenge.method": "S256"
+      },
+      "defaultClientScopes": ["web-origins", "acr", "roles", "profile", "email"],
+      "protocolMappers": [
+        {
+          "name": "auth-time",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usersessionmodel-note-mapper",
+          "consentRequired": false,
+          "config": {
+            "user.session.note": "AUTH_TIME",
+            "claim.name": "auth_time",
+            "jsonType.label": "long",
+            "id.token.claim": "true",
+            "access.token.claim": "true"
+          }
+        },
+        {
+          "name": "synthetic-lab-amr",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-hardcoded-claim-mapper",
+          "consentRequired": false,
+          "config": {
+            "claim.name": "amr",
+            "claim.value": "[\"webauthn\"]",
+            "jsonType.label": "JSON",
+            "id.token.claim": "true",
+            "access.token.claim": "true"
+          }
+        }
+      ]
+    }
+  ],
+  "users": [
+    {
+      "id": "46000000-0000-4000-8000-000000000100",
+      "username": "operator",
+      "email": "operator@local.invalid",
+      "emailVerified": true,
+      "enabled": true,
+      "firstName": "Local",
+      "lastName": "Operator",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "__LAB_USER_PASSWORD__",
+          "temporary": false
+        }
+      ]
+    }
+  ]
+}

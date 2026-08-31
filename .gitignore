@@ -7,3 +7,4 @@ coverage
 .e2e-tmp/
 playwright-report/
 test-results/
+.local-staging/

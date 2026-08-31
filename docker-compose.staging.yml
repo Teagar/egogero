@@ -1,0 +1,248 @@
+x-office-image: &office-image
+  build: .
+  image: ${COMPOSE_PROJECT_NAME:-office-local-staging}-app:local-staging
+
+x-office-runtime: &office-runtime
+  read_only: true
+  tmpfs:
+    - /tmp:size=64m,mode=1777
+  security_opt:
+    - no-new-privileges:true
+
+services:
+  db:
+    image: postgres:16-alpine
+    env_file: .local-staging/postgres.env
+    volumes:
+      - office_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U office -d office"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+    restart: unless-stopped
+
+  keycloak-db:
+    image: postgres:16-alpine
+    env_file: .local-staging/keycloak-postgres.env
+    volumes:
+      - keycloak_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U keycloak -d keycloak"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+    restart: unless-stopped
+
+  migrate:
+    <<: [*office-image, *office-runtime]
+    command: ["npm", "run", "db:migrate:deploy"]
+    env_file: .local-staging/migration.env
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+
+  seed:
+    image: postgres:16-alpine
+    env_file: .local-staging/seed.env
+    volumes:
+      - ./deploy/local-staging/seed.sql:/seed.sql:ro
+    command:
+      - sh
+      - -ec
+      - psql -h db -U office -d office -v runtime_password="$${RUNTIME_DB_PASSWORD}" -v monitor_password="$${MONITOR_DB_PASSWORD}" -f /seed.sql
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: "no"
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.3.3
+    command: ["start", "--import-realm"]
+    env_file: .local-staging/keycloak.env
+    environment:
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://keycloak-db:5432/keycloak
+      KC_HTTP_ENABLED: "true"
+      KC_HEALTH_ENABLED: "true"
+      KC_HOSTNAME: https://auth.localhost:8443
+      KC_HOSTNAME_STRICT: "true"
+      KC_PROXY_HEADERS: xforwarded
+    volumes:
+      - ./.local-staging/realm.json:/opt/keycloak/data/import/realm.json:ro
+    depends_on:
+      keycloak-db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "bash -ec 'exec 3<>/dev/tcp/127.0.0.1/9000; printf \"GET /health/ready HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n\" >&3; grep -q \"200 OK\" <&3'"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2.10.2-alpine
+    environment:
+      XDG_DATA_HOME: /data
+      XDG_CONFIG_HOME: /config
+    ports:
+      - "127.0.0.1:8443:8443"
+    volumes:
+      - ./deploy/local-staging/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      default:
+        ipv4_address: 172.31.46.254
+        aliases:
+          - office.localhost
+          - auth.localhost
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:2019/config/"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+    restart: unless-stopped
+
+  ca-export:
+    image: caddy:2.10.2-alpine
+    command:
+      - sh
+      - -ec
+      - until [ -r /caddy-data/caddy/pki/authorities/local/root.crt ]; do sleep 1; done; cp /caddy-data/caddy/pki/authorities/local/root.crt /local-ca/root.crt; chmod 0444 /local-ca/root.crt
+    volumes:
+      - caddy_data:/caddy-data:ro
+      - local_ca:/local-ca
+    depends_on:
+      caddy:
+        condition: service_healthy
+    restart: "no"
+
+  app:
+    <<: [*office-image, *office-runtime]
+    command: ["sh", "-ec", "until [ -r \"$${NODE_EXTRA_CA_CERTS}\" ]; do sleep 1; done; exec node dist/src/server.js"]
+    env_file: .local-staging/app.env
+    environment:
+      NODE_EXTRA_CA_CERTS: /local-ca/root.crt
+    volumes:
+      - local_ca:/local-ca:ro
+    depends_on:
+      seed:
+        condition: service_completed_successfully
+      keycloak:
+        condition: service_healthy
+      caddy:
+        condition: service_healthy
+      ca-export:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/ready').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    restart: unless-stopped
+
+  delivery-worker:
+    <<: [*office-image, *office-runtime]
+    command: ["npm", "run", "delivery:worker"]
+    env_file: .local-staging/delivery-worker.env
+    depends_on:
+      app:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "process.kill(1, 0)"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+    restart: unless-stopped
+
+  recovery-worker:
+    <<: [*office-image, *office-runtime]
+    command: ["npm", "run", "recovery:worker"]
+    env_file: .local-staging/recovery-worker.env
+    depends_on:
+      app:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "process.kill(1, 0)"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+    restart: unless-stopped
+
+  postgres-exporter:
+    image: quay.io/prometheuscommunity/postgres-exporter:v0.17.1
+    env_file: .local-staging/postgres-exporter.env
+    depends_on:
+      seed:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  blackbox-exporter:
+    image: quay.io/prometheus/blackbox-exporter:v0.27.0
+    command: ["--config.file=/etc/blackbox/blackbox.yml"]
+    volumes:
+      - ./deploy/local-staging/blackbox.yml:/etc/blackbox/blackbox.yml:ro
+      - local_ca:/local-ca:ro
+    depends_on:
+      app:
+        condition: service_healthy
+    restart: unless-stopped
+
+  prometheus:
+    image: quay.io/prometheus/prometheus:v3.5.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=7d
+    ports:
+      - "127.0.0.1:9090:9090"
+    volumes:
+      - ./deploy/local-staging/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    depends_on:
+      - blackbox-exporter
+      - postgres-exporter
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:12.1.1
+    env_file: .local-staging/grafana.env
+    environment:
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+    ports:
+      - "127.0.0.1:3002:3000"
+    volumes:
+      - ./deploy/local-staging/grafana/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./deploy/local-staging/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./deploy/local-staging/grafana/dashboard.json:/var/lib/grafana/dashboards/local-staging.json:ro
+    depends_on:
+      - prometheus
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:3000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    restart: unless-stopped
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 172.31.46.0/24
+
+volumes:
+  office_db_data:
+  keycloak_db_data:
+  caddy_data:
+  caddy_config:
+  local_ca:
+  prometheus_data:
