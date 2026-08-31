@@ -1,0 +1,9 @@
+https://office.localhost:8443 {
+	tls internal
+	reverse_proxy app:3000
+}
+
+https://auth.localhost:8443 {
+	tls internal
+	reverse_proxy keycloak:8080
+}

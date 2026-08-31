@@ -22,7 +22,14 @@
     "auth:rotation:rehearse": "node scripts/rehearse-auth-key-rotation.mjs",
     "auth:alerts:smoke": "tsx src/auth-alert-smoke.ts",
     "auth:rollout:evaluate": "tsx src/auth-rollout.ts",
-    "recovery:worker": "node dist/src/jobs/process-recovery-revocations.js"
+    "recovery:worker": "node dist/src/jobs/process-recovery-revocations.js",
+    "local-staging:configure": "node scripts/local-staging.mjs configure",
+    "local-staging:up": "node scripts/local-staging.mjs up",
+    "local-staging:check": "node scripts/local-staging.mjs check",
+    "local-staging:login-check": "node scripts/check-local-staging-login.mjs",
+    "local-staging:credentials": "node scripts/local-staging.mjs credentials",
+    "local-staging:down": "node scripts/local-staging.mjs down",
+    "local-staging:reset": "node scripts/local-staging.mjs reset"
   },
   "dependencies": {
     "@fastify/static": "^10.1.3",
