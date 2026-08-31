@@ -26,6 +26,12 @@ const requiredFiles = [
   'grafana.env',
   'realm.json'
 ];
+const labUsers = [
+  { username: 'provedor', role: 'provedor', placeholder: '__PROVEDOR_PASSWORD__' },
+  { username: 'sindico', role: 'sindico', placeholder: '__SINDICO_PASSWORD__' },
+  { username: 'morador', role: 'morador', placeholder: '__MORADOR_PASSWORD__' },
+  { username: 'portaria', role: 'portaria', placeholder: '__PORTARIA_PASSWORD__' }
+];
 const composeArguments = ['compose', '--project-name', projectName, '-f', composeFile];
 
 const action = process.argv[2] ?? 'configure';
@@ -82,7 +88,7 @@ async function configure() {
   const monitorDatabasePassword = secret();
   const idempotencySecret = secret();
   const oidcClientSecret = secret();
-  const labUserPassword = secret(24);
+  const labUserPasswords = Object.fromEntries(labUsers.map((user) => [user.username, secret(24)]));
   const keycloakAdminPassword = secret(24);
   const grafanaAdminPassword = secret(24);
   const issuer = 'https://auth.localhost:8443/realms/office';
@@ -171,9 +177,8 @@ async function configure() {
   ]);
 
   const template = await readFile(realmTemplate, 'utf8');
-  const realm = template
-    .replace('__OIDC_CLIENT_SECRET__', oidcClientSecret)
-    .replace('__LAB_USER_PASSWORD__', labUserPassword);
+  let realm = template.replace('__OIDC_CLIENT_SECRET__', oidcClientSecret);
+  for (const user of labUsers) realm = realm.replace(user.placeholder, labUserPasswords[user.username]);
   JSON.parse(realm);
   await writeSecure('realm.json', realm);
   process.stdout.write('Generated local-only credentials under .local-staging/.\n');
@@ -238,9 +243,15 @@ async function credentials() {
   const keycloak = parseEnv(await readFile(path.join(runtimeDirectory, 'keycloak.env'), 'utf8'));
   const realm = JSON.parse(await readFile(path.join(runtimeDirectory, 'realm.json'), 'utf8'));
   const grafana = parseEnv(await readFile(path.join(runtimeDirectory, 'grafana.env'), 'utf8'));
+  const users = labUsers.map(({ username, role }) => {
+    const password = realm.users.find((user) => user.username === username)
+      ?.credentials?.find((credential) => credential.type === 'password')?.value;
+    if (!password) throw new Error(`Generated local ${username} credential is unavailable`);
+    return `OIDC ${role}: ${username} / ${password}`;
+  });
   process.stdout.write([
     'Application: https://office.localhost:8443',
-    `OIDC user: operator / ${realm.users[0].credentials[0].value}`,
+    ...users,
     'Keycloak: https://auth.localhost:8443/admin',
     `Keycloak admin: ${keycloak.KC_BOOTSTRAP_ADMIN_USERNAME} / ${keycloak.KC_BOOTSTRAP_ADMIN_PASSWORD}`,
     'Grafana: http://127.0.0.1:3002',

@@ -55,16 +55,64 @@
   "users": [
     {
       "id": "46000000-0000-4000-8000-000000000100",
-      "username": "operator",
-      "email": "operator@local.invalid",
+      "username": "provedor",
+      "email": "provedor@local.invalid",
       "emailVerified": true,
       "enabled": true,
       "firstName": "Local",
-      "lastName": "Operator",
+      "lastName": "Provedor",
       "credentials": [
         {
           "type": "password",
-          "value": "__LAB_USER_PASSWORD__",
+          "value": "__PROVEDOR_PASSWORD__",
+          "temporary": false
+        }
+      ]
+    },
+    {
+      "id": "46000000-0000-4000-8000-000000000200",
+      "username": "sindico",
+      "email": "sindico@local.invalid",
+      "emailVerified": true,
+      "enabled": true,
+      "firstName": "Local",
+      "lastName": "Sindico",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "__SINDICO_PASSWORD__",
+          "temporary": false
+        }
+      ]
+    },
+    {
+      "id": "46000000-0000-4000-8000-000000000300",
+      "username": "morador",
+      "email": "morador@local.invalid",
+      "emailVerified": true,
+      "enabled": true,
+      "firstName": "Local",
+      "lastName": "Morador",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "__MORADOR_PASSWORD__",
+          "temporary": false
+        }
+      ]
+    },
+    {
+      "id": "46000000-0000-4000-8000-000000000400",
+      "username": "portaria",
+      "email": "portaria@local.invalid",
+      "emailVerified": true,
+      "enabled": true,
+      "firstName": "Local",
+      "lastName": "Portaria",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "__PORTARIA_PASSWORD__",
           "temporary": false
         }
       ]
