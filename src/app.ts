@@ -164,6 +164,7 @@ export type Readiness = {
   humanAuthEnabled: boolean;
   oidcMetadataValidated: boolean;
   requiredServicesComposed: boolean;
+  checkHumanAuthRolloutPolicy?(): Promise<void>;
 };
 
 type CondominioBody = Partial<Record<keyof CondominioCreateData, unknown>>;
@@ -546,6 +547,10 @@ export function createApp(
         throw new Error('Human authentication is not ready');
       }
       await readiness.checkDatabase();
+      if (readiness.humanAuthEnabled) {
+        if (!readiness.checkHumanAuthRolloutPolicy) throw new Error('Human authentication policy readiness is not configured');
+        await readiness.checkHumanAuthRolloutPolicy();
+      }
       return { status: 'ready' };
     } catch {
       return reply.status(503).send({ status: 'unavailable' });

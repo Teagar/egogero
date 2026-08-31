@@ -30,8 +30,8 @@ const pkceTestKeys = new Map([
 
 const permissiveAuthRateLimiter = {
   async check() { return { allowed: true, retryAfterSeconds: 0, repeatedExcess: false }; },
-  async reserveFailure() { return { allowed: true, retryAfterSeconds: 0, repeatedExcess: false, reservationId: randomUUID() }; },
-  async finalizeFailure() {}
+  async reserve() { return { allowed: true, retryAfterSeconds: 0, repeatedExcess: false, reservationId: randomUUID() }; },
+  async finalize() {}
 } satisfies AuthRateLimiter;
 
 function createOidcService(
@@ -344,10 +344,10 @@ test('OIDC callback preserves state and performs no provider exchange after dist
           ? { allowed: true, retryAfterSeconds: 0, repeatedExcess: false }
           : { allowed: false, retryAfterSeconds: 30, repeatedExcess: true };
       },
-      async reserveFailure() {
+      async reserve() {
         return { allowed: false, retryAfterSeconds: 30, repeatedExcess: true };
       },
-      async finalizeFailure() {}
+      async finalize() {}
     }
   });
   const authorization = await service.startLogin({ requestCorrelationId: 'limited-login' });
@@ -407,16 +407,16 @@ test('OIDC callback finalizes exact exchange reservations as success or failure'
   const config = configuration();
   const database = memoryStore();
   const provider = await mockProvider(config);
-  const finalized: Array<{ reservationId: string; outcome: 'success' | 'failure' }> = [];
+  const finalized: Array<{ reservationId: string; outcome: 'consume' | 'release' }> = [];
   let sequence = 0;
   const service = await createOidcService(config, database.store, provider.fetchImplementation, {
     rateLimiter: {
       async check() { return { allowed: true, retryAfterSeconds: 0, repeatedExcess: false }; },
-      async reserveFailure() {
+      async reserve() {
         sequence += 1;
         return { allowed: true, retryAfterSeconds: 0, repeatedExcess: false, reservationId: `reservation-${sequence}` };
       },
-      async finalizeFailure(reservationId, outcome) { finalized.push({ reservationId, outcome }); }
+      async finalize(reservationId, outcome) { finalized.push({ reservationId, outcome }); }
     }
   });
 
@@ -433,8 +433,8 @@ test('OIDC callback finalizes exact exchange reservations as success or failure'
     callbackUrl: callbackUrl(config, failed), requestCorrelationId: 'reserved-failure-callback', ipPrefix: '192.0.2.0/24'
   }), OidcCallbackError);
   assert.deepEqual(finalized, [
-    { reservationId: 'reservation-1', outcome: 'success' },
-    { reservationId: 'reservation-2', outcome: 'failure' }
+    { reservationId: 'reservation-1', outcome: 'release' },
+    { reservationId: 'reservation-2', outcome: 'consume' }
   ]);
 });
 
@@ -669,10 +669,14 @@ test('OIDC startup fails closed on metadata drift and never follows redirects', 
   const database = memoryStore();
   const provider = await mockProvider(config);
   provider.metadata = { token_endpoint: 'https://attacker.example/token' };
+  const telemetry = createAuthTestCollectors();
   await assert.rejects(
-    createOidcService(config, database.store, provider.fetchImplementation),
+    createOidcService(config, database.store, provider.fetchImplementation, { alerts: telemetry.alertSink }),
     /OIDC initialization failed/
   );
+  assert.deepEqual(telemetry.alerts.map((alert) => alert.type), [
+    'provider_configuration_drift', 'crypto_key_failure'
+  ]);
 
   const redirectingFetch: typeof fetch = async () => new Response(null, {
     status: 302,

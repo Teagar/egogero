@@ -23,9 +23,12 @@ import {
   createRoutedAuthAlertSink,
   createStructuredAuthTelemetry,
   DEFAULT_AUTH_ALERT_ROUTES,
+  prepareAuthSnapshotFile,
   type AuthAlertDelivery,
   type AuthSnapshotSink
 } from '../src/auth-observability.js';
+import { AUTH_ALERT_SMOKE_CONTRACT, runAuthAlertSmoke } from '../src/auth-alert-smoke.js';
+import { AUTH_RATE_LIMIT_POLICIES } from '../src/auth-rate-limits.js';
 
 const start = Date.parse('2026-08-01T00:00:00.000Z');
 
@@ -34,7 +37,7 @@ function snapshot(overrides: Partial<AuthRolloutSnapshot> = {}): AuthRolloutSnap
   return {
     contract: AUTH_ROLLOUT_CONTRACT,
     interval: { start: new Date(start).toISOString(), end: new Date(start + 24 * 60 * 60_000).toISOString() },
-    instanceId: '00000000-0000-4000-8000-000000000001',
+    stageId: 'staging:pc-37', instanceId: '00000000-0000-4000-8000-000000000001',
     sequence: 1,
     counters: [
       { metric: 'auth_oidc_callback_total', dimensions: { outcome: 'success', reason: 'none' }, value: 199 },
@@ -57,7 +60,7 @@ function inventory(instances: AuthRolloutInventory['servingInstances'] = [{
   expectedEnd: new Date(start + 24 * 60 * 60_000).toISOString(),
   cadenceMs: 24 * 60 * 60_000
 }]): AuthRolloutInventory {
-  return { contract: AUTH_ROLLOUT_INVENTORY_CONTRACT, servingInstances: instances };
+  return { contract: AUTH_ROLLOUT_INVENTORY_CONTRACT, stageId: 'staging:pc-37', servingInstances: instances };
 }
 
 test('rollout evaluator passes exact callback, latency, and 24 hour boundaries', () => {
@@ -75,11 +78,25 @@ test('rollout evaluator cannot pass without valid independent inventory or decla
   }]));
   assert.equal(tooSparse.result, 'inconclusive');
   assert.ok(tooSparse.reasons.includes('instance_cadence_exceeded'));
+  assert.ok(evaluateAuthRolloutSnapshots([
+    snapshot({ stageId: 'staging:non-canary' })
+  ], { ...inventory(), stageId: 'staging:non-canary' }).reasons.includes('invalid_snapshot'));
+});
+
+test('rollout evaluator rejects stage mixing and excludes foreign-stage totals', () => {
+  const foreign = snapshot({
+    stageId: 'production:other', alerts: { cross_tenant_access_denied: 1 }, criticalIncidentCount: 1
+  });
+  const result = evaluateAuthRolloutSnapshots([snapshot(), foreign], inventory());
+  assert.equal(result.result, 'inconclusive');
+  assert.equal(result.stageId, 'staging:pc-37');
+  assert.equal(result.totals.criticalIncidents, 0);
+  assert.ok(result.reasons.includes('stage_mismatch'));
 });
 
 test('rollout evaluator aggregates concurrent instances without averaging percentiles', () => {
   const slow = snapshot({
-    instanceId: '00000000-0000-4000-8000-000000000002',
+    stageId: 'staging:pc-37', instanceId: '00000000-0000-4000-8000-000000000002',
     counters: [{ metric: 'auth_oidc_callback_total', dimensions: { outcome: 'success', reason: 'none' }, value: 200 }],
     histograms: [{
       metric: 'auth_session_lookup_seconds', dimensions: { operation: 'inspect', outcome: 'hit' }, unit: 'seconds',
@@ -168,7 +185,7 @@ test('snapshot dimensions are allowlisted and alert payload canaries never enter
   const records: AuthRolloutSnapshot[] = [];
   let clock = start;
   const telemetry = createStructuredAuthTelemetry((record) => { records.push(record); }, {
-    instanceId: '00000000-0000-4000-8000-000000000003', now: () => clock
+    stageId: 'staging:pc-37', instanceId: '00000000-0000-4000-8000-000000000003', now: () => clock
   });
   telemetry.metrics.increment('auth_oidc_callback_total', { outcome: canary, reason: canary });
   telemetry.metrics.observe('auth_session_lookup_seconds', 0.01, { operation: canary, outcome: canary, account: canary });
@@ -183,16 +200,19 @@ test('snapshot dimensions are allowlisted and alert payload canaries never enter
     instanceId: records[0].instanceId, expectedStart: records[0].interval.start,
     expectedEnd: records[0].interval.end, cadenceMs: 60_000
   }])).reasons.includes('unexpected_dimension'));
+  assert.equal(records[0].contract, AUTH_ROLLOUT_CONTRACT);
+  assert.equal(records[0].stageId, 'staging:pc-37');
 });
 
 test('all incident and SLO routes are represented by bounded alert counters', () => {
   const records: AuthRolloutSnapshot[] = [];
   let clock = start;
   const telemetry = createStructuredAuthTelemetry((record) => { records.push(record); }, {
-    instanceId: '00000000-0000-4000-8000-000000000004', now: () => clock
+    stageId: 'staging:pc-37', instanceId: '00000000-0000-4000-8000-000000000004', now: () => clock
   });
-  for (const type of ['crypto_integrity_failure', 'crypto_key_failure', 'oidc_replay_or_state_miss',
-    'oidc_issuer_mixup', 'rate_limit_repeated_excess'] as const) telemetry.alerts.emit(type, { unsafe: 'ignored' });
+  for (const type of Object.keys(DEFAULT_AUTH_ALERT_ROUTES) as Array<keyof typeof DEFAULT_AUTH_ALERT_ROUTES>) {
+    telemetry.alerts.emit(type, { unsafe: 'ignored' });
+  }
   for (let index = 0; index < 100; index += 1) {
     telemetry.metrics.increment('auth_oidc_callback_total', { outcome: 'failure', reason: 'validation' });
     telemetry.metrics.observe('auth_session_lookup_seconds', 0.05, { operation: 'authenticate', outcome: 'hit' });
@@ -200,10 +220,31 @@ test('all incident and SLO routes are represented by bounded alert counters', ()
   clock += 60_000;
   telemetry.flush();
   assert.deepEqual(Object.keys(records[0].alerts).sort(), [
+    'cross_tenant_access_denied',
     'crypto_integrity_failure', 'crypto_key_failure', 'oidc_callback_success_slo', 'oidc_issuer_mixup',
-    'oidc_replay_or_state_miss', 'rate_limit_repeated_excess', 'session_lookup_latency_slo'
+    'oidc_replay_or_state_miss', 'provider_configuration_drift', 'rate_limit_repeated_excess',
+    'recovery_revocation_slo_breach', 'session_lookup_latency_slo', 'session_revocation_slo',
+    'unusual_session_creation'
   ]);
-  assert.equal(records[0].criticalIncidentCount, 4);
+  assert.equal(records[0].criticalIncidentCount, 9);
+});
+
+test('every normative auth limiter action remains a bounded rollout dimension', () => {
+  const records: AuthRolloutSnapshot[] = [];
+  let clock = start;
+  const telemetry = createStructuredAuthTelemetry((record) => { records.push(record); }, {
+    stageId: 'staging:pc-38', instanceId: '00000000-0000-4000-8000-000000000014', now: () => clock
+  });
+  for (const operation of Object.keys(AUTH_RATE_LIMIT_POLICIES)) {
+    telemetry.metrics.increment('auth_rate_limit_decisions_total', { operation, outcome: 'allowed' });
+  }
+  clock += 60_000;
+  telemetry.flush();
+  const dimensions = records[0].counters
+    .filter(({ metric }) => metric === 'auth_rate_limit_decisions_total')
+    .map(({ dimensions: labels }) => labels.operation).sort();
+  assert.deepEqual(dimensions, Object.keys(AUTH_RATE_LIMIT_POLICIES).sort());
+  assert.equal(dimensions.includes('other'), false);
 });
 
 test('throwing and rejecting snapshot sinks recover with explicit gap evidence', async () => {
@@ -217,7 +258,7 @@ test('throwing and rejecting snapshot sinks recover with explicit gap evidence',
     recovered.push(record);
   };
   const telemetry = createStructuredAuthTelemetry(sink, {
-    instanceId: '00000000-0000-4000-8000-000000000005', now: () => clock, sinkTimeoutMs: 5
+    stageId: 'staging:pc-37', instanceId: '00000000-0000-4000-8000-000000000005', now: () => clock, sinkTimeoutMs: 5
   });
   clock += 1_000;
   assert.doesNotThrow(() => telemetry.flush());
@@ -238,7 +279,7 @@ test('never-settling snapshot writes keep one active and one pending operation',
     calls += 1;
     return new Promise<void>(() => {});
   }, {
-    instanceId: '00000000-0000-4000-8000-000000000006', now: () => wall,
+    stageId: 'staging:pc-37', instanceId: '00000000-0000-4000-8000-000000000006', now: () => wall,
     monotonicNow: () => monotonic, sinkTimeoutMs: 5
   });
   for (let index = 0; index < 100; index += 1) {
@@ -256,7 +297,7 @@ test('never-settling snapshot writes keep one active and one pending operation',
   }
   const stream = new BackpressuredStream();
   const stdoutTelemetry = createStructuredAuthTelemetry(createAuthSnapshotStdoutSink(stream as unknown as NodeJS.WriteStream), {
-    instanceId: '00000000-0000-4000-8000-000000000008', now: () => wall,
+    stageId: 'staging:pc-37', instanceId: '00000000-0000-4000-8000-000000000008', now: () => wall,
     monotonicNow: () => monotonic, sinkTimeoutMs: 5
   });
   for (let index = 0; index < 100; index += 1) {
@@ -269,10 +310,12 @@ test('never-settling snapshot writes keep one active and one pending operation',
 });
 
 test('instance identity and wall-clock anomalies cannot become valid evidence', () => {
-  assert.throws(() => createStructuredAuthTelemetry(() => {}, { instanceId: 'account-or-hostname' }), /UUID v4/);
+  assert.throws(() => createStructuredAuthTelemetry(() => {}, {
+    instanceId: 'account-or-hostname', stageId: 'staging:test'
+  }), /UUID v4/);
   const records: AuthRolloutSnapshot[] = [];
   const telemetry = createStructuredAuthTelemetry((record) => { records.push(record); }, {
-    instanceId: '00000000-0000-4000-8000-000000000007', now: () => start
+    stageId: 'staging:pc-37', instanceId: '00000000-0000-4000-8000-000000000007', now: () => start
   });
   telemetry.flush();
   assert.equal(records[0].observability.gaps[0].code, 'clock_anomaly');
@@ -287,7 +330,7 @@ test('monotonic drift prevents a 24 hour wall-clock jump from fabricating covera
   let monotonic = 0;
   const records: AuthRolloutSnapshot[] = [];
   const telemetry = createStructuredAuthTelemetry((record) => { records.push(record); }, {
-    instanceId: '00000000-0000-4000-8000-000000000009', now: () => wall,
+    stageId: 'staging:pc-37', instanceId: '00000000-0000-4000-8000-000000000009', now: () => wall,
     monotonicNow: () => monotonic, maxClockDriftMs: 1_000
   });
   wall += 24 * 60 * 60_000;
@@ -318,7 +361,7 @@ test('independent serving inventory detects silent instances and accounts for pl
   const midpoint = start + 12 * 60 * 60_000;
   const before = snapshot({ interval: { start: new Date(start).toISOString(), end: new Date(midpoint).toISOString() } });
   const after = snapshot({
-    instanceId: '00000000-0000-4000-8000-000000000002',
+    stageId: 'staging:pc-37', instanceId: '00000000-0000-4000-8000-000000000002',
     interval: { start: new Date(midpoint).toISOString(), end: new Date(start + 24 * 60 * 60_000).toISOString() },
     counters: [], histograms: []
   });
@@ -342,7 +385,7 @@ test('alert routing delivers only bounded routes and reports nonblocking failure
     routing.sink.emit(type, { token: 'CANARY-secret', accountId: 'CANARY-account' });
     await new Promise((resolve) => setImmediate(resolve));
   }
-  assert.equal(delivered.length, 7);
+  assert.equal(delivered.length, Object.keys(DEFAULT_AUTH_ALERT_ROUTES).length);
   assert.equal(JSON.stringify(delivered).includes('CANARY'), false);
   assert.deepEqual(delivered.map((delivery) => delivery.routes), Object.values(DEFAULT_AUTH_ALERT_ROUTES));
   assert.deepEqual(gaps, []);
@@ -354,8 +397,18 @@ test('alert routing delivers only bounded routes and reports nonblocking failure
   await new Promise((resolve) => setImmediate(resolve));
   assert.deepEqual(unacknowledged, ['alert_route_unacknowledged']);
 
+  const acknowledged = createRoutedAuthAlertSink(DEFAULT_AUTH_ALERT_ROUTES,
+    async () => ({ acknowledged: true }), { timeoutMs: 20 });
+  await acknowledged.deliver('recovery_revocation_slo_breach');
+  await assert.rejects(() => noAck.deliver('recovery_revocation_slo_breach'), /not acknowledged/);
+  const deliveryGaps: string[] = [];
+  const neverSettles = createRoutedAuthAlertSink(DEFAULT_AUTH_ALERT_ROUTES,
+    () => new Promise(() => {}), { timeoutMs: 5, onGap: (gap) => deliveryGaps.push(gap) });
+  await assert.rejects(() => neverSettles.deliver('recovery_revocation_slo_breach'), /timed out/);
+  assert.deepEqual(deliveryGaps, ['alert_route_timeout']);
+
   const telemetry = createStructuredAuthTelemetry(() => {}, {
-    instanceId: '00000000-0000-4000-8000-000000000010', now: () => start
+    stageId: 'staging:pc-37', instanceId: '00000000-0000-4000-8000-000000000010', now: () => start
   });
   let attempts = 0;
   const failing = createRoutedAuthAlertSink(DEFAULT_AUTH_ALERT_ROUTES, () => {
@@ -380,6 +433,20 @@ test('alert routing delivers only bounded routes and reports nonblocking failure
   assert.ok(record?.observability.gaps.some((gap) => gap.code === 'alert_route_backpressure'));
 });
 
+test('external alert smoke requires acknowledgement for every bounded route', async () => {
+  const delivered: AuthAlertDelivery[] = [];
+  const result = await runAuthAlertSmoke(async (delivery) => {
+    delivered.push(delivery);
+    return { acknowledged: true };
+  }, 100);
+  assert.deepEqual(result, {
+    contract: AUTH_ALERT_SMOKE_CONTRACT, acknowledged: true, alertTypes: Object.keys(DEFAULT_AUTH_ALERT_ROUTES).length
+  });
+  assert.deepEqual(delivered.map((delivery) => delivery.type), Object.keys(DEFAULT_AUTH_ALERT_ROUTES));
+  await assert.rejects(runAuthAlertSmoke(async () => ({ acknowledged: false }), 100), /not acknowledged/);
+  await assert.rejects(runAuthAlertSmoke(() => new Promise(() => {}), 100), /timed out/);
+});
+
 test('streaming JSONL limits fail safely and secure file sink repairs mode and recovers', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'pc33-'));
   try {
@@ -396,9 +463,10 @@ test('streaming JSONL limits fail safely and secure file sink repairs mode and r
       '--import', 'tsx', 'src/auth-rollout.ts', '--inventory', inventoryPath, oversized
     ], { cwd: process.cwd(), encoding: 'utf8' });
     assert.equal(command.status, 2, command.stderr);
-    const output = JSON.parse(command.stdout) as { result: string; reasons: string[] };
+    const output = JSON.parse(command.stdout) as { contract: string; result: string; reasons: string[] };
     assert.equal(output.result, 'inconclusive');
     assert.ok(output.reasons.includes('input_limit_exceeded'));
+    assert.equal(output.contract, 'egogero.auth-rollout-evaluation/v2');
 
     const special = path.join(root, 'special');
     await mkdir(special);
@@ -436,6 +504,26 @@ test('streaming JSONL limits fail safely and secure file sink repairs mode and r
       }
     }), /changed while being read/);
 
+    const snapshotLink = path.join(root, 'snapshot-link.jsonl');
+    await symlink(emptySnapshots, snapshotLink);
+    await assert.rejects(readAuthRolloutJsonl([snapshotLink]), /regular file/);
+    const growingSnapshot = path.join(root, 'snapshot-growing.jsonl');
+    await writeFile(growingSnapshot, `${JSON.stringify(snapshot())}\n`, 'utf8');
+    await assert.rejects(readAuthRolloutJsonl([growingSnapshot], undefined, {
+      chunkBytes: 1,
+      afterOpen: async () => { await appendFile(growingSnapshot, '{}\n'); }
+    }), /changed while being read/);
+    const replacedSnapshot = path.join(root, 'snapshot-replaced.jsonl');
+    const replacedSnapshotOld = path.join(root, 'snapshot-replaced-old.jsonl');
+    await writeFile(replacedSnapshot, `${JSON.stringify(snapshot())}\n`, 'utf8');
+    await assert.rejects(readAuthRolloutJsonl([replacedSnapshot], undefined, {
+      chunkBytes: 1,
+      afterOpen: async () => {
+        await rename(replacedSnapshot, replacedSnapshotOld);
+        await writeFile(replacedSnapshot, `${JSON.stringify(snapshot())}\n`, 'utf8');
+      }
+    }), /changed while being read/);
+
     const directory = path.join(root, 'later');
     const file = path.join(directory, 'snapshots.jsonl');
     const fileSink = createAuthSnapshotFileSink(file);
@@ -445,7 +533,14 @@ test('streaming JSONL limits fail safely and secure file sink repairs mode and r
     await chmod(file, 0o666);
     await fileSink(snapshot());
     assert.equal((await stat(file)).mode & 0o777, 0o600);
-    assert.match(await readFile(file, 'utf8'), /egogero\.auth-rollout\/v1/);
+    assert.match(await readFile(file, 'utf8'), /egogero\.auth-rollout\/v2/);
+    await assert.rejects(createAuthSnapshotFileSink(file, { maxBytes: 1 })(snapshot()) as Promise<void>, /limit exceeded/);
+    const prepared = path.join(root, 'prepared.jsonl');
+    await prepareAuthSnapshotFile(prepared);
+    assert.equal((await stat(prepared)).mode & 0o777, 0o600);
+    const preparedLink = path.join(root, 'prepared-link.jsonl');
+    await symlink(prepared, preparedLink);
+    await assert.rejects(prepareAuthSnapshotFile(preparedLink));
   } finally {
     await rm(root, { recursive: true, force: true });
   }

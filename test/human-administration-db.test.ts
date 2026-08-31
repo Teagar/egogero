@@ -21,7 +21,7 @@ test('PostgreSQL invitation binding is one-time, email-exact, concurrent, tenant
   const prisma = new PrismaClient();
   const service = createHumanAdministrationService(prisma, {
     publicApplicationOrigin: 'https://app.example.test', recoveryUrl: `${issuer}/recovery`,
-    recoveryWebhookIssuers: new Set([issuer]), recoveryWebhookSecret: randomBytes(32), mfaPolicy: policy
+    recoveryWebhookIssuers: new Set([issuer]), recoveryWebhookSecrets: new Map([[1, randomBytes(32)]]), mfaPolicy: policy
   });
   const oidc = createPrismaOidcLoginStore(prisma, TEST_ONLY_ALLOW_ALL_HUMAN_AUTH_ROLLOUT);
   const providerId = randomUUID();
@@ -89,19 +89,20 @@ test('PostgreSQL invitation binding is one-time, email-exact, concurrent, tenant
   }
 });
 
-test('signed recovery webhook validates issuer, timestamp, signature, and replay before global revocation', { skip: !run }, async () => {
+test('signed recovery webhook atomically queues once without persisting its subject or invalid attempts', { skip: !run }, async () => {
   const prisma = new PrismaClient();
   const secret = randomBytes(32);
   const trailingIssuer = `${issuer}/`;
   const service = createHumanAdministrationService(prisma, {
     publicApplicationOrigin: 'https://app.example.test', recoveryUrl: `${issuer}/recovery`,
-    recoveryWebhookIssuers: new Set([issuer, trailingIssuer]), recoveryWebhookSecret: secret, mfaPolicy: policy
+    recoveryWebhookIssuers: new Set([issuer, trailingIssuer]), recoveryWebhookSecrets: new Map([[7, secret]]), mfaPolicy: policy
   });
   const accountId = randomUUID();
   const membershipId = randomUUID();
   const externalIdentityId = randomUUID();
   const sessionId = randomUUID();
   const eventId = randomUUID();
+  const legacyEventId = randomUUID();
   const subject = `recovery-${accountId}`;
   const trailingSubject = `trailing-${accountId}`;
   try {
@@ -120,31 +121,50 @@ test('signed recovery webhook validates issuer, timestamp, signature, and replay
     } });
     const timestamp = Math.floor(Date.now() / 1000);
     const signature = createHmac('sha256', secret)
-      .update(`${timestamp}.${eventId}.${trailingIssuer}.${trailingSubject}`).digest('hex');
+      .update(`7.${timestamp}.${eventId}.${trailingIssuer}.${trailingSubject}`).digest('hex');
     const request = { eventId, issuer: trailingIssuer, subject: trailingSubject,
-      timestamp, signature, requestCorrelationId: randomUUID() };
-    assert.equal(await service.processRecoveryWebhook({ ...request, signature: '0'.repeat(64) }), false);
-    assert.equal(await service.processRecoveryWebhook({ ...request, timestamp: timestamp - 301,
+      timestamp, keyVersion: 7, signature, requestCorrelationId: randomUUID() };
+    assert.deepEqual(await service.processRecoveryWebhook({ ...request, signature: '0'.repeat(64) }), { accepted: false, replayed: false });
+    assert.deepEqual(await service.processRecoveryWebhook({ ...request, timestamp: timestamp - 301,
       signature: createHmac('sha256', secret)
-        .update(`${timestamp - 301}.${eventId}.${trailingIssuer}.${trailingSubject}`).digest('hex') }), false);
-    assert.equal(await service.processRecoveryWebhook({ ...request, issuer: 'https://other.example.test',
+        .update(`7.${timestamp - 301}.${eventId}.${trailingIssuer}.${trailingSubject}`).digest('hex') }), { accepted: false, replayed: false });
+    assert.deepEqual(await service.processRecoveryWebhook({ ...request, issuer: 'https://other.example.test',
       signature: createHmac('sha256', secret)
-        .update(`${timestamp}.${eventId}.https://other.example.test.${trailingSubject}`).digest('hex') }), false);
-    assert.equal(await service.processRecoveryWebhook(request), true);
-    assert.equal(await service.processRecoveryWebhook(request), true);
-    assert.equal((await prisma.humanAccount.findUniqueOrThrow({ where: { id: accountId } })).sessionVersion, 1);
-    assert.equal((await prisma.browserSession.findUniqueOrThrow({ where: { id: sessionId } })).revokeReason, 'provider_recovery_event');
+        .update(`7.${timestamp}.${eventId}.https://other.example.test.${trailingSubject}`).digest('hex') }), { accepted: false, replayed: false });
+    assert.equal(await prisma.recoveryWebhookEvent.count({ where: { eventId } }), 0);
+    assert.deepEqual(await service.processRecoveryWebhook(request), { accepted: true, replayed: false });
+    assert.deepEqual(await service.processRecoveryWebhook(request), { accepted: true, replayed: true });
+    assert.equal((await prisma.humanAccount.findUniqueOrThrow({ where: { id: accountId } })).sessionVersion, 0);
+    assert.equal((await prisma.browserSession.findUniqueOrThrow({ where: { id: sessionId } })).revokedAt, null);
     const secondSignature = createHmac('sha256', secret)
-      .update(`${timestamp}.${eventId}.${issuer}.${subject}`).digest('hex');
-    assert.equal(await service.processRecoveryWebhook({ ...request, issuer, subject, signature: secondSignature }), true);
-    assert.equal((await prisma.humanAccount.findUniqueOrThrow({ where: { id: accountId } })).sessionVersion, 2);
+      .update(`7.${timestamp}.${eventId}.${issuer}.${subject}`).digest('hex');
+    assert.deepEqual(await service.processRecoveryWebhook({ ...request, issuer, subject, signature: secondSignature }), { accepted: true, replayed: false });
     const events = await prisma.recoveryWebhookEvent.findMany({ where: { eventId }, orderBy: { issuer: 'asc' } });
     assert.equal(events.length, 2);
     assert.deepEqual(new Set(events.map((event) => event.issuer)), new Set([issuer, trailingIssuer]));
-    assert.ok(events.every((event) => event.accountId === accountId && Buffer.from(event.eventDigest).length === 32));
-    assert.equal(JSON.stringify(events).includes(signature), false);
+    assert.ok(events.every((event) => event.accountId === accountId && Buffer.from(event.eventDigest).length === 32
+      && Buffer.from(event.subjectDigest).length === 32 && event.status === 'pending'));
+    const serialized = JSON.stringify(events);
+    assert.equal(serialized.includes(signature), false);
+    assert.equal(serialized.includes(subject), false);
+    assert.equal(serialized.includes(trailingSubject), false);
+    assert.equal(await prisma.authenticationAuditEvent.count({
+      where: { accountId, eventType: 'recovery_webhook_accepted', outcome: 'success' }
+    }), 2);
+
+    const legacySubject = `legacy-${accountId}`;
+    await prisma.$executeRaw`
+      INSERT INTO "RecoveryWebhookEvent" (id, "eventId", "eventDigest", issuer, subject, "processedAt")
+      VALUES (${randomUUID()}::uuid, ${legacyEventId}, ${randomBytes(32)}, ${issuer}, ${legacySubject}, clock_timestamp())
+    `;
+    const legacy = await prisma.recoveryWebhookEvent.findFirstOrThrow({ where: { eventId: legacyEventId } });
+    assert.equal(legacy.subject, null);
+    assert.equal(legacy.status, 'acknowledged');
+    assert.equal(legacy.keyVersion, 1);
+    assert.equal(Buffer.from(legacy.subjectDigest).length, 32);
+    assert.ok(legacy.acknowledgedAt && legacy.expiresAt > legacy.acknowledgedAt);
   } finally {
-    await prisma.recoveryWebhookEvent.deleteMany({ where: { eventId } });
+    await prisma.recoveryWebhookEvent.deleteMany({ where: { eventId: { in: [eventId, legacyEventId] } } });
     await prisma.browserSession.deleteMany({ where: { accountId } });
     await prisma.humanMembership.deleteMany({ where: { accountId } });
     await prisma.externalIdentity.deleteMany({ where: { accountId } });

@@ -264,11 +264,17 @@ test('public validation URL is optional but rejects unsafe values', () => {
 });
 
 test('auth alert adapter environment is bounded and fails closed', () => {
-  assert.deepEqual(authAlertConfigFromEnvironment({}), { adapter: 'stdout', timeoutMs: 5_000 });
+  const nonCanaryIdentity = {
+    rolloutMode: 'off' as const,
+    instanceId: '00000000-0000-4000-8000-000000000000', stageId: 'staging:non-canary', snapshotPath: undefined
+  };
+  assert.deepEqual(authAlertConfigFromEnvironment({}), {
+    adapter: 'stdout', timeoutMs: 5_000, ...nonCanaryIdentity
+  });
   assert.deepEqual(authAlertConfigFromEnvironment({
     AUTH_ALERT_ADAPTER: 'https_webhook', AUTH_ALERT_WEBHOOK_URL: 'https://alerts.example.test/auth',
     AUTH_ALERT_TIMEOUT_MS: '2500'
-  }), { adapter: 'https_webhook', url: 'https://alerts.example.test/auth', timeoutMs: 2_500 });
+  }), { adapter: 'https_webhook', url: 'https://alerts.example.test/auth', timeoutMs: 2_500, ...nonCanaryIdentity });
   assert.throws(() => authAlertConfigFromEnvironment({ AUTH_ALERT_ADAPTER: 'file' }), /stdout or https_webhook/);
   assert.throws(() => authAlertConfigFromEnvironment({
     AUTH_ALERT_ADAPTER: 'stdout', AUTH_ALERT_WEBHOOK_URL: 'https://alerts.example.test'
@@ -280,6 +286,23 @@ test('auth alert adapter environment is bounded and fails closed', () => {
     }), /AUTH_ALERT_WEBHOOK_URL/);
   }
   assert.throws(() => authAlertConfigFromEnvironment({ AUTH_ALERT_TIMEOUT_MS: '10001' }), /AUTH_ALERT_TIMEOUT_MS/);
+  const canary = {
+    AUTH_ROLLOUT_MODE: 'canary', AUTH_ALERT_ADAPTER: 'https_webhook',
+    AUTH_ALERT_WEBHOOK_URL: 'https://alerts.example.test/auth', AUTH_ALERT_SMOKE_ACK_ID: 'ACK-PC37-1234',
+    AUTH_ROLLOUT_INSTANCE_ID: '00000000-0000-4000-8000-000000000037',
+    AUTH_ROLLOUT_STAGE_ID: 'staging:pc-37', AUTH_ROLLOUT_SNAPSHOT_PATH: '/var/lib/office/auth-pc37.jsonl'
+  };
+  assert.equal(authAlertConfigFromEnvironment(canary).rolloutMode, 'canary');
+  for (const missing of ['AUTH_ALERT_SMOKE_ACK_ID', 'AUTH_ROLLOUT_INSTANCE_ID', 'AUTH_ROLLOUT_STAGE_ID',
+    'AUTH_ROLLOUT_SNAPSHOT_PATH'] as const) {
+    assert.throws(() => authAlertConfigFromEnvironment({ ...canary, [missing]: undefined }), /Canary requires/);
+  }
+  assert.throws(() => authAlertConfigFromEnvironment({
+    AUTH_ROLLOUT_STAGE_ID: 'staging:pc-37'
+  }), /require AUTH_ROLLOUT_MODE=canary/);
+  assert.throws(() => authAlertConfigFromEnvironment({
+    ...canary, AUTH_ROLLOUT_STAGE_ID: 'staging:non-canary'
+  }), /Canary requires/);
 });
 
 test('startServer redacts malformed alert routing failures before database startup', async () => {
@@ -299,7 +322,10 @@ test('startServer redacts malformed alert routing failures before database start
 
 test('server auth observability composes bounded delivery and records sink failures', async () => {
   const snapshots: AuthRolloutSnapshot[] = [];
-  const rejected = createServerAuthObservability({ adapter: 'stdout', timeoutMs: 100 }, {
+  const rejected = createServerAuthObservability({
+    adapter: 'stdout', timeoutMs: 100, rolloutMode: 'off',
+    instanceId: '00000000-0000-4000-8000-000000000011', stageId: 'staging:test'
+  }, {
     snapshotSink: (snapshot) => { snapshots.push(snapshot); },
     alertAdapter: async () => { throw new Error('sink unavailable'); }
   });
@@ -310,7 +336,27 @@ test('server auth observability composes bounded delivery and records sink failu
   assert.equal(snapshots[0].alerts.crypto_key_failure, 1);
   assert.ok(snapshots[0].observability.gaps.some((gap) => gap.code === 'alert_route_rejected'));
 
-  const timedOut = createServerAuthObservability({ adapter: 'stdout', timeoutMs: 5 }, {
+  const aggregateDeliveries: string[] = [];
+  const aggregates = createServerAuthObservability({
+    adapter: 'stdout', timeoutMs: 100, rolloutMode: 'off',
+    instanceId: '00000000-0000-4000-8000-000000000014', stageId: 'staging:test'
+  }, {
+    snapshotSink: () => {},
+    alertAdapter: async (delivery) => { aggregateDeliveries.push(delivery.type); return { acknowledged: true }; }
+  });
+  for (let index = 0; index < 100; index += 1) {
+    aggregates.telemetry.metrics.increment('auth_oidc_callback_total', { outcome: 'failure', reason: 'validation' });
+    aggregates.telemetry.metrics.observe('auth_session_lookup_seconds', 0.025, { operation: 'inspect', outcome: 'miss' });
+  }
+  aggregates.telemetry.flush();
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(aggregateDeliveries, ['oidc_callback_success_slo', 'session_lookup_latency_slo']);
+
+  const timedOut = createServerAuthObservability({
+    adapter: 'stdout', timeoutMs: 5, rolloutMode: 'off',
+    instanceId: '00000000-0000-4000-8000-000000000012', stageId: 'staging:test'
+  }, {
     snapshotSink: () => {}, alertAdapter: () => new Promise(() => {})
   });
   timedOut.alerts.emit('oidc_callback_success_slo', {});
@@ -324,7 +370,8 @@ test('server auth observability composes bounded delivery and records sink failu
 
   const requests: Array<{ url: string; body: string }> = [];
   const webhook = createServerAuthObservability({
-    adapter: 'https_webhook', timeoutMs: 100, url: 'https://alerts.example.test/auth'
+    adapter: 'https_webhook', timeoutMs: 100, rolloutMode: 'off', url: 'https://alerts.example.test/auth',
+    instanceId: '00000000-0000-4000-8000-000000000013', stageId: 'staging:test'
   }, {
     snapshotSink: () => {},
     request: async (input, init) => {

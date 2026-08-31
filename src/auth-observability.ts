@@ -1,4 +1,3 @@
-import { randomUUID } from 'node:crypto';
 import { constants } from 'node:fs';
 import { open } from 'node:fs/promises';
 import { performance } from 'node:perf_hooks';
@@ -35,7 +34,12 @@ export type AuthAlertType =
   | 'oidc_replay_or_state_miss'
   | 'oidc_issuer_mixup'
   | 'oidc_callback_success_slo'
-  | 'session_lookup_latency_slo';
+  | 'session_lookup_latency_slo'
+  | 'cross_tenant_access_denied'
+  | 'provider_configuration_drift'
+  | 'session_revocation_slo'
+  | 'unusual_session_creation'
+  | 'recovery_revocation_slo_breach';
 
 export interface AuthAlertSink {
   emit(type: AuthAlertType, details: Readonly<Record<string, unknown>>): void | Promise<void>;
@@ -110,13 +114,19 @@ export const DEFAULT_AUTH_ALERT_ROUTES: AuthAlertRoutingConfig = {
   oidc_replay_or_state_miss: ['security', 'identity'],
   oidc_issuer_mixup: ['security', 'identity'],
   oidc_callback_success_slo: ['identity'],
-  session_lookup_latency_slo: ['database', 'identity']
+  session_lookup_latency_slo: ['database', 'identity'],
+  cross_tenant_access_denied: ['security'],
+  provider_configuration_drift: ['security', 'identity'],
+  session_revocation_slo: ['security', 'identity'],
+  unusual_session_creation: ['security', 'abuse'],
+  recovery_revocation_slo_breach: ['security', 'identity']
 };
 
 const AUTH_ALERT_TYPES: readonly AuthAlertType[] = [
   'rate_limit_repeated_excess', 'crypto_integrity_failure', 'crypto_key_failure',
   'oidc_replay_or_state_miss', 'oidc_issuer_mixup', 'oidc_callback_success_slo',
-  'session_lookup_latency_slo'
+  'session_lookup_latency_slo', 'cross_tenant_access_denied', 'provider_configuration_drift',
+  'session_revocation_slo', 'unusual_session_creation', 'recovery_revocation_slo_breach'
 ];
 const AUTH_ALERT_ROUTES = new Set<AuthAlertRoute>(['security', 'identity', 'abuse', 'database']);
 
@@ -146,6 +156,44 @@ export function createRoutedAuthAlertSink(
   let pending: AuthAlertDelivery | null = null;
   function gap(code: Parameters<NonNullable<typeof options.onGap>>[0]) {
     try { options.onGap?.(code); } catch { /* observability cannot affect auth */ }
+  }
+  function deliveryFor(type: AuthAlertType): AuthAlertDelivery {
+    return { contract: 'egogero.auth-alert-delivery/v1', type, routes: [...routes[type]] };
+  }
+  async function deliver(type: AuthAlertType) {
+    const controller = new AbortController();
+    let cancel: (() => void) | undefined;
+    let timedOut = false;
+    let rejectTimeout!: (error: Error) => void;
+    const timeout = new Promise<never>((_resolve, reject) => { rejectTimeout = reject; });
+    const timer = setTimeout(() => {
+      timedOut = true;
+      gap('alert_route_timeout');
+      controller.abort();
+      try { cancel?.(); } catch { /* cancellation is best effort */ }
+      rejectTimeout(new Error('Auth alert delivery timed out'));
+    }, timeoutMs);
+    try {
+      const result = adapter(deliveryFor(type), controller.signal);
+      const operation = result instanceof Promise ? { promise: result } : result;
+      if (!operation?.promise || typeof operation.promise.then !== 'function') {
+        gap('alert_route_throw');
+        throw new Error('Invalid auth alert adapter operation');
+      }
+      cancel = operation.cancel;
+      const acknowledgement = await Promise.race([operation.promise, timeout]);
+      if (acknowledgement?.acknowledged !== true) {
+        gap('alert_route_unacknowledged');
+        throw new Error('Auth alert delivery was not acknowledged');
+      }
+    } catch (error) {
+      if (!timedOut && !(error instanceof Error && error.message === 'Auth alert delivery was not acknowledged')) {
+        gap('alert_route_rejected');
+      }
+      throw error;
+    } finally {
+      clearTimeout(timer);
+    }
   }
   function dispatch(delivery: AuthAlertDelivery) {
     const controller = new AbortController();
@@ -188,15 +236,13 @@ export function createRoutedAuthAlertSink(
   }
   const sink: AuthAlertSink = {
     emit(type) {
-      const delivery: AuthAlertDelivery = {
-        contract: 'egogero.auth-alert-delivery/v1', type, routes: [...routes[type]]
-      };
+      const delivery = deliveryFor(type);
       if (!active) dispatch(delivery);
       else if (!pending) pending = delivery;
       else gap('alert_route_backpressure');
     }
   };
-  return { sink, state: () => ({ inFlight: active !== null, pending: pending ? 1 : 0 }) };
+  return { sink, deliver, state: () => ({ inFlight: active !== null, pending: pending ? 1 : 0 }) };
 }
 
 export function combineAuthAlertSinks(...sinks: readonly AuthAlertSink[]): AuthAlertSink {
@@ -277,7 +323,9 @@ export type StructuredAuthTelemetry = {
 };
 
 const CRITICAL_ALERTS = new Set<AuthAlertType>([
-  'crypto_integrity_failure', 'crypto_key_failure', 'oidc_replay_or_state_miss', 'oidc_issuer_mixup'
+  'crypto_integrity_failure', 'crypto_key_failure', 'oidc_replay_or_state_miss', 'oidc_issuer_mixup',
+  'cross_tenant_access_denied', 'provider_configuration_drift', 'session_revocation_slo',
+  'unusual_session_creation', 'recovery_revocation_slo_breach'
 ]);
 const DIMENSIONS: Record<AuthMetricName, Readonly<Record<string, readonly string[]>>> = {
   auth_oidc_callback_total: { outcome: ['success', 'failure'], reason: ['none', 'state', 'issuer', 'crypto', 'account', 'validation'] },
@@ -287,7 +335,11 @@ const DIMENSIONS: Record<AuthMetricName, Readonly<Record<string, readonly string
   auth_session_revocation_seconds: { operation: ['current'], outcome: ['revoked', 'already-revoked', 'unavailable'] },
   auth_database_writes_total: { operation: ['recovery', 'session_issue', 'session_rotate', 'session_revoke'], outcome: ['success', 'failure'] },
   auth_rate_limit_decisions_total: {
-    operation: ['login_ip', 'callback_failure_ip', 'session_issue_account', 'recovery_ip', 'reauthentication_account', 'authentication_failure_ip'],
+    operation: [
+      'login_ip', 'callback_failure_ip', 'session_creation_account', 'recovery_ip',
+      'reauthentication_account', 'invitation_acceptance_ip', 'invitation_acceptance_digest',
+      'human_validation_account', 'authentication_failure_ip'
+    ],
     outcome: ['allowed', 'denied']
   }
 };
@@ -321,16 +373,21 @@ export function createAuthSnapshotStdoutSink(stream: NodeJS.WriteStream = proces
   };
 }
 
-export function createAuthSnapshotFileSink(path: string): AuthSnapshotSink {
+export function createAuthSnapshotFileSink(path: string, options: { maxBytes?: number } = {}): AuthSnapshotSink {
+  const maxBytes = options.maxBytes ?? 32 * 1_024 * 1_024;
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 1) throw new Error('Invalid auth snapshot sink limit');
   let writes = Promise.resolve();
   return (snapshot) => {
     writes = writes.catch(() => {}).then(async () => {
-      const handle = await open(path,
-        constants.O_APPEND | constants.O_CREAT | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
+      const encoded = Buffer.from(`${JSON.stringify(snapshot)}\n`, 'utf8');
+      const handle = await open(path, constants.O_APPEND | constants.O_CREAT | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
       try {
         const metadata = await handle.stat();
-        if ((metadata.mode & 0o077) !== 0) await handle.chmod(0o600);
-        await handle.appendFile(`${JSON.stringify(snapshot)}\n`, 'utf8');
+        if (!metadata.isFile()) throw new Error('Auth snapshot sink must be a regular file');
+        if ((metadata.mode & 0o777) !== 0o600) await handle.chmod(0o600);
+        if (metadata.size > maxBytes - encoded.length) throw new Error('Auth snapshot sink limit exceeded');
+        await handle.write(encoded);
+        await handle.sync();
       } finally {
         await handle.close();
       }
@@ -339,24 +396,44 @@ export function createAuthSnapshotFileSink(path: string): AuthSnapshotSink {
   };
 }
 
+export async function prepareAuthSnapshotFile(path: string, maxBytes = 32 * 1_024 * 1_024) {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 1) throw new Error('Invalid auth snapshot sink limit');
+  const handle = await open(path, constants.O_APPEND | constants.O_CREAT | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
+  try {
+    const metadata = await handle.stat();
+    if (!metadata.isFile()) throw new Error('Auth snapshot sink must be a regular file');
+    if (metadata.size > maxBytes) throw new Error('Auth snapshot sink limit exceeded');
+    if ((metadata.mode & 0o777) !== 0o600) await handle.chmod(0o600);
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+
 export function createStructuredAuthTelemetry(
   sink: AuthSnapshotSink = createAuthSnapshotStdoutSink(),
   options: {
-    instanceId?: string;
+    instanceId: string;
+    stageId: string;
     now?: () => number;
     monotonicNow?: () => number;
     maxClockDriftMs?: number;
     sinkTimeoutMs?: number;
-  } = {}
+    aggregateAlertSink?: AuthAlertSink;
+  }
 ): StructuredAuthTelemetry {
-  const instanceId = options.instanceId ?? randomUUID();
+  const { instanceId, stageId } = options;
   if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(instanceId)) {
-    throw new Error('Auth telemetry instanceId must be a non-sensitive UUID v4');
+    throw new Error('Auth telemetry instanceId must be an injected non-sensitive UUID v4');
+  }
+  if (!/^(?:staging|production):[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?$/.test(stageId)) {
+    throw new Error('Auth telemetry stageId must be an injected bounded deployment stage');
   }
   const now = options.now ?? Date.now;
   const monotonicNow = options.monotonicNow ?? (options.now ? now : performance.now.bind(performance));
   const maxClockDriftMs = options.maxClockDriftMs ?? 5_000;
   const sinkTimeoutMs = options.sinkTimeoutMs ?? 5_000;
+  const aggregateAlerts = safeAuthAlerts(options.aggregateAlertSink);
   if (!Number.isFinite(maxClockDriftMs) || maxClockDriftMs < 0
     || !Number.isFinite(sinkTimeoutMs) || sinkTimeoutMs < 1) throw new Error('Invalid auth telemetry timing configuration');
   const counters = new Map<string, AuthRolloutCounter>();
@@ -500,6 +577,7 @@ export function createStructuredAuthTelemetry(
       const callbacks = BigInt(callbackSuccess) + BigInt(callbackFailure);
       if (callbacks >= 100n && BigInt(callbackSuccess) * 1_000n < callbacks * 995n) {
         alerts.emit('oidc_callback_success_slo', { outcome: 'below_threshold', thresholdPermille: 995 });
+        aggregateAlerts.emit('oidc_callback_success_slo', { outcome: 'below_threshold', thresholdPermille: 995 });
       }
       if (sessionCount >= 100) {
         const rank = Number((BigInt(sessionCount) * 95n + 99n) / 100n);
@@ -507,6 +585,7 @@ export function createStructuredAuthTelemetry(
         const bucket = sessionBuckets.findIndex((count) => (cumulative += count) >= rank);
         if (bucket >= AUTH_SESSION_HISTOGRAM_BOUNDS_SECONDS.findIndex((bound) => bound === 0.02) + 1) {
           alerts.emit('session_lookup_latency_slo', { outcome: 'above_threshold', thresholdMs: 20 });
+          aggregateAlerts.emit('session_lookup_latency_slo', { outcome: 'above_threshold', thresholdMs: 20 });
         }
       }
       let criticalIncidentCount = 0;
@@ -518,6 +597,7 @@ export function createStructuredAuthTelemetry(
         contract: AUTH_ROLLOUT_CONTRACT,
         interval: { start: new Date(intervalStart).toISOString(), end: new Date(end).toISOString() },
         instanceId,
+        stageId,
         sequence: sequence += 1,
         counters: [...counters.values()],
         histograms: [...histograms.values()].map((histogram): AuthRolloutHistogram => ({

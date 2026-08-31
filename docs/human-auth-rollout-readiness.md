@@ -2,9 +2,9 @@
 
 ## Decision
 
-The integrated application revision `e087b46` is ready for local and CI verification but is **not ready for a real staging canary**.
+The current application revision is ready for local and CI verification but is **not ready for a real staging canary**.
 
-PC-30 through PC-33 provide tenant gates, transactional human-session rollback, browser threat tests, deployment preflight, bounded telemetry, and a conservative evaluator. Those controls were validated locally against 25 migrations, 179 backend/PostgreSQL tests, 17 frontend tests, 14 Chromium HTTPS/OIDC scenarios, the four-scenario key-rotation rehearsal, and the immutable image contract.
+PC-30 through PC-37 provide tenant gates, transactional human-session rollback, browser threat tests, deployment preflight, bounded critical alerts, durable stage-partitioned telemetry, a smoke command, and a conservative evaluator.
 
 That evidence is synthetic. It does not satisfy a staging stage, a 24-hour window, or an operator acknowledgement. Promotion remains blocked until every item under **Canary blockers** is closed with real evidence.
 
@@ -23,14 +23,12 @@ That evidence is synthetic. It does not satisfy a staging stage, a 24-hour windo
 
 | Blocker | Required closure | Accountable owner |
 | --- | --- | --- |
-| Alert delivery defaults to process stdout and can acknowledge before an operator receives it | Configure a real externally monitored adapter and record an acknowledged smoke event for every bounded route | Security operations |
-| Critical incident taxonomy does not include cross-tenant denial, provider configuration drift, revocation-SLO breach, or unusual session creation | Add bounded event types, emission, routes, snapshot counting, critical classification, and evaluator tests | Application security |
+| Repository smoke tests cannot prove an operator receives external alerts | Configure the required HTTPS adapter, run `auth:alerts:smoke`, verify every real destination, and retain its external acknowledgement ID | Security operations |
 | Rollout administration does not require authentication within the last ten minutes | Enforce recent OIDC authentication for every global or tenant policy mutation and add route/database tests | Backend authentication |
 | Direct rollout CLI trusts any holder of runtime database credentials and only attributes the change to the supplied provider UUID | Run it only through a separately authenticated, approved, least-privileged deployment identity with immutable operator binding, or change the command contract to carry verifiable operator authorization | Security and deployment platform |
 | Readiness does not verify that the authoritative global policy exists and is valid | Add a cached/startup or database readiness dependency and prove missing/corrupt policy returns generic `503` | Backend authentication and SRE |
-| Process instance identity is generated internally while inventory must be independent | Inject a stable UUIDv4 from the orchestrator and produce lifecycle inventory independently of snapshots | Deployment platform |
-| Production has no durable snapshot sink or stage partition contract | Provide access-controlled durable JSONL collection with bounded delivery and an immutable partition per stage | Observability/SRE |
-| Alert configuration was absent from the environment inventory | Render and validate the `AUTH_ALERT_*` entries now listed in `deploy/environment.manifest.yaml` | Deployment platform |
+| Repository contracts cannot produce authoritative serving inventory | Inject the required stable instance/stage IDs and produce lifecycle inventory independently of snapshots | Deployment platform |
+| Repository sink durability cannot prove platform retention | Mount the configured protected durable JSONL path and retain an immutable partition per stage | Observability/SRE |
 | No real staging origin, OIDC client, secret manager, proxy CIDRs, PostgreSQL security evidence, pilot tenant, or named responders | Supply and approve each dependency without committing or printing secret values | Rollout owner |
 | ADR abuse limits differ from implementation, and invitation acceptance has no dedicated distributed policy | Reconcile the decision or implementation and add the invitation IP/invitation limits before external exposure | Application security |
 | Recovery webhook has no monitored retry queue or five-second revocation paging | Implement and exercise retry, expiry, paging, and timing evidence | Identity and security operations |
@@ -112,6 +110,13 @@ node scripts/verify-image-contract.mjs "$IMAGE"
 
 Run migrations as a separate platform job from the immutable image. The placeholder below is not a standalone shell command: the orchestrator must inject `DATABASE_URL` from its secret reference without placing the value in arguments, logs, shell history, or evidence.
 
+Migration `0026` is an intentional authorization boundary, not a mixed-version policy-write deployment. Freeze all
+rollout policy mutations, drain every pre-`0026` policy writer, apply migrations, and then admit the new revision
+before unfreezing mutations. Existing authentication reads may continue during this control-plane window, but old
+and new policy writers must never overlap: old writers lose direct table grants at `0026`, while new writers require
+the hardened function introduced by that migration. Record the freeze, drain, migration, revision, and unfreeze in
+the release evidence.
+
 ```text
 platform-job run --image "$IMAGE" --secret-ref DATABASE_URL --entrypoint npm -- run db:migrate:deploy
 ```
@@ -129,7 +134,7 @@ curl --fail --silent --show-error "$PUBLIC_APPLICATION_ORIGIN/health"
 curl --fail --silent --show-error "$PUBLIC_APPLICATION_ORIGIN/ready"
 ```
 
-Expected responses are `{"status":"ok"}` and `{"status":"ready"}`. Before promotion, separately prove provider login, MFA role enforcement, recovery webhook acknowledgement, proxy overwrite, direct-port denial, device validation, and public invitation validation.
+Expected responses are `{"status":"ok"}` and `{"status":"ready"}`. With human auth enabled, process startup and readiness require one valid global rollout policy; missing or inconsistent policy prevents startup/readiness with only generic external failure. Human-auth-disabled deployments do not query that policy. Before promotion, separately prove provider login, MFA role enforcement, recovery webhook acknowledgement, proxy overwrite, direct-port denial, device validation, and public invitation validation.
 
 ## Policy command
 
@@ -153,7 +158,7 @@ node dist/src/jobs/set-human-auth-rollout.js \
 
 Scopes are `global` or `tenant:<uuid>`. States are `disabled`, global-only `internal-provider`, `pilot --cohort 10|50|100`, and `enabled`. Unknown, duplicate, missing, or inapplicable arguments fail without a policy change.
 
-The CLI verifies only that the attributed actor UUID belongs to an active externally bound provider; it does not authenticate the operator. For a real rollout, every image command in this runbook must run through a separately authenticated, approved, least-privileged platform job that binds the human operator and change ticket immutably. Until that control and the recent-auth blocker are fixed, neither direct CLI nor browser policy mutation may be used for a real canary.
+Every command also requires `HUMAN_AUTH_ROLLOUT_AUTHORIZATION_TOKEN` as a masked environment secret. A separately authenticated approval job must insert one `HumanAuthDeploymentAuthorization` row using a database identity that can only insert authorizations, never mutate policy. The row binds the exact provider actor, scope, state, cohort and approval reference, expires within ten minutes, and is consumed atomically once. The application role cannot read or mint approvals or directly mutate policy/history; it can only execute the hardened database function. The approver role can only insert approvals and cannot mutate policy. Never place the token in arguments, logs or evidence. Browser policy mutation requires OIDC authentication within ten minutes and sends stale sessions through the existing reauthentication flow.
 
 ## Promotion sequence
 
@@ -235,9 +240,9 @@ Every target tenant still requires an allowing tenant policy. Missing policies f
 
 ## Gate evaluation
 
-The platform must inject stable instance IDs, independently produce exact serving lifecycle inventory, and durably partition snapshots by stage. Inventory must never be inferred from snapshots. Snapshot inputs currently lack the inventory reader's `O_NOFOLLOW` and inode checks, so secure snapshot-file opening is itself a canary blocker.
+The platform must inject stable instance and stage IDs, independently produce exact v2 serving lifecycle inventory, and durably partition v2 snapshots by the same stage. Inventory must never be inferred from snapshots. The evaluator rejects mixed stages, symlinks, special files, path replacement, growth, and bounded-input violations.
 
-The restricted evidence directory must be newly created with mode `0700`; collection and evaluation jobs must refuse symlinks, special files and pre-existing output paths. After secure snapshot input handling is implemented, run the evaluator through an approved platform job and create `evaluation.json` atomically with mode `0600`, never ordinary `>` onto an unchecked path:
+The restricted evidence directory must be newly created with mode `0700`; collection and evaluation jobs must refuse symlinks, special files and pre-existing output paths. Run the evaluator through an approved platform job and create `evaluation.json` atomically with mode `0600`, never ordinary `>` onto an unchecked path:
 
 ```text
 platform-job evaluate-auth-rollout \

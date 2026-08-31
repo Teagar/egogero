@@ -33,13 +33,13 @@ test('human administration environment requires exact recovery, webhook, and com
     PUBLIC_APPLICATION_ORIGIN: 'https://app.example.test',
     OIDC_RECOVERY_URL: 'https://identity.example.test/recovery',
     RECOVERY_WEBHOOK_ISSUERS: 'https://identity.example.test',
-    RECOVERY_WEBHOOK_SECRET: secret,
+    RECOVERY_WEBHOOK_KEYS: JSON.stringify({ 7: secret }),
     HUMAN_MFA_ROLE_POLICY: JSON.stringify(policy)
   };
   const config = humanAdministrationConfigFromEnvironment(base)!;
   assert.equal(config.recoveryUrl, base.OIDC_RECOVERY_URL);
-  assert.equal(config.recoveryWebhookSecret.toString(), secret);
-  assert.throws(() => humanAdministrationConfigFromEnvironment({ ...base, RECOVERY_WEBHOOK_SECRET: 'short' }), /at least 32 bytes/);
+  assert.equal(config.recoveryWebhookSecrets.get(7)?.toString(), secret);
+  assert.throws(() => humanAdministrationConfigFromEnvironment({ ...base, RECOVERY_WEBHOOK_KEYS: JSON.stringify({ 7: 'short' }) }), /at least 32 bytes/);
   assert.throws(() => humanAdministrationConfigFromEnvironment({ ...base, OIDC_RECOVERY_URL: 'http://identity.test/recovery' }), /HTTPS/);
   assert.throws(() => humanAdministrationConfigFromEnvironment({ ...base, HUMAN_MFA_ROLE_POLICY: '{}' }), /every role/);
   assert.deepEqual(
@@ -53,6 +53,6 @@ test('human administration environment requires exact recovery, webhook, and com
   }), /unsafe method/);
 
   const timestamp = Math.floor(Date.now() / 1000);
-  const canonical = `${timestamp}.event-id.https://identity.example.test.subject`;
-  assert.equal(createHmac('sha256', config.recoveryWebhookSecret).update(canonical).digest('hex').length, 64);
+  const canonical = `7.${timestamp}.event-id.https://identity.example.test.subject`;
+  assert.equal(createHmac('sha256', config.recoveryWebhookSecrets.get(7)!).update(canonical).digest('hex').length, 64);
 });

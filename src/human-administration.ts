@@ -7,6 +7,7 @@ import { isUuid, type AuthenticatedIdentity, type Authenticator, type Role } fro
 
 const INVITATION_TTL_MS = 24 * 60 * 60 * 1000;
 const WEBHOOK_CLOCK_SKEW_MS = 5 * 60 * 1000;
+const RECOVERY_EVENT_TTL_MS = 15 * 60 * 1000;
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+$/;
 
 export type AuthenticationEvidence = { amr: readonly string[]; acr: string | null };
@@ -16,7 +17,7 @@ export type HumanAdministrationConfig = {
   publicApplicationOrigin: string;
   recoveryUrl: string;
   recoveryWebhookIssuers: ReadonlySet<string>;
-  recoveryWebhookSecret: Buffer;
+  recoveryWebhookSecrets: ReadonlyMap<number, Buffer>;
   mfaPolicy: RoleMfaPolicy;
 };
 
@@ -116,17 +117,33 @@ export function humanAdministrationConfigFromEnvironment(
   if (issuers.length === 0 || new Set(issuers).size !== issuers.length) {
     throw new Error('RECOVERY_WEBHOOK_ISSUERS must be a unique exact issuer allowlist');
   }
-  const rawSecret = required(environment, 'RECOVERY_WEBHOOK_SECRET');
-  const recoveryWebhookSecret = Buffer.from(rawSecret, 'utf8');
-  if (recoveryWebhookSecret.length < 32 || new Set(rawSecret).size < 12
-    || /(change[-_ ]?me|placeholder|example|secret){2,}/i.test(rawSecret)) {
-    throw new Error('RECOVERY_WEBHOOK_SECRET must be at least 32 bytes and have adequate entropy');
+  let parsedSecrets: unknown;
+  try { parsedSecrets = JSON.parse(required(environment, 'RECOVERY_WEBHOOK_KEYS')); }
+  catch { throw new Error('RECOVERY_WEBHOOK_KEYS must be a version-to-secret JSON object'); }
+  if (!parsedSecrets || typeof parsedSecrets !== 'object' || Array.isArray(parsedSecrets)) {
+    throw new Error('RECOVERY_WEBHOOK_KEYS must be a version-to-secret JSON object');
+  }
+  const recoveryWebhookSecrets = new Map<number, Buffer>();
+  for (const [rawVersion, value] of Object.entries(parsedSecrets)) {
+    const version = Number(rawVersion);
+    if (!Number.isSafeInteger(version) || version < 1 || typeof value !== 'string') {
+      throw new Error('RECOVERY_WEBHOOK_KEYS contains an invalid version or secret');
+    }
+    const secret = Buffer.from(value, 'utf8');
+    if (secret.length < 32 || new Set(value).size < 12
+      || /(change[-_ ]?me|placeholder|example|secret){2,}/i.test(value)) {
+      throw new Error('RECOVERY_WEBHOOK_KEYS secrets must be at least 32 bytes and have adequate entropy');
+    }
+    recoveryWebhookSecrets.set(version, secret);
+  }
+  if (recoveryWebhookSecrets.size < 1 || recoveryWebhookSecrets.size > 3) {
+    throw new Error('RECOVERY_WEBHOOK_KEYS must contain between one and three rotation keys');
   }
   return {
     publicApplicationOrigin: new URL(origin).origin,
     recoveryUrl,
     recoveryWebhookIssuers: new Set(issuers),
-    recoveryWebhookSecret,
+    recoveryWebhookSecrets,
     mfaPolicy: parseMfaPolicy(required(environment, 'HUMAN_MFA_ROLE_POLICY'))
   };
 }
@@ -142,14 +159,16 @@ export function evidenceSatisfiesRole(policy: RoleMfaPolicy, role: Role, evidenc
 }
 
 export function verifyRecoveryWebhookSignature(
-  config: Pick<HumanAdministrationConfig, 'recoveryWebhookIssuers' | 'recoveryWebhookSecret'>,
-  input: { eventId: string; issuer: string; subject: string; timestamp: number; signature: string },
+  config: Pick<HumanAdministrationConfig, 'recoveryWebhookIssuers' | 'recoveryWebhookSecrets'>,
+  input: { eventId: string; issuer: string; subject: string; timestamp: number; keyVersion: number; signature: string },
   now = Date.now()
 ) {
   const canonical = canonicalRecoveryWebhookEvent(input);
   const supplied = /^[a-f0-9]{64}$/i.test(input.signature) ? Buffer.from(input.signature, 'hex') : Buffer.alloc(0);
-  const expected = createHmac('sha256', config.recoveryWebhookSecret).update(canonical).digest();
+  const secret = config.recoveryWebhookSecrets.get(input.keyVersion);
+  const expected = secret ? createHmac('sha256', secret).update(canonical).digest() : Buffer.alloc(32);
   const valid = supplied.length === expected.length && timingSafeEqual(supplied, expected)
+    && Boolean(secret) && Number.isSafeInteger(input.keyVersion) && input.keyVersion > 0
     && Number.isSafeInteger(input.timestamp) && Math.abs(now - input.timestamp * 1000) <= WEBHOOK_CLOCK_SKEW_MS
     && input.eventId.length > 0 && input.eventId.length <= 255 && input.subject.length > 0 && input.subject.length <= 255
     && config.recoveryWebhookIssuers.has(input.issuer);
@@ -158,8 +177,8 @@ export function verifyRecoveryWebhookSignature(
   return valid;
 }
 
-function canonicalRecoveryWebhookEvent(input: { timestamp: number; eventId: string; issuer: string; subject: string }) {
-  return `${input.timestamp}.${input.eventId}.${input.issuer}.${input.subject}`;
+function canonicalRecoveryWebhookEvent(input: { keyVersion: number; timestamp: number; eventId: string; issuer: string; subject: string }) {
+  return `${input.keyVersion}.${input.timestamp}.${input.eventId}.${input.issuer}.${input.subject}`;
 }
 
 async function insertAudit(transaction: Prisma.TransactionClient, input: AuditInput) {
@@ -315,33 +334,42 @@ export function createHumanAdministrationService(client: PrismaClient, config: H
       });
     },
 
-    async processRecoveryWebhook(input: { eventId: string; issuer: string; subject: string; timestamp: number; signature: string; requestCorrelationId: string }) {
+    async processRecoveryWebhook(input: { eventId: string; issuer: string; subject: string; timestamp: number; keyVersion: number; signature: string; requestCorrelationId: string }) {
       const valid = verifyRecoveryWebhookSignature(config, input);
-      if (!valid) {
-        await client.$transaction((transaction) => insertAudit(transaction, { eventType: 'recovery_webhook_denied', outcome: 'denied',
-          actorType: 'anonymous', requestCorrelationId: input.requestCorrelationId, reasonCode: 'invalid_webhook' }));
-        return false;
-      }
+      if (!valid) return { accepted: false as const, replayed: false };
       return client.$transaction(async (transaction) => {
         const eventDigest = digestSecret(canonicalRecoveryWebhookEvent(input));
-        const inserted = await transaction.$queryRaw<Array<{ id: string }>>(Prisma.sql`
-          INSERT INTO "RecoveryWebhookEvent" (id, "eventId", "eventDigest", issuer, subject, "processedAt")
-          VALUES (${randomUUID()}::uuid, ${input.eventId}, ${eventDigest}, ${input.issuer}, ${input.subject}, clock_timestamp())
-          ON CONFLICT (issuer, "eventId") DO NOTHING RETURNING id
-        `);
-        if (!inserted[0]) return true;
+        const subjectDigest = digestSecret(`${input.issuer}\0${input.subject}`);
         const identities = await transaction.$queryRaw<Array<{ accountId: string }>>(Prisma.sql`
-          SELECT "accountId" FROM "ExternalIdentity" WHERE issuer = ${input.issuer} AND subject = ${input.subject} FOR UPDATE
+          SELECT "accountId" FROM "ExternalIdentity"
+          WHERE issuer = ${input.issuer} AND subject = ${input.subject}
         `);
         const accountId = identities[0]?.accountId;
-        if (accountId) {
-          await transaction.$executeRaw`UPDATE "HumanAccount" SET "sessionVersion" = "sessionVersion" + 1, "updatedAt" = clock_timestamp() WHERE id = ${accountId}::uuid`;
-          await transaction.$executeRaw`UPDATE "BrowserSession" SET "revokedAt" = clock_timestamp(), "revokeReason" = 'provider_recovery_event' WHERE "accountId" = ${accountId}::uuid AND "revokedAt" IS NULL`;
-          await transaction.$executeRaw`UPDATE "RecoveryWebhookEvent" SET "accountId" = ${accountId}::uuid WHERE id = ${inserted[0].id}::uuid`;
+        const inserted = await transaction.$queryRaw<Array<{ id: string }>>(Prisma.sql`
+          INSERT INTO "RecoveryWebhookEvent" (
+            id, "eventId", "eventDigest", issuer, "subjectDigest", "keyVersion", "accountId", "expiresAt"
+          ) VALUES (
+            ${randomUUID()}::uuid, ${input.eventId}, ${eventDigest}, ${input.issuer}, ${subjectDigest},
+            ${input.keyVersion}, ${accountId ?? null}::uuid,
+            clock_timestamp() + (${RECOVERY_EVENT_TTL_MS} * interval '1 millisecond')
+          )
+          ON CONFLICT DO NOTHING RETURNING id
+        `);
+        if (!inserted[0]) {
+          const existing = await transaction.$queryRaw<Array<{ eventDigest: Buffer }>>(Prisma.sql`
+            SELECT "eventDigest" FROM "RecoveryWebhookEvent"
+            WHERE issuer = ${input.issuer} AND "eventId" = ${input.eventId}
+          `);
+          return existing[0] && timingSafeEqual(Buffer.from(existing[0].eventDigest), eventDigest)
+            ? { accepted: true as const, replayed: true }
+            : { accepted: false as const, replayed: true };
         }
-        await insertAudit(transaction, { eventType: 'recovery_webhook_processed', outcome: 'success', accountId,
-          actorType: 'system', requestCorrelationId: input.requestCorrelationId, metadata: { identityMatched: Boolean(accountId) } });
-        return true;
+        await insertAudit(transaction, {
+          eventType: 'recovery_webhook_accepted', outcome: 'success', accountId,
+          actorType: 'system', requestCorrelationId: input.requestCorrelationId,
+          metadata: { identityMatched: Boolean(accountId) }
+        });
+        return { accepted: true as const, replayed: false };
       }, { timeout: 5_000 });
     }
   };
@@ -402,10 +430,16 @@ export function registerHumanAdministrationRoutes(app: FastifyInstance, authenti
   }
   app.post('/auth/recovery/webhook', async (request, reply) => {
     const body = bodyObject(request) ?? {};
-    await service.processRecoveryWebhook({ eventId: String(body.eventId ?? ''), issuer: String(body.issuer ?? ''),
-      subject: String(body.subject ?? ''), timestamp: Number(request.headers['x-recovery-timestamp']),
-      signature: typeof request.headers['x-recovery-signature'] === 'string' ? request.headers['x-recovery-signature'] : '',
-      requestCorrelationId: request.id });
-    return reply.status(202).send({ accepted: true });
+    try {
+      const result = await service.processRecoveryWebhook({ eventId: String(body.eventId ?? ''), issuer: String(body.issuer ?? ''),
+        subject: String(body.subject ?? ''), timestamp: Number(request.headers['x-recovery-timestamp']),
+        keyVersion: Number(request.headers['x-recovery-key-version']),
+        signature: typeof request.headers['x-recovery-signature'] === 'string' ? request.headers['x-recovery-signature'] : '',
+        requestCorrelationId: request.id });
+      if (!result.accepted) return reply.status(400).send({ accepted: false });
+      return reply.status(result.replayed ? 200 : 202).send({ accepted: true });
+    } catch {
+      return reply.status(503).send({ accepted: false });
+    }
   });
 }

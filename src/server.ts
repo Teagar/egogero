@@ -23,11 +23,14 @@ import {
   combineAuthAlertSinks,
   createAuthAlertStdoutAdapter,
   createAuthAlertWebhookAdapter,
+  createAuthSnapshotFileSink,
   createRoutedAuthAlertSink,
   createStructuredAuthTelemetry,
   DEFAULT_AUTH_ALERT_ROUTES,
+  prepareAuthSnapshotFile,
   registerAuthTelemetryLifecycle,
   type AuthAlertDeliveryAdapter,
+  type AuthAlertSink,
   type AuthSnapshotSink
 } from './auth-observability.js';
 import type { AuthAlertEnvironmentConfig } from './env.js';
@@ -41,7 +44,14 @@ export function createServerAuthObservability(
     request?: typeof fetch;
   } = {}
 ) {
-  const telemetry = createStructuredAuthTelemetry(dependencies.snapshotSink);
+  const aggregateAlerts: { current?: AuthAlertSink } = {};
+  const snapshotSink = dependencies.snapshotSink ?? (config.snapshotPath
+    ? createAuthSnapshotFileSink(config.snapshotPath)
+    : undefined);
+  const telemetry = createStructuredAuthTelemetry(snapshotSink, {
+    instanceId: config.instanceId, stageId: config.stageId,
+    aggregateAlertSink: { emit(type, details) { return aggregateAlerts.current?.emit(type, details); } }
+  });
   const adapter = dependencies.alertAdapter ?? (config.adapter === 'stdout'
     ? createAuthAlertStdoutAdapter()
     : createAuthAlertWebhookAdapter(config.url, dependencies.request));
@@ -49,6 +59,7 @@ export function createServerAuthObservability(
     timeoutMs: config.timeoutMs,
     onGap: telemetry.recordObservabilityGap
   });
+  aggregateAlerts.current = routed.sink;
   return {
     telemetry,
     alerts: combineAuthAlertSinks(telemetry.alerts, routed.sink),
@@ -58,6 +69,7 @@ export function createServerAuthObservability(
 
 export async function startServer(environment: NodeJS.ProcessEnv = process.env) {
   const env = getEnv(environment);
+  if (env.authAlerts.rolloutMode === 'canary') await prepareAuthSnapshotFile(env.authAlerts.snapshotPath!);
   const deviceStore = createPrismaDeviceStore(prisma, env.deviceApiKeySecret);
   const invitationStore = createPrismaInvitationStore(
     prisma,
@@ -79,6 +91,7 @@ export async function startServer(environment: NodeJS.ProcessEnv = process.env) 
   const humanAuthRolloutService = env.oidc || env.sessions
     ? createHumanAuthRolloutService(prisma)
     : undefined;
+  if (env.humanAuthEnabled) await humanAuthRolloutService!.verifyGlobalPolicy();
   const oidcService = env.oidc
     ? await createOidcService(env.oidc, createPrismaOidcLoginStore(prisma, humanAuthRolloutService!), fetch, {
         rateLimiter: authRateLimiter,
@@ -104,11 +117,15 @@ export async function startServer(environment: NodeJS.ProcessEnv = process.env) 
     oidcService && browserSessionService && browserSessionStore && humanAdministrationService && authRateLimiter
   );
   if (!humanServicesComposed) throw new Error('Human authentication services are incomplete');
-  const authenticator = browserSessionStore
+  const baseAuthenticator = browserSessionStore
     ? createCredentialRouter(browserSessionStore, deviceAuthenticator, developmentAuthenticator, authRateLimiter)
     : developmentAuthenticator
       ? createCompositeAuthenticator(deviceAuthenticator, developmentAuthenticator)
       : deviceAuthenticator;
+  const authenticator = {
+    authenticate: baseAuthenticator.authenticate.bind(baseAuthenticator),
+    authorizationAlerts: authObservability.alerts
+  };
   const app = createApp({
     authenticator,
     invitationStore,
@@ -132,6 +149,9 @@ export async function startServer(environment: NodeJS.ProcessEnv = process.env) 
       requiredServicesComposed: humanServicesComposed,
       async checkDatabase() {
         await prisma.$queryRaw`SELECT 1`;
+      },
+      async checkHumanAuthRolloutPolicy() {
+        await humanAuthRolloutService!.verifyGlobalPolicy();
       }
     }
   });

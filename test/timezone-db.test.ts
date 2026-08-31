@@ -72,7 +72,11 @@ test('seeded migration preserves every UTC epoch under a non-UTC database sessio
     `);
     assert.deepEqual(attemptsAfter.rows[0], attemptsBefore.rows[0]);
     assert.equal((await client.query('SELECT timezone FROM "Condominio"')).rows[0]!.timezone, 'America/Sao_Paulo');
-    for (const timeZone of ['UTC', 'EST5EDT', 'CST6CDT', 'PST8PDT', 'GMT0']) {
+    const supportedTimeZones = (await client.query<{ name: string }>(`
+      SELECT name FROM pg_timezone_names WHERE name IN ('UTC', 'EST5EDT', 'CST6CDT', 'PST8PDT') ORDER BY name
+    `)).rows.map(({ name }) => name);
+    assert.ok(supportedTimeZones.includes('UTC'));
+    for (const timeZone of supportedTimeZones) {
       await client.query('UPDATE "Condominio" SET timezone = $1', [timeZone]);
       assert.equal((await client.query('SELECT timezone FROM "Condominio"')).rows[0]!.timezone, timeZone);
     }

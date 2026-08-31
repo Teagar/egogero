@@ -402,8 +402,8 @@ test('browser auth endpoints are no-store and implement session, tenant, logout,
         }
         return { allowed: true, retryAfterSeconds: 0, repeatedExcess: false };
       },
-      async reserveFailure() { return { allowed: true, retryAfterSeconds: 0, repeatedExcess: false, reservationId: randomUUID() }; },
-      async finalizeFailure() {}
+      async reserve() { return { allowed: true, retryAfterSeconds: 0, repeatedExcess: false, reservationId: randomUUID() }; },
+      async finalize() {}
     }
   });
   const cookie = `${SESSION_COOKIE_NAME}=${token}`;

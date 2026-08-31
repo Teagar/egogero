@@ -12,6 +12,7 @@ import type { SessionRuntimeConfig } from '../src/sessions.js';
 import { createPrismaAuthRateLimiter } from '../src/auth-rate-limits.js';
 import type { AuthRateLimiter } from '../src/auth-rate-limits.js';
 import { TEST_ONLY_ALLOW_ALL_HUMAN_AUTH_ROLLOUT } from '../src/human-auth-rollout.js';
+import { createAuthTestCollectors } from '../src/auth-observability.js';
 
 const runDatabaseTests = process.env.RUN_DATABASE_TESTS === 'true' && Boolean(process.env.DATABASE_URL);
 
@@ -33,8 +34,8 @@ test(
     };
     const permissiveRateLimiter = {
       async check() { return { allowed: true, retryAfterSeconds: 0, repeatedExcess: false }; },
-      async reserveFailure() { return { allowed: true, retryAfterSeconds: 0, repeatedExcess: false, reservationId: randomUUID() }; },
-      async finalizeFailure() {}
+      async reserve() { return { allowed: true, retryAfterSeconds: 0, repeatedExcess: false, reservationId: randomUUID() }; },
+      async finalize() {}
     } satisfies AuthRateLimiter;
     const store = createPrismaBrowserSessionStore(prisma, config, { rateLimiter: permissiveRateLimiter,
       rolloutGate: TEST_ONLY_ALLOW_ALL_HUMAN_AUTH_ROLLOUT });
@@ -650,6 +651,61 @@ test(
   }
 );
 
+test('session issuance rejects a handoff authenticated before account-wide revocation', { skip: !runDatabaseTests }, async () => {
+  const prisma = new PrismaClient();
+  const accountId = randomUUID();
+  const identityId = randomUUID();
+  const membershipId = randomUUID();
+  const loginTransactionId = randomUUID();
+  const handoffToken = generateSessionToken();
+  const rateLimiter = {
+    async check() { return { allowed: true, retryAfterSeconds: 0, repeatedExcess: false }; },
+    async reserve() { return { allowed: true, retryAfterSeconds: 0, repeatedExcess: false, reservationId: randomUUID() }; },
+    async finalize() {}
+  } satisfies AuthRateLimiter;
+  const store = createPrismaBrowserSessionStore(prisma, {
+    currentCsrfKeyVersion: 1,
+    csrfKeys: new Map([[1, randomBytes(32)]]),
+    publicApplicationOrigin: 'https://app.example.test'
+  }, { rateLimiter, rolloutGate: TEST_ONLY_ALLOW_ALL_HUMAN_AUTH_ROLLOUT });
+  try {
+    await prisma.humanAccount.create({ data: { id: accountId, displayName: 'Stale handoff', status: 'active' } });
+    await prisma.externalIdentity.create({ data: {
+      id: identityId, accountId, issuer: 'https://identity.example.test', subject: `stale-${accountId}`
+    } });
+    await prisma.humanMembership.create({ data: { id: membershipId, accountId, role: 'provedor', status: 'active' } });
+    await prisma.oidcLoginTransaction.create({ data: {
+      id: loginTransactionId, expiresAt: new Date(Date.now() + 60_000), stateDigest: randomBytes(32),
+      nonceDigest: randomBytes(32), pkceVerifierCiphertext: randomBytes(43), pkceVerifierNonce: randomBytes(12),
+      pkceVerifierAuthTag: randomBytes(16), pkceKeyVersion: 1, issuer: 'https://identity.example.test',
+      clientId: 'stale-handoff-test', redirectUri: 'https://app.example.test/auth/callback', returnTo: '/'
+    } });
+    const authenticatedAt = new Date(Date.now() + 60_000);
+    await prisma.oidcValidatedHandoff.create({ data: {
+      id: randomUUID(), expiresAt: new Date(Date.now() + 60_000), handleDigest: digest(handoffToken),
+      loginTransactionId, accountId, externalIdentityId: identityId, authenticatedAt
+    } });
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    await prisma.humanAccount.update({ where: { id: accountId }, data: {
+      sessionVersion: { increment: 1 }, updatedAt: new Date()
+    } });
+    assert.equal(await store.issueFromHandoff({
+      handoffToken, requestCorrelationId: 'stale-after-recovery'
+    }), null);
+    assert.ok(await prisma.authenticationAuditEvent.findFirst({ where: {
+      accountId, eventType: 'session_issue_denied', reasonCode: 'stale_handoff'
+    } }));
+  } finally {
+    await prisma.oidcValidatedHandoff.deleteMany({ where: { loginTransactionId } });
+    await prisma.oidcLoginTransaction.deleteMany({ where: { id: loginTransactionId } });
+    await prisma.browserSession.deleteMany({ where: { accountId } });
+    await prisma.humanMembership.deleteMany({ where: { accountId } });
+    await prisma.externalIdentity.deleteMany({ where: { accountId } });
+    await prisma.humanAccount.deleteMany({ where: { id: accountId } });
+    await prisma.$disconnect();
+  }
+});
+
 test('recovery always revokes old sessions before an exhausted replacement-session limit', { skip: !runDatabaseTests }, async () => {
   const databaseUrl = process.env.DATABASE_URL!;
   const prisma = new PrismaClient({
@@ -659,11 +715,15 @@ test('recovery always revokes old sessions before an exhausted replacement-sessi
   const identityId = randomUUID();
   const membershipId = randomUUID();
   const transactionIds: string[] = [];
-  const store = createPrismaBrowserSessionStore(prisma, {
+  const telemetry = createAuthTestCollectors();
+  const sessionConfig = {
     currentCsrfKeyVersion: 1,
     csrfKeys: new Map([[1, randomBytes(32)]]),
     publicApplicationOrigin: 'https://app.example.test'
-  }, { rolloutGate: TEST_ONLY_ALLOW_ALL_HUMAN_AUTH_ROLLOUT });
+  };
+  const store = createPrismaBrowserSessionStore(prisma, sessionConfig, {
+    rolloutGate: TEST_ONLY_ALLOW_ALL_HUMAN_AUTH_ROLLOUT, alerts: telemetry.alertSink
+  });
 
   async function handoff(recoveryIntent: boolean) {
     const loginTransactionId = randomUUID();
@@ -694,6 +754,18 @@ test('recovery always revokes old sessions before an exhausted replacement-sessi
     await prisma.humanMembership.create({
       data: { id: membershipId, accountId, role: 'provedor', status: 'active' }
     });
+    const deniedTelemetry = createAuthTestCollectors();
+    const inconsistentStore = createPrismaBrowserSessionStore(prisma, sessionConfig, {
+      rolloutGate: {
+        ...TEST_ONLY_ALLOW_ALL_HUMAN_AUTH_ROLLOUT,
+        async gateMembership() { return { allowed: false, reason: 'policy_inconsistent' }; }
+      },
+      alerts: deniedTelemetry.alertSink
+    });
+    assert.equal(await inconsistentStore.issueFromHandoff({
+      handoffToken: await handoff(false), requestCorrelationId: 'cross-tenant-denial'
+    }), null);
+    assert.deepEqual(deniedTelemetry.alerts.map((alert) => alert.type), ['cross_tenant_access_denied']);
     const first = await store.issueFromHandoff({ handoffToken: await handoff(false), requestCorrelationId: 'initial' });
     assert.ok(first);
     const limiter = createPrismaAuthRateLimiter(prisma);
@@ -712,6 +784,7 @@ test('recovery always revokes old sessions before an exhausted replacement-sessi
     assert.equal(await prisma.authenticationAuditEvent.count({
       where: { accountId, eventType: 'session_issue_denied', reasonCode: 'session_creation_rate_limited' }
     }), 1);
+    assert.ok(telemetry.alerts.some((alert) => alert.type === 'unusual_session_creation'));
   } finally {
     await prisma.authenticationRateLimit.deleteMany({ where: { subject: accountId } });
     await prisma.browserSession.deleteMany({ where: { accountId } });

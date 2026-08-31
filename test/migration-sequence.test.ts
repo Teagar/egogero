@@ -31,7 +31,9 @@ test('migrations form one exact contiguous immutable sequence', async () => {
     '0022_add_callback_reservations_and_intent_checks',
     '0023_add_human_gatehouse_access_audit',
     '0024_add_reauthentication_start_intent',
-    '0025_add_human_auth_rollout'
+    '0025_add_human_auth_rollout',
+    '0026_add_rollout_deployment_authorization',
+    '0027_add_recovery_revocation_queue'
   ]);
 });
 
@@ -42,4 +44,29 @@ test('reauthentication migration binds trusted intent to a UUID family in both h
   ), 'utf8');
   assert.equal((sql.match(/"reauthenticationFamilyId" UUID/g) ?? []).length, 2);
   assert.equal((sql.match(/"reauthenticationIntent" = \("reauthenticationFamilyId" IS NOT NULL\)/g) ?? []).length, 2);
+});
+
+test('recovery revocation queue migration remains additive', async () => {
+  const sql = await readFile(new URL(
+    '../prisma/migrations/0027_add_recovery_revocation_queue/migration.sql',
+    import.meta.url
+  ), 'utf8');
+  assert.doesNotMatch(sql, /DROP (?:COLUMN|INDEX)/);
+  assert.match(sql, /ALTER COLUMN subject DROP NOT NULL/);
+  assert.match(sql, /ALTER COLUMN "processedAt" DROP NOT NULL/);
+  assert.match(sql, /prepare_legacy_recovery_webhook_event/);
+  assert.match(sql, /NEW\.subject := NULL/);
+  assert.match(sql, /subject = NULL/);
+});
+
+test('deployment authorization rejects future-dated approvals at consumption', async () => {
+  const sql = await readFile(new URL(
+    '../prisma/migrations/0026_add_rollout_deployment_authorization/migration.sql',
+    import.meta.url
+  ), 'utf8');
+  assert.match(sql, /deployment_auth\."createdAt" <= clock_timestamp\(\)/);
+  for (const role of ['egogero_rollout_owner', 'egogero_rollout_approver']) {
+    assert.match(sql, new RegExp(`rolname = '${role}'[\\s\\S]+rolcanlogin OR rolsuper OR rolcreatedb OR rolcreaterole OR rolinherit`));
+    assert.match(sql, new RegExp(`${role} has unsafe role attributes`));
+  }
 });

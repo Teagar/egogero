@@ -53,8 +53,26 @@ model HumanAuthRolloutHistory {
   requestCorrelationId     String
   rollback                 Boolean
   revokedSessions          Int                   @default(0)
+  deploymentAuthorizationId String?               @db.Uuid
+  deploymentOperatorIdentifier String?
+  deploymentApprovalReference String?
 
   @@index([scope, createdAt, id])
+}
+
+model HumanAuthDeploymentAuthorization {
+  id                   String                @id @db.Uuid
+  createdAt            DateTime              @default(now()) @db.Timestamptz(3)
+  expiresAt            DateTime              @db.Timestamptz(3)
+  usedAt               DateTime?             @db.Timestamptz(3)
+  tokenDigest          Bytes                 @unique
+  actorAccountId       String                @db.Uuid
+  scope                 String
+  state                 HumanAuthRolloutState
+  cohortPercentage     Int?
+  operatorIdentifier   String
+  approvalReference    String
+  requestCorrelationId String?
 }
 
 enum HumanAuthRolloutState {
@@ -286,6 +304,7 @@ model HumanAccount {
   memberships             HumanMembership[]
   browserSessions         BrowserSession[]
   provisioningInvitations HumanProvisioningInvitation[]
+  recoveryWebhookEvents   RecoveryWebhookEvent[]
 }
 
 model ExternalIdentity {
@@ -423,17 +442,42 @@ model HumanProvisioningInvitation {
 }
 
 model RecoveryWebhookEvent {
-  id          String   @id @default(uuid()) @db.Uuid
-  createdAt   DateTime @default(now()) @db.Timestamptz(3)
-  eventId     String
-  eventDigest Bytes    @unique
-  issuer      String
-  subject     String
-  accountId   String?  @db.Uuid
-  processedAt DateTime @db.Timestamptz(3)
+  id             String                   @id @default(uuid()) @db.Uuid
+  createdAt      DateTime                 @default(now()) @db.Timestamptz(3)
+  eventId        String
+  eventDigest    Bytes                    @unique
+  issuer         String
+  subject        String?
+  processedAt    DateTime?                @db.Timestamptz(3)
+  subjectDigest  Bytes
+  keyVersion     Int
+  accountId      String?                  @db.Uuid
+  status         RecoveryRevocationStatus @default(pending)
+  attempts       Int                      @default(0)
+  nextAttemptAt  DateTime                 @default(now()) @db.Timestamptz(3)
+  expiresAt      DateTime                 @db.Timestamptz(3)
+  leaseOwner     String?
+  leaseToken     String?                  @db.Uuid
+  leaseExpiresAt DateTime?                @db.Timestamptz(3)
+  acknowledgedAt DateTime?                @db.Timestamptz(3)
+  failedAt       DateTime?                @db.Timestamptz(3)
+  lastError      String?
+  sloAlertedAt   DateTime?                @db.Timestamptz(3)
+  account        HumanAccount?            @relation(fields: [accountId], references: [id], onDelete: Restrict)
 
   @@unique([issuer, eventId])
-  @@index([createdAt])
+  @@index([status, nextAttemptAt, createdAt, id])
+  @@index([status, leaseExpiresAt, id])
+  @@index([status, createdAt, sloAlertedAt])
+}
+
+enum RecoveryRevocationStatus {
+  pending
+  processing
+  retry
+  acknowledged
+  failed
+  expired
 }
 
 model ReauthenticationStartIntent {

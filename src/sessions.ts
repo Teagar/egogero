@@ -703,6 +703,7 @@ export function createPrismaBrowserSessionStore(
         const handoffs = await transaction.$queryRaw<Array<{
           accountId: string;
           externalIdentityId: string;
+          createdAt: Date;
           authenticatedAt: Date;
           authenticationMethods: string[];
           assuranceContext: string | null;
@@ -715,7 +716,7 @@ export function createPrismaBrowserSessionStore(
           WHERE "handleDigest" = ${digest(input.handoffToken)}
             AND "consumedAt" IS NULL
             AND "expiresAt" > clock_timestamp()
-          RETURNING "accountId", "externalIdentityId", "authenticatedAt", "authenticationMethods",
+          RETURNING "accountId", "externalIdentityId", "createdAt", "authenticatedAt", "authenticationMethods",
                     "assuranceContext", "recoveryIntent", "reauthenticationIntent",
                     "reauthenticationFamilyId"
         `);
@@ -735,9 +736,10 @@ export function createPrismaBrowserSessionStore(
           id: string;
           sessionVersion: number;
           status: string;
+          updatedAt: Date;
           databaseNow: Date;
         }>>(Prisma.sql`
-          SELECT id, "sessionVersion", status::text, clock_timestamp() AS "databaseNow"
+          SELECT id, "sessionVersion", status::text, "updatedAt", clock_timestamp() AS "databaseNow"
           FROM "HumanAccount"
           WHERE id IN (${Prisma.join(accountIds.map((id) => Prisma.sql`${id}::uuid`))})
           ORDER BY id
@@ -748,6 +750,16 @@ export function createPrismaBrowserSessionStore(
           await insertAudit(transaction, {
             eventType: 'session_issue_denied', outcome: 'denied', reasonCode: 'account_inactive',
             requestCorrelationId: input.requestCorrelationId, accountId: handoff.accountId,
+            externalIdentityId: handoff.externalIdentityId, ipPrefix: input.ipPrefix,
+            userAgentHash: userAgentDigest(input.userAgent)
+          });
+          return null;
+        }
+        if (account.sessionVersion > 0
+          && (handoff.createdAt <= account.updatedAt || handoff.authenticatedAt <= account.updatedAt)) {
+          await insertAudit(transaction, {
+            eventType: 'session_issue_denied', outcome: 'denied', reasonCode: 'stale_handoff',
+            requestCorrelationId: input.requestCorrelationId, accountId: account.id,
             externalIdentityId: handoff.externalIdentityId, ipPrefix: input.ipPrefix,
             userAgentHash: userAgentDigest(input.userAgent)
           });
@@ -790,6 +802,9 @@ export function createPrismaBrowserSessionStore(
         if (membership) {
           const rollout = await dependencies.rolloutGate.gateMembership(transaction, membership.id, account.id);
           if (!rollout.allowed) {
+            if (rollout.reason === 'policy_inconsistent') {
+              alerts.emit('cross_tenant_access_denied', { reason: rollout.reason, operation: 'session_issue' });
+            }
             await insertAudit(transaction, {
               eventType: 'session_issue_denied', outcome: 'denied', reasonCode: 'rollout_disabled',
               requestCorrelationId: input.requestCorrelationId, accountId: account.id,
@@ -903,6 +918,7 @@ export function createPrismaBrowserSessionStore(
         }
         const creationLimit = await rateLimiter.check('session_creation_account', account.id, true, transaction);
         if (!creationLimit.allowed) {
+          alerts.emit('unusual_session_creation', { operation: 'session_issue', outcome: 'rate_limited' });
           await insertAudit(transaction, {
             eventType: 'session_issue_denied', outcome: 'denied', reasonCode: 'session_creation_rate_limited',
             requestCorrelationId: input.requestCorrelationId, accountId: account.id,
@@ -1263,7 +1279,9 @@ export function createPrismaBrowserSessionStore(
         });
         return 'revoked';
       });
-      metrics.observe('auth_session_revocation_seconds', (performance.now() - startedAt) / 1000, { operation: 'current', outcome: result });
+      const revocationSeconds = (performance.now() - startedAt) / 1000;
+      metrics.observe('auth_session_revocation_seconds', revocationSeconds, { operation: 'current', outcome: result });
+      if (revocationSeconds > 5) alerts.emit('session_revocation_slo', { operation: 'current', thresholdSeconds: 5 });
       if (result === 'revoked') metrics.increment('auth_database_writes_total', { operation: 'session_revoke', outcome: 'success' });
       return result;
     },
@@ -1356,7 +1374,7 @@ export function createBrowserSessionAuthenticator(store: BrowserSessionStore, ra
       const ipPrefix = requestIpPrefix(request);
       const hasSession = hasBrowserSessionCookie(request.headers.cookie);
       if (!hasSession) return null;
-      const reservation = await rateLimiter?.reserveFailure('authentication_failure_ip', ipPrefix);
+      const reservation = await rateLimiter?.reserve('authentication_failure_ip', ipPrefix);
       if (reservation && !reservation.allowed) {
         throw new AuthenticationError(429, 'authentication_temporarily_unavailable', {
           'cache-control': 'no-store', 'retry-after': String(reservation.retryAfterSeconds)
@@ -1367,7 +1385,7 @@ export function createBrowserSessionAuthenticator(store: BrowserSessionStore, ra
       const finalize = async (outcome: 'success' | 'failure') => {
         if (reservationId && !reservationFinalized) {
           reservationFinalized = true;
-          await rateLimiter?.finalizeFailure(reservationId, outcome);
+          await rateLimiter?.finalize(reservationId, outcome === 'failure' ? 'consume' : 'release');
         }
       };
       const rejectAuthenticationFailure = async (

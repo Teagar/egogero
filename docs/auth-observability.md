@@ -6,19 +6,30 @@ application processes. The cleanup operation removes rows inactive for 24 hours 
 `AuthenticationRateLimit_updatedAt_idx`. IP subjects contain only IPv4 `/24` or IPv6 `/64`
 prefixes. An unparseable trusted-proxy result shares the fail-closed `unknown` bucket.
 
-| Operation | Limit | External behavior |
-| --- | --- | --- |
-| Login initiation | 5/IP/10 minutes | Generic `429`, bounded `Retry-After` |
-| Failed OIDC callback | 10/IP/15 minutes | State is consumed, then an exact PostgreSQL exchange reservation is acquired before provider I/O |
-| Session creation/rotation | 10/account/15 minutes | Denial, progressive PostgreSQL backoff, repeated-excess alert; recovery revocation happens first |
-| Recovery initiation | 3/IP/30 minutes | Generic `429`, no account input or signal |
-| Reauthentication initiation | 5/account/10 minutes | Generic `429` after authenticated request validation |
-| CSRF/authentication failure | 60/IP/minute | Generic `429` on sustained abuse |
+The normative table is `AUTH_RATE_LIMIT_POLICIES` in `src/auth-rate-limits.ts`;
+automated parity rejects documentation drift.
 
-Callback reservations are finalized exactly once. Success releases the reservation without
-consuming failure budget; failure converts it into a counted failure. This caps concurrent
-provider exchanges at the remaining failure budget without eventually denying successful
-callbacks. Reservations expire with the counter window and are deleted with their bucket.
+<!-- auth-rate-limits:start -->
+| Operation | Dimension | Limit | External behavior |
+| --- | --- | --- | --- |
+| Login initiation | IP prefix | 5 per 10 minutes | Generic 429; bounded Retry-After |
+| Failed OIDC callback | IP prefix | 10 per 15 minutes | Consume state before provider exchange; reserve failure budget |
+| Session creation or rotation | Account | 10 per 15 minutes | Deny; progressive backoff; repeated-excess alert |
+| Recovery initiation | IP prefix | 3 per 30 minutes | Generic 429; no account signal |
+| Reauthentication initiation | Account | 5 per 10 minutes | Generic 429 after authenticated validation |
+| Administrative invitation acceptance | IP prefix | 10 per 1 hour | Generic denial; exponential backoff; repeated-excess alert |
+| Administrative invitation acceptance | Invitation digest | 5 per 1 hour | Generic denial; exponential backoff; repeated-excess alert |
+| Human gate validation | Account | 20 per 1 minute | Generic 429 after authenticated validation |
+| CSRF or authentication failure | IP prefix | 60 per 1 minute | Generic 429 on sustained abuse |
+<!-- auth-rate-limits:end -->
+
+Reservations are finalized exactly once under row locks. Callback success releases its
+reservation and callback failure consumes it. Invitation acceptance reserves the normalized
+trusted IP prefix and invitation digest independently, consumes both before OIDC transaction
+creation, and fails closed if either operation cannot commit. This caps concurrent work at the
+remaining budget across service instances without creating a transaction or session for denied
+attempts. Reservations expire with the counter window; cleanup removes expired reservations,
+repairs reserved counts, and removes inactive buckets through indexed scans.
 
 `TRUST_PROXY` accepts only a comma-separated IP/CIDR allowlist. Wildcard `/0` networks and invalid configuration stop
 startup. Forwarded addresses are interpreted only by Fastify after the direct peer matches
@@ -49,7 +60,9 @@ observations have conservative histogram p95 above 20 ms.
 ## Alerts and Redaction
 
 Alerts cover repeated limiter excess, PKCE/CSRF integrity or key failures, state misses and
-replay, issuer mix-up, callback success SLO, and session latency SLO. Alert payloads pass
+replay, issuer mix-up, callback/session SLOs, cross-tenant policy inconsistency, provider
+configuration drift, session revocation over five seconds, unusual rate-limited session creation,
+and the critical five-second recovery-revocation acknowledgement SLO. Alert payloads pass
 through recursive defensive redaction. Authorization/cookie headers and raw session, OIDC,
 invitation, device, digest, ciphertext, nonce, authentication-tag, client-secret, and code
 fields are replaced. Request bodies are not telemetry payloads.
@@ -64,10 +77,13 @@ measured migration gate.
 ## Rollout Snapshot Contract
 
 `createStructuredAuthTelemetry` emits one JSON object per interval using contract
-`egogero.auth-rollout/v1`. The default sink writes JSONL to stdout. A sink adapter can send the
-same object elsewhere. `createAuthSnapshotFileSink(path)` opens with `O_NOFOLLOW`, creates with
-mode `0600`, repairs any existing group/other permission bits to `0600` before append, and
-recovers its serialized promise chain after a failed append. Sink promises are never awaited
+`egogero.auth-rollout/v2`. Non-canary operation is explicit and defaults to stdout with the
+reserved `staging:non-canary` partition. Canary mode requires an injected UUID v4, an injected
+stage partition, and an absolute durable JSONL path. `prepareAuthSnapshotFile(path)` verifies
+that path before startup. `createAuthSnapshotFileSink(path)` opens each append with `O_NOFOLLOW`,
+creates with mode `0600`, repairs the complete mode to `0600`, enforces a 32 MiB default bound,
+syncs each append, and recovers its serialized promise chain after a failed append. Sink promises
+are never awaited
 by authentication. Throws, rejection, timeout (default five seconds), or backpressure are
 carried into a later snapshot as a degraded observability gap.
 The affected interval is not silently accepted as evidence. If the only sink remains down,
@@ -84,14 +100,15 @@ Each snapshot contains only:
 
 | Field | Contract |
 | --- | --- |
-| `contract` | Exact version `egogero.auth-rollout/v1` |
+| `contract` | Exact version `egogero.auth-rollout/v2` |
 | `interval.start/end` | Half-open UTC interval `[start,end)` for this process |
-| `instanceId` | UUID v4 generated per process by default; non-sensitive and unrelated to hosts or users |
+| `instanceId` | Stable UUID v4 injected by the orchestrator for canary; non-sensitive and unrelated to hosts or users |
+| `stageId` | Bounded `staging:<partition>` or `production:<partition>` injected for canary and copied to inventory/evaluation |
 | `sequence` | Strictly increasing within one process instance |
 | `counters[]` | Delta counters with allowlisted metric dimensions and safe integer values |
 | `histograms[]` | Delta, non-cumulative bucket counts in seconds; bounds `1,2.5,5,10,20,50,100,250,500,1000ms`, plus overflow |
-| `alerts` | Counts keyed only by the seven bounded `AuthAlertType` routes |
-| `criticalIncidentCount` | Crypto integrity/key, replay/state-miss, and issuer mix-up total |
+| `alerts` | Counts keyed only by the twelve bounded `AuthAlertType` routes |
+| `criticalIncidentCount` | Crypto integrity/key, replay/state-miss, issuer mix-up, cross-tenant denial, provider drift, session/recovery revocation-SLO, and unusual-session total |
 | `observability` | `healthy` or `degraded`, with bounded sink, routing, clock, and numeric gap code/count pairs |
 
 Snapshots contain no raw observations or alert details. They must not contain account,
@@ -110,18 +127,19 @@ infinite.
 
 ## Canary Evaluator
 
-Evaluation also requires an independently produced `egogero.auth-rollout-inventory/v1` JSON
-file. Each `servingInstances` entry contains a UUID v4 `instanceId`, canonical UTC
+Evaluation also requires an independently produced `egogero.auth-rollout-inventory/v2` JSON
+file with the exact stage partition. Each `servingInstances` entry contains a UUID v4 `instanceId`, canonical UTC
 `expectedStart`/`expectedEnd`, and `cadenceMs`. It must come from deployment inventory or the
 orchestrator, not the telemetry sink or process lifecycle hook. Every expected interval must
 be covered by that instance's snapshots, each no longer than its cadence. Planned replacement
 is represented by ending the old instance and starting the new instance in inventory; a
 replica that silently stops while another remains healthy is inconclusive.
 
-Inventory is exactly one JSON record in a regular file. The evaluator checks the path, opens it
-once with `O_NOFOLLOW`, verifies the opened device/inode, reads incrementally from that handle,
-and verifies size and identity again after EOF. Symlinks, directories/special files, multiple
-records, growth, or path replacement are rejected as inconclusive with exit `2`.
+Inventory and snapshot paths must be regular files. The evaluator checks each path, opens it
+once with `O_NOFOLLOW`, verifies the opened device/inode, reads incrementally only from that
+handle under file/line/record/total limits, and verifies consumed bytes, size, and identity
+again after EOF. Symlinks, directories/special files, multiple inventory records, growth, or
+path replacement are rejected as inconclusive with exit `2`.
 
 Run against one or more files, or pipe JSONL on stdin:
 
@@ -130,7 +148,9 @@ npm run auth:rollout:evaluate -- --inventory serving.json snapshots-a.jsonl snap
 cat snapshots.jsonl | npm run auth:rollout:evaluate -- --inventory serving.json
 ```
 
-The command writes exactly one `egogero.auth-rollout-evaluation/v1` JSON object. Exit `0` is
+The command writes exactly one `egogero.auth-rollout-evaluation/v2` JSON object carrying the
+inventory `stageId`. Foreign-stage snapshots cause `stage_mismatch`, are excluded from
+selected-stage totals, and make the result inconclusive. Exit `0` is
 `pass`, exit `1` is `fail`, and exit `2` is `inconclusive`. A pass requires all of:
 
 - contiguous real wall-clock coverage of at least 24 hours (the exact boundary passes)
@@ -145,7 +165,7 @@ An observed critical incident or measured SLO breach is `fail` even if other evi
 incomplete. Missing volume/window, malformed data, restarts with ambiguous same-instance
 overlap, and observability gaps are `inconclusive`, never pass. Synthetic snapshots are useful
 only for validating the evaluator and alert plumbing; they are not staging or production
-rollout evidence.
+rollout evidence. The reserved `staging:non-canary` partition is rejected as evaluator evidence.
 
 JSONL is processed as a stream. Defaults are at most 32 files, 100,000 records, 256 KiB per
 line, 32 MiB per file, and 64 MiB total; inventory is capped at 256 KiB. Limit or read failures
@@ -168,10 +188,10 @@ critical         = sum(criticalIncidentCount)
 gaps             = sum(observability.gaps.count) by code
 ```
 
-Route `crypto_integrity_failure` and `crypto_key_failure` to the security/on-call channel;
-route `oidc_replay_or_state_miss` and `oidc_issuer_mixup` to security and identity on-call;
-route `rate_limit_repeated_excess` to abuse/on-call; and route both SLO alerts to identity and
-database on-call. A routing smoke test must deliver one sanitized event for every route and
+The bounded default routing map sends security integrity and cross-tenant alerts to Security,
+provider drift and revocation breaches to Security and Identity, unusual session creation to
+Security and Abuse, repeated excess to Abuse, and callback/session SLOs to their Identity or
+Database owners. A routing smoke test must deliver one sanitized event for every alert type and
 confirm acknowledgement without adding payload dimensions.
 
 `createRoutedAuthAlertSink` validates an exact `AuthAlertType` to bounded route-name map. The
@@ -192,11 +212,27 @@ is deliberately small and fail-closed:
 | `AUTH_ALERT_ADAPTER` | `stdout` (default) or `https_webhook` |
 | `AUTH_ALERT_WEBHOOK_URL` | Required only for `https_webhook`; HTTPS without credentials, query, or fragment |
 | `AUTH_ALERT_TIMEOUT_MS` | Integer `100..10000`, default `5000` |
+| `AUTH_ROLLOUT_MODE` | `off` (explicit non-canary default) or `canary` |
+| `AUTH_ROLLOUT_INSTANCE_ID` | Injected UUID v4, required for canary |
+| `AUTH_ROLLOUT_STAGE_ID` | Injected bounded stage partition, required for canary |
+| `AUTH_ROLLOUT_SNAPSHOT_PATH` | Absolute protected durable JSONL path, required for canary |
+| `AUTH_ALERT_SMOKE_ACK_ID` | External smoke evidence identifier, required for canary |
 
 The stdout adapter emits only `egogero.auth-alert-delivery/v1`. The webhook adapter is a generic
 HTTP transport, not a claim of integration with any alert provider. Non-2xx acknowledgement,
 throw, rejection, timeout, and bounded-queue drops are observability gaps and never affect an
 authentication result.
+
+Before setting canary mode, exercise the same external HTTPS endpoint sequentially for all
+bounded alert types. The command exits nonzero on timeout, transport failure, non-2xx response,
+or negative acknowledgement and prints only a bounded summary on success:
+
+```sh
+npm run auth:alerts:smoke -- --url "https://alerts.example.test/auth" --timeout-ms 5000
+```
+
+Retain the receiver/operator acknowledgement as `AUTH_ALERT_SMOKE_ACK_ID`; an HTTP acknowledgement
+alone does not prove the final operator destination was configured correctly.
 
 Rollback the canary on any critical incident, callback success below 99.5%, session p95 above
 20 ms, or repeated excess that indicates uncontrolled abuse. A scoped rollback revokes affected

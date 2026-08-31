@@ -625,6 +625,30 @@ test('tenant matrix prevents a sindico from reaching another condominium before 
   }
 });
 
+test('cross-tenant authorization denials emit a bounded critical signal', async () => {
+  const alerts: Array<{ type: string; details: Readonly<Record<string, unknown>> }> = [];
+  const app = createApp({
+    db: createAuthorizationStore(),
+    authenticator: {
+      ...authenticator,
+      authorizationAlerts: { emit(type, details) { alerts.push({ type, details }); } }
+    }
+  });
+  const response = await app.inject({
+    method: 'GET',
+    url: `/condominios/${OTHER_CONDOMINIO_ID}/moradores`,
+    headers: developmentHeaders('sindico')
+  });
+
+  assert.equal(response.statusCode, 403);
+  assert.deepEqual(alerts, [{
+    type: 'cross_tenant_access_denied',
+    details: { reason: 'tenant_scope_mismatch', operation: 'moradores:manage' }
+  }]);
+  assert.equal(JSON.stringify(alerts).includes(OTHER_CONDOMINIO_ID), false);
+  await app.close();
+});
+
 test('resident guest ownership is enforced before any store access', async () => {
   let storeCalls = 0;
   const inaccessible = async () => {

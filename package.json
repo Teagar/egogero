@@ -20,7 +20,9 @@
     "delivery:worker": "node dist/src/jobs/deliver-invitations.js",
     "auth:rollout": "tsx src/jobs/set-human-auth-rollout.ts",
     "auth:rotation:rehearse": "node scripts/rehearse-auth-key-rotation.mjs",
-    "auth:rollout:evaluate": "tsx src/auth-rollout.ts"
+    "auth:alerts:smoke": "tsx src/auth-alert-smoke.ts",
+    "auth:rollout:evaluate": "tsx src/auth-rollout.ts",
+    "recovery:worker": "node dist/src/jobs/process-recovery-revocations.js"
   },
   "dependencies": {
     "@fastify/static": "^10.1.3",

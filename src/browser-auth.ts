@@ -65,13 +65,13 @@ export function registerBrowserAuthRoutes(
     reservationId?: string
   ) {
     reply.header('Set-Cookie', CLEARED_SESSION_COOKIE);
-    if (reservationId) await rateLimiter?.finalizeFailure(reservationId, 'failure');
+    if (reservationId) await rateLimiter?.finalize(reservationId, 'consume');
     return reply.status(401).send({ error: 'authentication_required' });
   }
 
   app.get('/auth/session', unambiguous, async (request, reply) => {
     noStore(reply);
-    const reservation = await rateLimiter?.reserveFailure('authentication_failure_ip', requestIpPrefix(request));
+    const reservation = await rateLimiter?.reserve('authentication_failure_ip', requestIpPrefix(request));
     if (reservation && !reservation.allowed) {
       return reply.header('Retry-After', reservation.retryAfterSeconds).status(429)
         .send({ error: 'authentication_temporarily_unavailable' });
@@ -85,13 +85,13 @@ export function registerBrowserAuthRoutes(
     try {
       snapshot = await store.inspect({ sessionToken: token, requestCorrelationId: request.id, ipPrefix: requestIpPrefix(request) });
     } catch (error) {
-      if (reservationId) await rateLimiter?.finalizeFailure(reservationId, 'success');
+      if (reservationId) await rateLimiter?.finalize(reservationId, 'release');
       throw error;
     }
     if (!snapshot) {
       return rejectSessionLookup(request, reply, reservationId);
     }
-    if (reservationId) await rateLimiter?.finalizeFailure(reservationId, 'success');
+    if (reservationId) await rateLimiter?.finalize(reservationId, 'release');
     return {
       account: snapshot.account,
       memberships: snapshot.memberships,
