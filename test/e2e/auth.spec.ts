@@ -218,6 +218,9 @@ test('current and all-session logout revoke concurrent tabs and independent brow
   await independent.close();
 
   await resetRateLimits();
+  const account = await databaseRows<{ updatedAt: Date }>(`SELECT "updatedAt" FROM "HumanAccount"
+    WHERE id = '31000000-0000-4000-8000-000000000001'::uuid`);
+  await expect.poll(() => Math.floor(Date.now() / 1_000) * 1_000).toBeGreaterThan(account[0]!.updatedAt.getTime());
   await page.goto('/recovery');
   await page.getByRole('link', { name: 'Continuar recuperação' }).click();
   await expect(page.locator('.shell-main h1')).toBeVisible();
