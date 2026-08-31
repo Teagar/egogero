@@ -189,7 +189,6 @@ async function processRecoveryClaimStarted(
     const result = await client.$transaction(async (transaction) => {
       onTransactionStart();
       timer = setTimeout(() => { timedOut = true; controller.abort(); }, config.adapterTimeoutMs);
-      timer.unref();
       const current = await transaction.$queryRaw<Array<{ id: string }>>(Prisma.sql`
         SELECT id FROM "RecoveryWebhookEvent"
         WHERE id = ${claim.id}::uuid AND status = 'processing'
