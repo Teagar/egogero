@@ -2,9 +2,9 @@
 
 ## Decision
 
-The current application revision is ready for local and CI verification but is **not ready for a real staging canary**.
+The current application revision has completed its repository controls but is **not ready for a real staging canary**.
 
-PC-30 through PC-37 provide tenant gates, transactional human-session rollback, browser threat tests, deployment preflight, bounded critical alerts, durable stage-partitioned telemetry, a smoke command, and a conservative evaluator.
+PC-30 through PC-39 provide tenant gates, transactional human-session rollback, browser threat tests, deployment preflight, bounded critical alerts, durable stage-partitioned telemetry, strong rollout authorization, reconciled abuse limits, recovery-revocation processing, a smoke command, and a conservative evaluator.
 
 That evidence is synthetic. It does not satisfy a staging stage, a 24-hour window, or an operator acknowledgement. Promotion remains blocked until every item under **Canary blockers** is closed with real evidence.
 
@@ -19,19 +19,28 @@ That evidence is synthetic. It does not satisfy a staging stage, a 24-hour windo
 - Synthetic snapshots, screenshots, partial windows, and data reconstructed from the telemetry stream are not rollout evidence.
 - Redis remains disabled. Evaluation can begin only after one of the ADR production triggers is measured for seven consecutive days.
 
+## Repository controls closed
+
+| Control | Immutable closure |
+| --- | --- |
+| Recent browser reauthentication, single-use deployment authorization, least-privileged database roles, and authoritative policy readiness | PC-36 and merge commit `4a64f18718ad5ee8dd7d8acf7cf91c9de168f4a1` |
+| Routed critical alerts, stable serving identity, durable stage snapshots, bounded evaluator input, and alert smoke evidence | PC-37 and merge commit `4a64f18718ad5ee8dd7d8acf7cf91c9de168f4a1` |
+| ADR-aligned login, callback, session-creation, invitation-IP, and invitation-token abuse limits | PC-38 and merge commit `4a64f18718ad5ee8dd7d8acf7cf91c9de168f4a1` |
+| Durable recovery-revocation queue with retry, expiry, paging, bounded concurrency, monitoring, and five-second enforcement | PC-39 and merge commit `4a64f18718ad5ee8dd7d8acf7cf91c9de168f4a1` |
+
+These references close repository implementation gaps only. They are not staging acknowledgements, observed SLO windows, or proof that an external platform is configured correctly.
+
 ## Canary blockers
 
 | Blocker | Required closure | Accountable owner |
 | --- | --- | --- |
 | Repository smoke tests cannot prove an operator receives external alerts | Configure the required HTTPS adapter, run `auth:alerts:smoke`, verify every real destination, and retain its external acknowledgement ID | Security operations |
-| Rollout administration does not require authentication within the last ten minutes | Enforce recent OIDC authentication for every global or tenant policy mutation and add route/database tests | Backend authentication |
-| Direct rollout CLI trusts any holder of runtime database credentials and only attributes the change to the supplied provider UUID | Run it only through a separately authenticated, approved, least-privileged deployment identity with immutable operator binding, or change the command contract to carry verifiable operator authorization | Security and deployment platform |
-| Readiness does not verify that the authoritative global policy exists and is valid | Add a cached/startup or database readiness dependency and prove missing/corrupt policy returns generic `503` | Backend authentication and SRE |
-| Repository contracts cannot produce authoritative serving inventory | Inject the required stable instance/stage IDs and produce lifecycle inventory independently of snapshots | Deployment platform |
-| Repository sink durability cannot prove platform retention | Mount the configured protected durable JSONL path and retain an immutable partition per stage | Observability/SRE |
+| Deployment authorization exists but no real approval identity or secret-injection path is configured | Provision the least-privileged approver/application roles, inject the masked single-use authorization token, and retain the immutable approval reference | Security and deployment platform |
+| Repository contracts cannot prove authoritative serving inventory or platform retention | Inject stable instance/stage IDs, independently produce lifecycle inventory, mount the protected durable JSONL path, and retain an immutable partition per stage | Deployment platform and Observability/SRE |
 | No real staging origin, OIDC client, secret manager, proxy CIDRs, PostgreSQL security evidence, pilot tenant, or named responders | Supply and approve each dependency without committing or printing secret values | Rollout owner |
-| ADR abuse limits differ from implementation, and invitation acceptance has no dedicated distributed policy | Reconcile the decision or implementation and add the invitation IP/invitation limits before external exposure | Application security |
-| Recovery webhook has no monitored retry queue or five-second revocation paging | Implement and exercise retry, expiry, paging, and timing evidence | Identity and security operations |
+| Local abuse-limit tests cannot prove provider limits, production load behavior, or routed acknowledgements | Configure provider-side limits, exercise staging load and enumeration controls, and retain sanitized alert acknowledgements | Application security |
+| Local recovery processing cannot prove provider delivery, external monitoring, or revocation timing | Exercise signed delivery, retry, expiry, paging, alert acknowledgement, and five-second timing against the real provider integration | Identity and security operations |
+| No complete 24-hour stage window exists | Collect a new contiguous window for each stage and retain its independent inventory, durable snapshots, evaluator output, incidents, and approvals | Rollout owner and SRE |
 
 A blocker is closed only by an immutable change reference plus the evidence named above. A risk acceptance does not turn missing 24-hour or security evidence into a pass.
 
@@ -57,7 +66,7 @@ A blocker is closed only by an immutable change reference plus the evidence name
 | Session expiry and lifecycle | 30-minute idle, 12-hour absolute, bounded touch, rotation and family revocation | Session unit/database tests | Staging expiry/rotation timing and multi-tab behavior; Backend and QA |
 | Immutable audit and retention | Append-only authentication audit plus cleanup contracts for transient auth rows | Schema/database and retention tests | Application-role privilege inspection, retention job record and restricted export policy; DBA/Security |
 | Ninety-day key rotation | Current/previous keyrings and disposable integration rehearsal | Rotation rehearsal and configuration tests | Dated secret-manager/provider rotation record at least every 90 days; Security/Identity |
-| Abuse and enumeration | PostgreSQL counters, generic responses and bounded labels | Rate-limit and unknown-account/invitation tests | Reconciled ADR limits, provider limits, alert acknowledgements and load evidence; Abuse/Security |
+| Abuse and enumeration | PostgreSQL counters, generic responses and bounded labels | Rate-limit and unknown-account/invitation tests | Provider limits, alert acknowledgements and load evidence; Abuse/Security |
 | 24-hour promotion gate | Versioned snapshots, independent inventory, conservative histogram and evaluator | `test/auth-rollout.test.ts` | Real orchestrator inventory, durable snapshots and evaluator output per stage; SRE |
 | Rollback isolation | Scoped/global policy transitions revoke only ineligible human sessions | High-cardinality and lock-order PostgreSQL tests | Staging rollback drill plus device/public-path checks; SRE and Backend |
 
