@@ -65,4 +65,8 @@ test('deployment authorization rejects future-dated approvals at consumption', a
     import.meta.url
   ), 'utf8');
   assert.match(sql, /deployment_auth\."createdAt" <= clock_timestamp\(\)/);
+  for (const role of ['egogero_rollout_owner', 'egogero_rollout_approver']) {
+    assert.match(sql, new RegExp(`rolname = '${role}'[\\s\\S]+rolcanlogin OR rolsuper OR rolcreatedb OR rolcreaterole OR rolinherit`));
+    assert.match(sql, new RegExp(`${role} has unsafe role attributes`));
+  }
 });

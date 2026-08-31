@@ -364,6 +364,11 @@ export function createHumanAdministrationService(client: PrismaClient, config: H
             ? { accepted: true as const, replayed: true }
             : { accepted: false as const, replayed: true };
         }
+        await insertAudit(transaction, {
+          eventType: 'recovery_webhook_accepted', outcome: 'success', accountId,
+          actorType: 'system', requestCorrelationId: input.requestCorrelationId,
+          metadata: { identityMatched: Boolean(accountId) }
+        });
         return { accepted: true as const, replayed: false };
       }, { timeout: 5_000 });
     }

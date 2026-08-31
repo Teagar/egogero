@@ -117,11 +117,15 @@ export async function startServer(environment: NodeJS.ProcessEnv = process.env) 
     oidcService && browserSessionService && browserSessionStore && humanAdministrationService && authRateLimiter
   );
   if (!humanServicesComposed) throw new Error('Human authentication services are incomplete');
-  const authenticator = browserSessionStore
+  const baseAuthenticator = browserSessionStore
     ? createCredentialRouter(browserSessionStore, deviceAuthenticator, developmentAuthenticator, authRateLimiter)
     : developmentAuthenticator
       ? createCompositeAuthenticator(deviceAuthenticator, developmentAuthenticator)
       : deviceAuthenticator;
+  const authenticator = {
+    authenticate: baseAuthenticator.authenticate.bind(baseAuthenticator),
+    authorizationAlerts: authObservability.alerts
+  };
   const app = createApp({
     authenticator,
     invitationStore,

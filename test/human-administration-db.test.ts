@@ -148,6 +148,9 @@ test('signed recovery webhook atomically queues once without persisting its subj
     assert.equal(serialized.includes(signature), false);
     assert.equal(serialized.includes(subject), false);
     assert.equal(serialized.includes(trailingSubject), false);
+    assert.equal(await prisma.authenticationAuditEvent.count({
+      where: { accountId, eventType: 'recovery_webhook_accepted', outcome: 'success' }
+    }), 2);
 
     const legacySubject = `legacy-${accountId}`;
     await prisma.$executeRaw`

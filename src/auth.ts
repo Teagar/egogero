@@ -1,5 +1,7 @@
 import type { FastifyReply, FastifyRequest } from 'fastify';
 
+import type { AuthAlertSink } from './auth-observability.js';
+
 export const ROLES = ['provedor', 'sindico', 'morador', 'portaria'] as const;
 
 export type Role = (typeof ROLES)[number];
@@ -57,6 +59,7 @@ declare module 'fastify' {
 
 export interface Authenticator {
   authenticate(request: FastifyRequest): Promise<AuthenticatedIdentity | null>;
+  authorizationAlerts?: AuthAlertSink;
 }
 
 const DEVELOPMENT_ID_HEADER = 'x-development-user-id';
@@ -155,6 +158,11 @@ export function authorize(
     const globallyAuthorized = identity.role === 'provedor' && identity.condominioIds === null;
 
     if (condominioId && !globallyAuthorized && !identity.condominioIds?.includes(condominioId)) {
+      try {
+        void Promise.resolve(authenticator.authorizationAlerts?.emit('cross_tenant_access_denied', {
+          reason: 'tenant_scope_mismatch', operation: permission
+        })).catch(() => {});
+      } catch { /* authorization does not depend on telemetry */ }
       return reply.status(403).send({ error: 'Forbidden' });
     }
 

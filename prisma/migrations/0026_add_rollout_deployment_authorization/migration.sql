@@ -4,9 +4,21 @@ DO $$
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'egogero_rollout_owner') THEN
     CREATE ROLE egogero_rollout_owner NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT;
+  ELSIF EXISTS (
+    SELECT 1 FROM pg_roles
+    WHERE rolname = 'egogero_rollout_owner'
+      AND (rolcanlogin OR rolsuper OR rolcreatedb OR rolcreaterole OR rolinherit)
+  ) THEN
+    RAISE EXCEPTION 'egogero_rollout_owner has unsafe role attributes';
   END IF;
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'egogero_rollout_approver') THEN
     CREATE ROLE egogero_rollout_approver NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT;
+  ELSIF EXISTS (
+    SELECT 1 FROM pg_roles
+    WHERE rolname = 'egogero_rollout_approver'
+      AND (rolcanlogin OR rolsuper OR rolcreatedb OR rolcreaterole OR rolinherit)
+  ) THEN
+    RAISE EXCEPTION 'egogero_rollout_approver has unsafe role attributes';
   END IF;
 END;
 $$;
