@@ -173,7 +173,6 @@ export function createRoutedAuthAlertSink(
       try { cancel?.(); } catch { /* cancellation is best effort */ }
       rejectTimeout(new Error('Auth alert delivery timed out'));
     }, timeoutMs);
-    timer.unref();
     try {
       const result = adapter(deliveryFor(type), controller.signal);
       const operation = result instanceof Promise ? { promise: result } : result;
